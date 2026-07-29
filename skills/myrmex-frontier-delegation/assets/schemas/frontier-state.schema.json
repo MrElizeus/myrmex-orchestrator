@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:frontier-state:v1",
+  "title": "Myrmex Frontier State v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "schema_version",
+    "run_id",
+    "objective_id",
+    "objective",
+    "parent_objective",
+    "scope",
+    "mode",
+    "phase",
+    "status",
+    "repository_root",
+    "branch",
+    "base_sha",
+    "protected_dirty_paths",
+    "commit_policy",
+    "push_policy",
+    "frontier_chat_url",
+    "frontier_task_id",
+    "last_request_id",
+    "last_outbound_digest",
+    "last_response_digest",
+    "plan_revision",
+    "worker_task_id",
+    "verification_revision",
+    "commit_sha",
+    "push_status",
+    "blocker",
+    "budgets",
+    "receipts",
+    "revision",
+    "created_at",
+    "updated_at",
+    "delegation_ledger",
+    "attempts",
+    "defect_history"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.frontier-state/v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$"
+    },
+    "objective_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_objective": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "enum": [
+        "narrow",
+        "continuous"
+      ]
+    },
+    "mode": {
+      "enum": [
+        "interactive",
+        "autonomous"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "initializing",
+        "collecting-context",
+        "requesting-plan",
+        "waiting-for-frontier",
+        "reviewing-plan",
+        "implementing",
+        "verifying",
+        "reporting",
+        "parent-gate",
+        "committing",
+        "pushing",
+        "blocked",
+        "dormant",
+        "failed",
+        "cancelled",
+        "superseded"
+      ]
+    },
+    "status": {
+      "enum": [
+        "active",
+        "blocked",
+        "dormant",
+        "failed",
+        "cancelled",
+        "superseded"
+      ]
+    },
+    "repository_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "protected_dirty_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "commit_policy": {
+      "enum": [
+        "deny",
+        "ask",
+        "authorized"
+      ]
+    },
+    "push_policy": {
+      "enum": [
+        "deny",
+        "ask",
+        "authorized"
+      ]
+    },
+    "frontier_chat_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "frontier_task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_outbound_digest": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "last_response_digest": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "plan_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "worker_task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verification_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "commit_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "push_status": {
+      "enum": [
+        "not_requested",
+        "unauthorized",
+        "pending",
+        "pushed",
+        "failed"
+      ]
+    },
+    "blocker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budgets": {
+      "type": "object",
+      "required": [
+        "max_wait_seconds",
+        "max_plan_iterations",
+        "max_worker_corrections",
+        "max_failover_chats"
+      ],
+      "properties": {
+        "max_wait_seconds": {
+          "type": "integer",
+          "minimum": 30
+        },
+        "max_plan_iterations": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_worker_corrections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_failover_chats": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "receipts": {
+      "type": "object"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "memory_status": {
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable"
+      ]
+    },
+    "delegation_ledger": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent",
+          "role",
+          "reason",
+          "attempt",
+          "started_at",
+          "status"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "scout",
+              "writer",
+              "verifier"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "work_unit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "started",
+              "success",
+              "failed",
+              "blocked"
+            ]
+          }
+        }
+      }
+    },
+    "attempts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scouts",
+        "writers",
+        "verifiers",
+        "corrections"
+      ],
+      "properties": {
+        "scouts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "writers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verifiers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "corrections": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "defect_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "initial",
+          "corrected",
+          "remaining",
+          "new"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "initial": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "corrected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "remaining": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "new": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

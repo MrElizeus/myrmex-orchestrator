@@ -1,0 +1,20 @@
+{
+  "mcp": {
+    "engram": {
+      "type": "local",
+      "enabled": true,
+      "command": ["engram", "mcp", "--tools=agent"]
+    },
+    "playwright": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "npx",
+        "-y",
+        "@playwright/mcp@0.0.78",
+        "--browser=chrome",
+        "--user-data-dir=/home/USER/.config/opencode/myrmex-chrome-profile"
+      ]
+    }
+  }
+}

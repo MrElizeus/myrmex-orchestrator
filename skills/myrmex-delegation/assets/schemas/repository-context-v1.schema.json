@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:repository-context:v1",
+  "title": "Myrmex Repository Context v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "repository_root",
+    "branch",
+    "base_sha",
+    "git_status",
+    "objective",
+    "relevant_files",
+    "relevant_symbols",
+    "architecture",
+    "current_behavior",
+    "tests",
+    "data_contracts",
+    "observed_conventions",
+    "implementation_constraints",
+    "unresolved_decisions",
+    "protected_dirty_paths",
+    "excluded_sensitive_paths",
+    "evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.repository-context/v1"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "objective_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repository_root": {
+      "type": "string"
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_sha": {
+      "type": "string"
+    },
+    "git_status": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "objective": {
+      "type": "string"
+    },
+    "relevant_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "relevant_symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "architecture": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "current_behavior": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "data_contracts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "observed_conventions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementation_constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unresolved_decisions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "excluded_sensitive_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "protected_dirty_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    }
+  }
+}

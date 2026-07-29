@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:evidence-receipt:v1",
+  "title": "Myrmex Evidence Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "branch", "head", "base_sha", "files", "additions", "deletions", "changed_lines", "status", "diff_check"],
+  "properties": {
+    "schema": {"const": "myrmex.evidence-receipt/v1"},
+    "branch": {"type": "string"},
+    "head": {"type": "string", "minLength": 4},
+    "base_sha": {"type": ["string", "null"]},
+    "files": {"type": "array", "items": {"type": "string"}},
+    "additions": {"type": "integer", "minimum": 0},
+    "deletions": {"type": "integer", "minimum": 0},
+    "changed_lines": {"type": "integer", "minimum": 0},
+    "status": {"type": "array", "items": {"type": "string"}},
+    "diff_check": {"enum": ["pass", "fail"]},
+    "diff_check_output": {"type": "string"}
+  }
+}

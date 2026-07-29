@@ -1,0 +1,30 @@
+{
+  "schema": "myrmex.work-order/v1",
+  "run_id": "myrmex-example-001",
+  "task_id": "impl-001",
+  "objective": "Implement the bounded requested behavior using existing repository patterns.",
+  "non_goals": ["No unrelated refactor", "No dependency upgrades"],
+  "repository_root": "/path/to/repository",
+  "branch": "feature/example",
+  "base_sha": "0123456789abcdef",
+  "scope": {
+    "allowed_paths": ["app/Services/**", "tests/Feature/**"],
+    "forbidden_paths": [".env", "vendor/**", "node_modules/**"],
+    "preexisting_dirty_paths": []
+  },
+  "context": {
+    "repository_findings": ["Follow the existing service pattern in app/Services."],
+    "constraints": ["Preserve the public API."],
+    "known_risks": [],
+    "relevant_files": []
+  },
+  "acceptance_criteria": ["The requested behavior is observable and covered by a focused test."],
+  "skills_to_load": [],
+  "verification": {
+    "required": true,
+    "commands": [],
+    "discover_when_missing": true,
+    "manual_checks": []
+  },
+  "git_policy": {"commit": false, "push": false}
+}

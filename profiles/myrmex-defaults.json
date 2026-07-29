@@ -1,0 +1,38 @@
+{
+  "$schema": "myrmex.config/v1",
+  "frontier": {
+    "default_chat_url": null,
+    "timeout_seconds": 900,
+    "poll_seconds": [
+      5,
+      15,
+      30,
+      45,
+      60
+    ],
+    "max_plan_iterations": 6,
+    "max_worker_corrections": 2,
+    "max_failover_chats": 1,
+    "context_soft_limit_chars": 90000,
+    "evidence_soft_limit_chars": 90000
+  },
+  "git": {
+    "default_commit_policy": "ask",
+    "default_push_policy": "deny"
+  },
+  "memory": {
+    "engram_required": false
+  },
+  "agent_policy": {
+    "allowed_provider_prefixes": [
+      "openai/"
+    ],
+    "require_resolved_model_for_delegation": true,
+    "block_shadowed_agents": true,
+    "max_steps": {
+      "myrmex-scout": 80,
+      "myrmex-worker": 110,
+      "myrmex-verifier": 90
+    }
+  }
+}

@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:verification-result:v1",
+  "title": "Myrmex Verification Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "verdict",
+    "base_sha_observed",
+    "candidate_sha_observed",
+    "scope_compliance",
+    "diff_review",
+    "commands",
+    "acceptance",
+    "findings",
+    "preexisting_failures",
+    "required_corrections",
+    "memory_candidates"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.verification-result/v1"
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail",
+        "blocked"
+      ]
+    },
+    "base_sha_observed": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "candidate_sha_observed": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope_compliance": {
+      "type": "object"
+    },
+    "diff_review": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "location",
+          "claim",
+          "evidence",
+          "causal_disposition"
+        ],
+        "properties": {
+          "severity": {
+            "enum": [
+              "BLOCKER",
+              "CRITICAL",
+              "WARNING",
+              "SUGGESTION"
+            ]
+          },
+          "location": {
+            "type": "string"
+          },
+          "claim": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "causal_disposition": {
+            "enum": [
+              "introduced",
+              "activated",
+              "worsened",
+              "pre-existing",
+              "unknown"
+            ]
+          }
+        }
+      }
+    },
+    "preexisting_failures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_corrections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "memory_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "diff_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "additions",
+        "deletions",
+        "changed_lines"
+      ],
+      "properties": {
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "size_exception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "cohesion",
+        "review_strategy"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cohesion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "review_strategy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

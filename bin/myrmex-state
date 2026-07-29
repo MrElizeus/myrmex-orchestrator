@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""Atomic local run-state store for Myrmex frontier workflows.
+
+No external dependencies. This stores exact operational state; Engram remains the
+semantic-memory layer.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import secrets
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "myrmex.frontier-state/v1"
+PHASES = {
+    "initializing", "collecting-context", "requesting-plan", "waiting-for-frontier",
+    "reviewing-plan", "implementing", "verifying", "reporting", "parent-gate",
+    "committing", "pushing", "blocked", "dormant", "failed", "cancelled",
+    "superseded",
+}
+STATUSES = {"active", "blocked", "dormant", "failed", "cancelled", "superseded"}
+POLICIES = {"deny", "ask", "authorized"}
+PUSH_STATUSES = {"not_requested", "unauthorized", "pending", "pushed", "failed"}
+MEMORY_STATUSES = {"available", "degraded", "unavailable"}
+
+
+def utcnow() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def state_home() -> Path:
+    explicit = os.environ.get("MYRMEX_STATE_HOME")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return (base / "opencode" / "myrmex-orchestrator").resolve()
+
+
+def runs_dir() -> Path:
+    return state_home() / "runs"
+
+
+def run_dir(run_id: str) -> Path:
+    validate_run_id(run_id)
+    return runs_dir() / run_id
+
+
+def validate_run_id(value: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", value):
+        raise SystemExit(f"invalid run id: {value!r}")
+
+
+def slug(value: str, limit: int = 36) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return (text or "objective")[:limit].rstrip("-")
+
+
+def atomic_write(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = (path.stat().st_mode & 0o777) if path.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def read_state(run_id: str) -> dict[str, Any]:
+    path = run_dir(run_id) / "state.json"
+    if not path.is_file():
+        raise SystemExit(f"run not found: {run_id}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"invalid state for {run_id}: {exc}") from exc
+    if data.get("schema") != SCHEMA:
+        raise SystemExit(f"unsupported state schema for {run_id}: {data.get('schema')!r}")
+    return data
+
+
+def write_state(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
+    run_id = str(data["run_id"])
+    path = run_dir(run_id) / "state.json"
+    current_revision = -1
+    if path.exists():
+        current = json.loads(path.read_text(encoding="utf-8"))
+        current_revision = int(current.get("revision", 0))
+        if expected_revision is not None and current_revision != expected_revision:
+            raise SystemExit(
+                f"revision conflict for {run_id}: expected {expected_revision}, observed {current_revision}"
+            )
+    data["revision"] = current_revision + 1
+    data["updated_at"] = utcnow()
+    validate_state(data)
+    atomic_write(path, data)
+    latest = state_home() / "latest"
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="latest.", suffix=".tmp", dir=latest.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(run_id + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, latest)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    return data
+
+
+def validate_state(data: dict[str, Any]) -> None:
+    required = [
+        "schema", "schema_version", "run_id", "objective_id", "objective", "scope",
+        "mode", "phase", "status", "repository_root", "protected_dirty_paths",
+        "commit_policy", "push_policy", "revision", "created_at", "updated_at",
+    ]
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise SystemExit(f"state missing fields: {', '.join(missing)}")
+    if data["schema"] != SCHEMA or data["schema_version"] != 1:
+        raise SystemExit("unsupported state schema/version")
+    validate_run_id(str(data["run_id"]))
+    if data["scope"] not in {"narrow", "continuous"}:
+        raise SystemExit("invalid scope")
+    if data["mode"] not in {"interactive", "autonomous"}:
+        raise SystemExit("invalid mode")
+    if data["phase"] not in PHASES:
+        raise SystemExit(f"invalid phase: {data['phase']}")
+    if data["status"] not in STATUSES:
+        raise SystemExit(f"invalid status: {data['status']}")
+    if data["commit_policy"] not in POLICIES or data["push_policy"] not in POLICIES:
+        raise SystemExit("invalid commit/push policy")
+    if data.get("push_status") not in PUSH_STATUSES:
+        raise SystemExit("invalid push_status")
+    if data.get("memory_status") is not None and data["memory_status"] not in MEMORY_STATUSES:
+        raise SystemExit("invalid memory_status")
+    if not isinstance(data["protected_dirty_paths"], list) or not all(isinstance(x, str) for x in data["protected_dirty_paths"]):
+        raise SystemExit("protected_dirty_paths must be an array of strings")
+    if not isinstance(data.get("budgets"), dict):
+        raise SystemExit("budgets must be an object")
+    for key in ["max_wait_seconds", "max_plan_iterations", "max_worker_corrections", "max_failover_chats"]:
+        if not isinstance(data["budgets"].get(key), int) or data["budgets"][key] < 0:
+            raise SystemExit(f"invalid budget: {key}")
+    if data["budgets"]["max_wait_seconds"] < 30 or data["budgets"]["max_plan_iterations"] < 1:
+        raise SystemExit("invalid frontier budgets")
+    if not isinstance(data.get("receipts"), dict):
+        raise SystemExit("receipts must be an object")
+    if not isinstance(data.get("delegation_ledger"), list):
+        raise SystemExit("delegation_ledger must be an array")
+    if not isinstance(data.get("attempts"), dict):
+        raise SystemExit("attempts must be an object")
+    for key in ["scouts", "writers", "verifiers", "corrections"]:
+        if not isinstance(data["attempts"].get(key), int) or data["attempts"][key] < 0:
+            raise SystemExit(f"invalid attempt counter: {key}")
+    if not isinstance(data.get("defect_history"), list):
+        raise SystemExit("defect_history must be an array")
+    if not isinstance(data.get("revision"), int) or data["revision"] < 0:
+        raise SystemExit("revision must be a non-negative integer")
+
+
+def latest_run() -> str:
+    marker = state_home() / "latest"
+    if marker.is_file():
+        value = marker.read_text(encoding="utf-8").strip()
+        if value and (runs_dir() / value / "state.json").is_file():
+            return value
+    candidates = sorted(
+        (p for p in runs_dir().glob("*/state.json") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ) if runs_dir().is_dir() else []
+    if not candidates:
+        raise SystemExit("no Myrmex runs found")
+    return candidates[0].parent.name
+
+
+def parse_scalar(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def set_dotted(target: dict[str, Any], key: str, value: Any) -> None:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", key):
+        raise SystemExit(f"invalid patch key: {key}")
+    parts = key.split(".")
+    current: dict[str, Any] = target
+    for part in parts[:-1]:
+        existing = current.get(part)
+        if existing is None:
+            existing = {}
+            current[part] = existing
+        if not isinstance(existing, dict):
+            raise SystemExit(f"cannot descend into non-object patch key: {key}")
+        current = existing
+    current[parts[-1]] = value
+
+
+def append_event(run_id: str, event_type: str, message: str | None, data: Any) -> dict[str, Any]:
+    directory = run_dir(run_id)
+    if not (directory / "state.json").is_file():
+        raise SystemExit(f"run not found: {run_id}")
+    event = {
+        "timestamp": utcnow(),
+        "run_id": run_id,
+        "type": event_type,
+        "message": message,
+        "data": data,
+    }
+    path = directory / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return event
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = state_home()
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        test = root / ".write-test"
+        test.write_text("ok\n", encoding="utf-8")
+        test.unlink()
+    except Exception as exc:
+        errors.append(f"state directory is not writable: {exc}")
+    invalid_runs: list[str] = []
+    if runs_dir().is_dir():
+        for path in runs_dir().glob("*/state.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                validate_state(data)
+            except BaseException as exc:  # validate_state raises SystemExit
+                invalid_runs.append(f"{path.parent.name}: {exc}")
+    if invalid_runs:
+        warnings.extend(invalid_runs)
+    result = {
+        "ok": not errors,
+        "schema": SCHEMA,
+        "state_home": str(root),
+        "runs": len(list(runs_dir().glob("*/state.json"))) if runs_dir().is_dir() else 0,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    print(json.dumps(result, indent=2))
+    return 0 if not errors else 1
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if bool(args.objective) == bool(args.objective_file):
+        raise SystemExit("provide exactly one of --objective or --objective-file")
+    objective = args.objective
+    if args.objective_file:
+        objective = Path(args.objective_file).expanduser().read_text(encoding="utf-8").strip()
+    assert objective is not None
+    if not objective.strip():
+        raise SystemExit("objective cannot be empty")
+    repo = str(Path(args.repository_root).expanduser().resolve())
+    now = utcnow()
+    run_id = args.run_id or (
+        "myrmex-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + slug(objective) + "-" + secrets.token_hex(3)
+    )
+    validate_run_id(run_id)
+    directory = run_dir(run_id)
+    if directory.exists():
+        raise SystemExit(f"run already exists: {run_id}")
+    objective_id = hashlib.sha256((repo + "\0" + objective.strip()).encode()).hexdigest()[:20]
+    data: dict[str, Any] = {
+        "schema": SCHEMA,
+        "schema_version": 1,
+        "run_id": run_id,
+        "objective_id": objective_id,
+        "objective": objective.strip(),
+        "parent_objective": args.parent_objective,
+        "scope": args.scope,
+        "mode": args.mode,
+        "phase": "initializing",
+        "status": "active",
+        "repository_root": repo,
+        "branch": args.branch,
+        "base_sha": args.base_sha,
+        "protected_dirty_paths": args.protected_dirty_path or [],
+        "commit_policy": args.commit_policy,
+        "push_policy": args.push_policy,
+        "frontier_chat_url": args.chat_url,
+        "frontier_task_id": None,
+        "last_request_id": None,
+        "last_outbound_digest": None,
+        "last_response_digest": None,
+        "plan_revision": 0,
+        "worker_task_id": None,
+        "verification_revision": 0,
+        "commit_sha": None,
+        "push_status": "not_requested" if args.push_policy == "deny" else "unauthorized",
+        "blocker": None,
+        "budgets": {
+            "max_wait_seconds": args.max_wait_seconds,
+            "max_plan_iterations": args.max_plan_iterations,
+            "max_worker_corrections": args.max_worker_corrections,
+            "max_failover_chats": args.max_failover_chats,
+        },
+        "receipts": {},
+        "delegation_ledger": [],
+        "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
+        "defect_history": [],
+        "revision": -1,
+        "created_at": now,
+        "updated_at": now,
+    }
+    directory.mkdir(parents=True, exist_ok=False)
+    (directory / "artifacts").mkdir()
+    write_state(data)
+    append_event(run_id, "run.initialized", "Myrmex run initialized", {"mode": args.mode, "scope": args.scope})
+    print(run_id)
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    run_id = args.run_id or latest_run()
+    print(json.dumps(read_state(run_id), indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    rows: list[dict[str, Any]] = []
+    if runs_dir().is_dir():
+        for path in runs_dir().glob("*/state.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if args.status and data.get("status") != args.status:
+                    continue
+                rows.append({key: data.get(key) for key in ["run_id", "status", "phase", "mode", "scope", "objective", "updated_at"]})
+            except Exception:
+                continue
+    rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    if args.limit:
+        rows = rows[: args.limit]
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_patch(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    if args.json_patch:
+        patch = json.loads(args.json_patch)
+        if not isinstance(patch, dict):
+            raise SystemExit("--json-patch must be an object")
+        for key, value in patch.items():
+            set_dotted(data, key, value)
+    for item in args.set or []:
+        if "=" not in item:
+            raise SystemExit(f"--set requires key=value: {item}")
+        key, value = item.split("=", 1)
+        set_dotted(data, key, parse_scalar(value))
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "state.patched", None, {"revision": saved["revision"], "keys": args.set or []})
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+
+def cmd_delegation(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    role = args.role
+    if role not in {"scout", "writer", "verifier"}:
+        raise SystemExit("invalid delegation role")
+    attempt = data["attempts"][role + "s"] + 1
+    entry = {
+        "agent": args.agent, "role": role, "reason": args.reason,
+        "task_id": args.task_id, "work_unit_id": args.work_unit_id,
+        "attempt": attempt, "started_at": args.started_at or utcnow(),
+        "completed_at": args.completed_at, "status": args.status,
+    }
+    data["delegation_ledger"].append(entry)
+    data["attempts"][role + "s"] = attempt
+    if args.correction:
+        data["attempts"]["corrections"] += 1
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "delegation.recorded", None, entry)
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_defects(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    defects = json.loads(args.defects_json)
+    if not isinstance(defects, list) or not all(isinstance(item, str) for item in defects):
+        raise SystemExit("--defects-json must be an array of strings")
+    record = {"revision": data["verification_revision"] + 1, "initial": defects, "corrected": [], "remaining": defects, "new": []}
+    data["defect_history"].append(record)
+    data["verification_revision"] = record["revision"]
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "defects.recorded", None, record)
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_event(args: argparse.Namespace) -> int:
+    data: Any = None
+    if args.data_json:
+        data = json.loads(args.data_json)
+    event = append_event(args.run_id, args.type, args.message, data)
+    print(json.dumps(event, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_artifact_path(args: argparse.Namespace) -> int:
+    read_state(args.run_id)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.name):
+        raise SystemExit("invalid artifact name")
+    path = run_dir(args.run_id) / "artifacts" / args.name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(path)
+    return 0
+
+
+def cmd_lock(args: argparse.Namespace) -> int:
+    read_state(args.run_id)
+    path = run_dir(args.run_id) / "lock.json"
+    lock = {"owner": args.owner, "acquired_at": utcnow(), "pid": os.getpid()}
+
+    if args.force:
+        previous = None
+        if path.exists():
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        atomic_write(path, lock)
+        append_event(args.run_id, "run.locked", "lock force-acquired", {"lock": lock, "previous": previous})
+        print(json.dumps(lock, indent=2))
+        return 0
+
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if current.get("owner") == args.owner:
+            print(json.dumps(current, indent=2))
+            return 0
+        raise SystemExit(f"run locked by {current.get('owner')!r} since {current.get('acquired_at')}")
+
+    try:
+        payload = (json.dumps(lock, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    append_event(args.run_id, "run.locked", None, lock)
+    print(json.dumps(lock, indent=2))
+    return 0
+
+
+def cmd_unlock(args: argparse.Namespace) -> int:
+    read_state(args.run_id)
+    path = run_dir(args.run_id) / "lock.json"
+    if not path.exists():
+        print(json.dumps({"unlocked": False, "reason": "not locked"}, indent=2))
+        return 0
+    current = json.loads(path.read_text(encoding="utf-8"))
+    if current.get("owner") != args.owner and not args.force:
+        raise SystemExit(f"lock owned by {current.get('owner')!r}; use matching owner")
+    path.unlink()
+    append_event(args.run_id, "run.unlocked", None, {"previous": current})
+    print(json.dumps({"unlocked": True, "previous": current}, indent=2))
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    data["phase"] = "cancelled"
+    data["status"] = "cancelled"
+    data["blocker"] = args.reason
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "run.cancelled", args.reason, None)
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_latest(args: argparse.Namespace) -> int:
+    print(latest_run())
+    return 0
+
+
+def cmd_hash(args: argparse.Namespace) -> int:
+    digest = hashlib.sha256(Path(args.file).expanduser().read_bytes()).hexdigest()
+    print(digest)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="myrmex-state", description=__doc__)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor")
+    doctor.set_defaults(func=cmd_doctor)
+
+    init = sub.add_parser("init")
+    init.add_argument("--run-id")
+    init.add_argument("--objective")
+    init.add_argument("--objective-file")
+    init.add_argument("--repository-root", required=True)
+    init.add_argument("--mode", choices=["interactive", "autonomous"], required=True)
+    init.add_argument("--scope", choices=["narrow", "continuous"], required=True)
+    init.add_argument("--parent-objective")
+    init.add_argument("--branch")
+    init.add_argument("--base-sha")
+    init.add_argument("--protected-dirty-path", action="append")
+    init.add_argument("--commit-policy", choices=sorted(POLICIES), default="ask")
+    init.add_argument("--push-policy", choices=sorted(POLICIES), default="deny")
+    init.add_argument("--chat-url")
+    init.add_argument("--max-wait-seconds", type=int, default=900)
+    init.add_argument("--max-plan-iterations", type=int, default=6)
+    init.add_argument("--max-worker-corrections", type=int, default=2)
+    init.add_argument("--max-failover-chats", type=int, default=1)
+    init.set_defaults(func=cmd_init)
+
+    show = sub.add_parser("show")
+    show.add_argument("run_id", nargs="?")
+    show.set_defaults(func=cmd_show)
+
+    listing = sub.add_parser("list")
+    listing.add_argument("--status", choices=sorted(STATUSES))
+    listing.add_argument("--limit", type=int, default=20)
+    listing.set_defaults(func=cmd_list)
+
+    patch = sub.add_parser("patch")
+    patch.add_argument("run_id")
+    patch.add_argument("--set", action="append")
+    patch.add_argument("--json-patch")
+    patch.add_argument("--expect-revision", type=int)
+    patch.set_defaults(func=cmd_patch)
+
+    event = sub.add_parser("event")
+    event.add_argument("run_id")
+    event.add_argument("--type", required=True)
+    event.add_argument("--message")
+    event.add_argument("--data-json")
+    event.set_defaults(func=cmd_event)
+
+    delegation = sub.add_parser("delegation")
+    delegation.add_argument("run_id")
+    delegation.add_argument("--agent", required=True)
+    delegation.add_argument("--role", choices=["scout", "writer", "verifier"], required=True)
+    delegation.add_argument("--reason", required=True)
+    delegation.add_argument("--task-id")
+    delegation.add_argument("--work-unit-id")
+    delegation.add_argument("--started-at")
+    delegation.add_argument("--completed-at")
+    delegation.add_argument("--status", choices=["started", "success", "failed", "blocked"], default="started")
+    delegation.add_argument("--correction", action="store_true")
+    delegation.add_argument("--expect-revision", type=int)
+    delegation.set_defaults(func=cmd_delegation)
+
+    defects = sub.add_parser("defects")
+    defects.add_argument("run_id")
+    defects.add_argument("--defects-json", required=True)
+    defects.add_argument("--expect-revision", type=int)
+    defects.set_defaults(func=cmd_defects)
+
+    artifact = sub.add_parser("artifact-path")
+    artifact.add_argument("run_id")
+    artifact.add_argument("name")
+    artifact.set_defaults(func=cmd_artifact_path)
+
+    lock = sub.add_parser("lock")
+    lock.add_argument("run_id")
+    lock.add_argument("--owner", required=True)
+    lock.add_argument("--force", action="store_true")
+    lock.set_defaults(func=cmd_lock)
+
+    unlock = sub.add_parser("unlock")
+    unlock.add_argument("run_id")
+    unlock.add_argument("--owner", required=True)
+    unlock.add_argument("--force", action="store_true")
+    unlock.set_defaults(func=cmd_unlock)
+
+    cancel = sub.add_parser("cancel")
+    cancel.add_argument("run_id")
+    cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--expect-revision", type=int)
+    cancel.set_defaults(func=cmd_cancel)
+
+    latest = sub.add_parser("latest")
+    latest.set_defaults(func=cmd_latest)
+
+    hashing = sub.add_parser("hash")
+    hashing.add_argument("--file", required=True)
+    hashing.set_defaults(func=cmd_hash)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

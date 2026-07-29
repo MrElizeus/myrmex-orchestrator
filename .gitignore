@@ -1,0 +1,22 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# JavaScript/build outputs
+node_modules/
+dist/
+build/
+
+# Local artifacts and secrets
+*.zip
+*.zip.sha256
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local OSS study checkout; never part of the distribution
+external-sources/

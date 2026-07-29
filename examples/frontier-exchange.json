@@ -1,0 +1,13 @@
+{
+  "schema": "myrmex.frontier-exchange/v1",
+  "action": "send_and_wait",
+  "run_id": "myrmex-frontier-example-001",
+  "request_id": "req-example-001",
+  "chat_url": "https://chatgpt.com/c/REPLACE_ME",
+  "outbound_message": "Rendered prompt containing request_id req-example-001",
+  "timeout_seconds": 900,
+  "allow_reload": true,
+  "allow_failover": true,
+  "allow_dom_send_fallback": false,
+  "failover_handoff": "Rendered recovery handoff"
+}

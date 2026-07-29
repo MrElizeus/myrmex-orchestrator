@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:frontier-exchange-result:v1",
+  "title": "Myrmex Frontier Exchange Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "action",
+    "chat_url",
+    "message_id",
+    "request_id",
+    "response_type",
+    "text",
+    "stable",
+    "poll_count",
+    "recovery_actions",
+    "blocker",
+    "observations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.frontier-exchange-result/v1"
+    },
+    "status": {
+      "enum": [
+        "success",
+        "blocked",
+        "timeout",
+        "error"
+      ]
+    },
+    "action": {
+      "enum": [
+        "send_and_wait",
+        "read_latest",
+        "recover_and_wait"
+      ]
+    },
+    "chat_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "response_type": {
+      "enum": [
+        "plan",
+        "blocking_clarification",
+        "objective_complete",
+        "sub_objective_complete",
+        "parent_objective_complete",
+        "already_complete",
+        "unknown"
+      ]
+    },
+    "text": {
+      "type": "string"
+    },
+    "stable": {
+      "type": "boolean"
+    },
+    "poll_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "recovery_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:frontier-exchange:v1",
+  "title": "Myrmex Frontier Exchange v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "action",
+    "run_id",
+    "request_id",
+    "chat_url",
+    "timeout_seconds",
+    "allow_reload",
+    "allow_failover"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.frontier-exchange/v1"
+    },
+    "action": {
+      "enum": [
+        "send_and_wait",
+        "read_latest",
+        "recover_and_wait"
+      ]
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "chat_url": {
+      "type": "string"
+    },
+    "outbound_message": {
+      "type": "string"
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 1800
+    },
+    "allow_reload": {
+      "type": "boolean"
+    },
+    "allow_failover": {
+      "type": "boolean"
+    },
+    "allow_dom_send_fallback": {
+      "type": "boolean",
+      "default": false
+    },
+    "failover_handoff": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:work-result:v1",
+  "title": "Myrmex Work Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "base_sha_observed",
+    "summary",
+    "files_changed",
+    "diff_stat",
+    "commands",
+    "acceptance",
+    "deviations",
+    "blockers",
+    "unrelated_changes_detected",
+    "skills_loaded",
+    "memory_candidates",
+    "diff_metrics",
+    "self_review"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.work-result/v1"
+    },
+    "status": {
+      "enum": [
+        "success",
+        "partial",
+        "blocked",
+        "failed"
+      ]
+    },
+    "base_sha_observed": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "diff_stat": {
+      "type": "string"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "exit_code",
+          "result"
+        ],
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "result": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion",
+          "status",
+          "evidence"
+        ],
+        "properties": {
+          "criterion": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail",
+              "unknown"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "deviations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "unrelated_changes_detected": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "skills_loaded": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "memory_candidates": {
+      "$ref": "#/$defs/memoryCandidates"
+    },
+    "diff_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "additions",
+        "deletions",
+        "changed_lines"
+      ],
+      "properties": {
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "size_exception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "cohesion",
+        "review_strategy"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cohesion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "review_strategy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "self_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "git_diff_check",
+        "scope_check",
+        "generated_artifacts",
+        "acceptance_coverage",
+        "notes"
+      ],
+      "properties": {
+        "git_diff_check": {
+          "const": "pass"
+        },
+        "scope_check": {
+          "const": "pass"
+        },
+        "generated_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "acceptance_coverage": {
+          "enum": [
+            "complete",
+            "partial",
+            "unknown"
+          ]
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "memoryCandidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "topic_key",
+          "content",
+          "reason"
+        ],
+        "properties": {
+          "type": {
+            "enum": [
+              "discovery",
+              "decision",
+              "bugfix",
+              "convention",
+              "warning"
+            ]
+          },
+          "topic_key": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

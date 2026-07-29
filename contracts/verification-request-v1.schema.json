@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:verification-request:v1",
+  "title": "Myrmex Verification Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "objective",
+    "repository_root",
+    "base_sha",
+    "acceptance_criteria",
+    "allowed_paths",
+    "protected_paths",
+    "implementation_result",
+    "commands"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.verification-request/v1"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "repository_root": {
+      "type": "string"
+    },
+    "base_sha": {
+      "type": "string"
+    },
+    "candidate_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "protected_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementation_result": {
+      "type": "object"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "known_preexisting_failures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "diff_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "additions",
+        "deletions",
+        "changed_lines"
+      ],
+      "properties": {
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "size_exception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "cohesion",
+        "review_strategy"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cohesion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "review_strategy": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
