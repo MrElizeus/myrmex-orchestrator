@@ -11,7 +11,7 @@ Before commit:
 3. Stage only objective-owned paths and review the staged diff for secrets, generated junk, and unrelated work.
 4. Commit only under the run's explicit commit policy; record commit SHA and verification receipt in local state.
 
-Before push, confirm exact commit(s), remote, branch, and explicit current-run push authorization. Never force-push, rewrite shared history, or infer deployment/release permission. If content changes after verification, invalidate the gate and re-verify.
+Before push, confirm exact commit(s), remote, branch, and explicit current-run push authorization. Never force-push, rewrite shared history, or infer deployment/release permission. If content changes after verification, invalidate the gate and re-verify. For PR creation/labels, use `scripts/github-pr-recovery.py`: it queries first, persists a `PR_CREATED_LABEL_PENDING` receipt immediately after creation, and falls back to the narrow issue-label REST endpoint only after confirming the PR exists.
 
 ## Scope-aware completion
 
@@ -21,4 +21,4 @@ Before push, confirm exact commit(s), remote, branch, and explicit current-run p
 
 ## Terminal transition
 
-Persist final artifacts and receipts, update local state to `dormant`, `blocked`, `failed`, `cancelled`, or `superseded`, save only a compact durable Engram summary/decision when available, and release the run lock. Do not ask the frontier for arbitrary additional work after the relevant objective scope is complete.
+Persist final artifacts and receipts, then use `myrmex-state complete <run-id> --message ... --unlock-owner ...` for a successful terminal transition. It atomically writes `phase=dormant,status=dormant,blocker=null`, records completion, and only then releases the matching lock. For other terminal outcomes, set the matching phase/status pair before release. Do not ask the frontier for arbitrary additional work after the relevant objective scope is complete.

@@ -27,3 +27,14 @@ Commit and push are separate. Authorization for one never implies the other, dep
 Confirm exact commits, remote, branch, and explicit push authorization. Refuse force/history rewriting and unauthorized protected-branch delivery. Push normally and record the result. Never infer deployment or release.
 
 If tracked content/path/mode changes after verification, invalidate the gate and re-verify.
+
+## Recovering partially successful GitHub operations
+
+GitHub commands are independent side effects. Never chain create, label, query, and push in one shell expression where a later failure can hide a successful earlier operation.
+
+1. Before creating a PR, query the exact open `head`/`base` pair. Do not push again when the remote SHA already matches the intended candidate.
+2. Create a draft PR as one step, then immediately persist its number and URL in a run artifact/receipt and `myrmex-state` when a run exists. This intermediate state is `PR_CREATED_LABEL_PENDING`.
+3. Apply the label as a second step. If `gh pr edit --add-label` fails due to Projects scope, query the PR first and use the narrow issue-label REST endpoint as a fallback; do not request unrelated scopes.
+4. Finalize the receipt as `PR_CREATED`, `PR_CREATION_FAILED`, or `LABEL_APPLICATION_FAILED`. Never retry creation until discovery proves the exact PR does not exist.
+
+Use `scripts/github-pr-recovery.py` for this sequence. It never pushes branches and records a durable receipt before label application.
