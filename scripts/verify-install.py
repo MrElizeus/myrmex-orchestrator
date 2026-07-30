@@ -228,8 +228,8 @@ def main() -> int:
                 status = agent.get("status")
                 if status == "WARN_SHADOWED_AGENT":
                     warnings.append("shadowed local agent: " + str(agent.get("agent")))
-                elif status in {"FAIL_INVALID_AGENT_STEPS", "FAIL_AGENT_NOT_INSTALLED",
-                                 "BLOCKED_UNRESOLVED_AGENT_MODEL", "BLOCKED_NON_ALLOWED_PROVIDER"}:
+                elif status in {"FAIL_INVALID_AGENT_STEPS", "AGENT_NOT_INSTALLED",
+                                 "AGENT_MODEL_UNRESOLVED", "BLOCKED_NON_ALLOWED_PROVIDER"}:
                     errors.append(status + ": " + str(agent.get("agent")))
         except Exception as exc:
             warnings.append(f"agent resolution unavailable: {exc}")

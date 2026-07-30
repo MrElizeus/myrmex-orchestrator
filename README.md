@@ -66,7 +66,7 @@ explicitly in myrmex.json when required.
 
 The resolver reports effective source, global source, shadowing, model, provider,
 and bounded steps. It emits PASS_AGENT_RESOLUTION, WARN_SHADOWED_AGENT,
-BLOCKED_UNRESOLVED_AGENT_MODEL, BLOCKED_NON_ALLOWED_PROVIDER, and
+AGENT_MODEL_UNRESOLVED, BLOCKED_NON_ALLOWED_PROVIDER, and
 FAIL_INVALID_AGENT_STEPS.
 
 ## Security and delivery

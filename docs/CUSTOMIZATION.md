@@ -15,7 +15,7 @@ model identifiers whose provider prefix is listed in `agent_policy.allowed_provi
 }
 ```
 
-Myrmex never silently falls back. Diagnostics use `BLOCKED_UNRESOLVED_AGENT_MODEL`
+Myrmex never silently falls back. Diagnostics use `AGENT_MODEL_UNRESOLVED`
 or `BLOCKED_NON_ALLOWED_PROVIDER`. Add another provider explicitly in a local
 `myrmex.json` only if your deployment requires it.
 

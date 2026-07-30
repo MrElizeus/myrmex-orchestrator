@@ -23,12 +23,32 @@ PHASES = {
     "initializing", "collecting-context", "requesting-plan", "waiting-for-frontier",
     "reviewing-plan", "implementing", "verifying", "reporting", "parent-gate",
     "committing", "pushing", "blocked", "dormant", "failed", "cancelled",
-    "superseded",
+    "superseded", "waiting-for-delegations", "collecting-delegation-results",
+    "consolidating-evidence", "proceeding-to-next-gate",
 }
 STATUSES = {"active", "blocked", "dormant", "failed", "cancelled", "superseded"}
 POLICIES = {"deny", "ask", "authorized"}
 PUSH_STATUSES = {"not_requested", "unauthorized", "pending", "pushed", "failed"}
 MEMORY_STATUSES = {"available", "degraded", "unavailable"}
+PHASE_STATUS = {
+    **{phase: "active" for phase in {
+        "initializing", "collecting-context", "requesting-plan", "waiting-for-frontier",
+        "reviewing-plan", "implementing", "verifying", "reporting", "parent-gate",
+        "committing", "pushing", "waiting-for-delegations", "collecting-delegation-results",
+        "consolidating-evidence", "proceeding-to-next-gate",
+    }},
+    "blocked": "blocked",
+    "dormant": "dormant",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "superseded": "superseded",
+}
+DELEGATION_OUTCOMES = {
+    "STARTED", "SUCCESS", "FAILED", "BLOCKED", "CANCELLED",
+    "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR", "PROVIDER_INVOCATION_FAILED",
+    "AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED",
+}
+TERMINAL_TASK_STATUSES = {"success", "failed", "blocked", "cancelled"}
 
 
 def utcnow() -> str:
@@ -95,6 +115,45 @@ def read_state(run_id: str) -> dict[str, Any]:
     return data
 
 
+def sanitize_evidence(value: Any) -> Any:
+    """Keep failure evidence useful without storing credentials or bearer tokens."""
+    sensitive = re.compile(r"(?:api[_-]?key|token|secret|password|authorization|cookie)", re.I)
+    token = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)", re.I)
+    if isinstance(value, dict):
+        return {str(key): "[REDACTED]" if sensitive.search(str(key)) else sanitize_evidence(item)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_evidence(item) for item in value]
+    if isinstance(value, str):
+        return token.sub("[REDACTED]", value)
+    return value
+
+
+def normalize_legacy_state(data: dict[str, Any]) -> list[str]:
+    """Apply lossless normalizations needed by older v1 state files."""
+    changes: list[str] = []
+    if data.get("phase") == "dormant" and data.get("status") == "active":
+        data["status"] = "dormant"
+        data["blocker"] = None
+        changes.append("normalized phase=dormant,status=active")
+    if "delegation_batches" not in data:
+        data["delegation_batches"] = []
+        changes.append("initialized delegation_batches")
+    if "no_progress_cycles" not in data:
+        data["no_progress_cycles"] = 0
+        changes.append("initialized no_progress_cycles")
+    if "defect_history" not in data:
+        data["defect_history"] = []
+        changes.append("initialized defect_history")
+    if "delegation_ledger" not in data:
+        data["delegation_ledger"] = []
+        changes.append("initialized delegation_ledger")
+    elif isinstance(data["delegation_ledger"], dict):
+        data["delegation_ledger"] = [data["delegation_ledger"]]
+        changes.append("wrapped legacy delegation_ledger object")
+    return changes
+
+
 def write_state(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
     run_id = str(data["run_id"])
     path = run_dir(run_id) / "state.json"
@@ -148,6 +207,14 @@ def validate_state(data: dict[str, Any]) -> None:
         raise SystemExit(f"invalid phase: {data['phase']}")
     if data["status"] not in STATUSES:
         raise SystemExit(f"invalid status: {data['status']}")
+    expected_status = PHASE_STATUS[data["phase"]]
+    if data["status"] != expected_status:
+        raise SystemExit(
+            f"invalid phase/status combination: {data['phase']}/{data['status']}; "
+            f"expected {data['phase']}/{expected_status}"
+        )
+    if data["phase"] == "dormant" and data.get("blocker") is not None:
+        raise SystemExit("dormant runs must clear blocker")
     if data["commit_policy"] not in POLICIES or data["push_policy"] not in POLICIES:
         raise SystemExit("invalid commit/push policy")
     if data.get("push_status") not in PUSH_STATUSES:
@@ -167,6 +234,19 @@ def validate_state(data: dict[str, Any]) -> None:
         raise SystemExit("receipts must be an object")
     if not isinstance(data.get("delegation_ledger"), list):
         raise SystemExit("delegation_ledger must be an array")
+    batches = data.get("delegation_batches", [])
+    if not isinstance(batches, list):
+        raise SystemExit("delegation_batches must be an array")
+    for batch in batches:
+        if not isinstance(batch, dict):
+            raise SystemExit("delegation batch must be an object")
+        if not isinstance(batch.get("batch_id"), str) or not batch["batch_id"]:
+            raise SystemExit("delegation batch missing batch_id")
+        task_ids = batch.get("task_ids")
+        if not isinstance(task_ids, list) or not task_ids or not all(isinstance(item, str) and item for item in task_ids):
+            raise SystemExit("delegation batch task_ids must be a non-empty array of strings")
+        if len(set(task_ids)) != len(task_ids):
+            raise SystemExit("delegation batch task_ids must be unique")
     if not isinstance(data.get("attempts"), dict):
         raise SystemExit("attempts must be an object")
     for key in ["scouts", "writers", "verifiers", "corrections"]:
@@ -259,7 +339,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for path in runs_dir().glob("*/state.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                changes = normalize_legacy_state(data)
                 validate_state(data)
+                if changes:
+                    warnings.append(f"{path.parent.name}: legacy state can be normalized: {', '.join(changes)}")
             except BaseException as exc:  # validate_state raises SystemExit
                 invalid_runs.append(f"{path.parent.name}: {exc}")
     if invalid_runs:
@@ -331,6 +414,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         },
         "receipts": {},
         "delegation_ledger": [],
+        "delegation_batches": [],
         "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
         "defect_history": [],
         "no_progress_cycles": 0,
@@ -372,6 +456,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_patch(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
+    normalize_legacy_state(data)
     if args.json_patch:
         patch = json.loads(args.json_patch)
         if not isinstance(patch, dict):
@@ -392,6 +477,7 @@ def cmd_patch(args: argparse.Namespace) -> int:
 
 def cmd_delegation(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
+    normalize_legacy_state(data)
     role = args.role
     if role not in {"scout", "writer", "verifier"}:
         raise SystemExit("invalid delegation role")
@@ -414,7 +500,17 @@ def cmd_delegation(args: argparse.Namespace) -> int:
         "task_id": args.task_id, "work_unit_id": args.work_unit_id,
         "attempt": attempt, "started_at": args.started_at or utcnow(),
         "completed_at": args.completed_at, "status": args.status,
+        "outcome": args.outcome or {"success": "SUCCESS", "failed": "FAILED", "blocked": "BLOCKED", "cancelled": "CANCELLED", "started": "STARTED"}[args.status],
     }
+    if args.evidence_json:
+        try:
+            entry["evidence"] = sanitize_evidence(json.loads(args.evidence_json))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid --evidence-json: {exc}") from exc
+    if entry["outcome"] in {"AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED"}:
+        data["phase"] = "blocked"
+        data["status"] = "blocked"
+        data["blocker"] = entry["outcome"]
     data["delegation_ledger"].append(entry)
     data["attempts"][role + "s"] = attempt
     if args.correction:
@@ -436,6 +532,7 @@ def parse_string_list(value: str | None, option: str) -> list[str] | None:
 
 def cmd_defects(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
+    normalize_legacy_state(data)
     initial = parse_string_list(args.defects_json, "--defects-json")
     corrected = parse_string_list(args.corrected_json, "--corrected-json") or []
     remaining = parse_string_list(args.remaining_json, "--remaining-json")
@@ -480,6 +577,182 @@ def cmd_event(args: argparse.Namespace) -> int:
         data = json.loads(args.data_json)
     event = append_event(args.run_id, args.type, args.message, data)
     print(json.dumps(event, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def parse_batch_results(value: str) -> list[dict[str, Any]]:
+    try:
+        results = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid --results-json: {exc}") from exc
+    if not isinstance(results, list):
+        raise SystemExit("--results-json must be an array")
+    parsed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for result in results:
+        if not isinstance(result, dict):
+            raise SystemExit("each delegation result must be an object")
+        task_id = result.get("task_id")
+        status = result.get("status")
+        if not isinstance(task_id, str) or not task_id:
+            raise SystemExit("each delegation result requires task_id")
+        if task_id in seen:
+            raise SystemExit(f"duplicate delegation result for task_id: {task_id}")
+        if status not in TERMINAL_TASK_STATUSES:
+            raise SystemExit(f"delegation result {task_id} is not terminal")
+        seen.add(task_id)
+        parsed.append({"task_id": task_id, "status": status, "payload": sanitize_evidence(result.get("payload"))})
+    return parsed
+
+
+def contradictory_claims(results: list[dict[str, Any]]) -> list[str]:
+    """Detect conflicting structured claims while allowing independent findings."""
+    claims: dict[str, str] = {}
+    conflicts: set[str] = set()
+    for result in results:
+        payload = result.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("claims"), list):
+            continue
+        for claim in payload["claims"]:
+            if not isinstance(claim, dict) or not isinstance(claim.get("subject"), str) or "value" not in claim:
+                continue
+            subject = claim["subject"]
+            value = json.dumps(claim["value"], ensure_ascii=False, sort_keys=True)
+            if subject in claims and claims[subject] != value:
+                conflicts.add(subject)
+            claims[subject] = value
+    return sorted(conflicts)
+
+
+def cmd_delegation_batch(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    normalize_legacy_state(data)
+    batches: list[dict[str, Any]] = data["delegation_batches"]
+    batch = next((item for item in batches if item.get("batch_id") == args.batch_id), None)
+    if args.batch_action == "start":
+        if batch is not None:
+            raise SystemExit(f"delegation batch already exists: {args.batch_id}")
+        task_ids = parse_string_list(args.task_ids_json, "--task-ids-json")
+        if not task_ids:
+            raise SystemExit("--task-ids-json must contain at least one task ID")
+        if len(set(task_ids)) != len(task_ids):
+            raise SystemExit("--task-ids-json must be unique")
+        batch = {
+            "batch_id": args.batch_id, "task_ids": task_ids, "expected_results": len(task_ids),
+            "status": "waiting-for-delegations", "started_at": utcnow(), "recovery_attempted": False,
+            "results": [], "missing_task_ids": [], "contradictions": [],
+        }
+        batches.append(batch)
+        data["phase"] = "waiting-for-delegations"
+        data["status"] = "active"
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "delegation_batch.started", None, batch)
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if batch is None:
+        raise SystemExit(f"delegation batch not found: {args.batch_id}")
+    if args.batch_action == "collect":
+        if args.results_json is None:
+            raise SystemExit("--results-json is required for delegation-batch collect")
+        results = parse_batch_results(args.results_json)
+        expected = set(batch["task_ids"])
+        unexpected = sorted(item["task_id"] for item in results if item["task_id"] not in expected)
+        if unexpected:
+            raise SystemExit("unexpected delegation result task IDs: " + ", ".join(unexpected))
+        result_ids = {item["task_id"] for item in results}
+        missing = sorted(expected - result_ids)
+        batch["results"] = results
+        batch["missing_task_ids"] = missing
+        if missing:
+            if args.recover_missing and not batch["recovery_attempted"]:
+                batch["recovery_attempted"] = True
+                batch["status"] = "recovering-missing-delegation-result"
+                data["phase"] = "collecting-delegation-results"
+                data["status"] = "active"
+                saved = write_state(data, args.expect_revision)
+                append_event(args.run_id, "delegation_batch.recovery_requested", None, {"batch_id": args.batch_id, "missing_task_ids": missing})
+                print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+                return 1
+            data["phase"] = "blocked"
+            data["status"] = "blocked"
+            data["blocker"] = "BLOCKED_MISSING_DELEGATION_RESULT"
+            batch["status"] = "blocked"
+            saved = write_state(data, args.expect_revision)
+            append_event(args.run_id, "delegation_batch.blocked", None, {"batch_id": args.batch_id, "missing_task_ids": missing})
+            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+            return 1
+        batch["contradictions"] = contradictory_claims(results)
+        if batch["contradictions"]:
+            data["phase"] = "blocked"
+            data["status"] = "blocked"
+            data["blocker"] = "BLOCKED_CONTRADICTORY_DELEGATION_RESULTS"
+            batch["status"] = "blocked"
+            saved = write_state(data, args.expect_revision)
+            append_event(args.run_id, "delegation_batch.blocked", None, {"batch_id": args.batch_id, "contradictions": batch["contradictions"]})
+            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+            return 1
+        batch["status"] = "consolidating-evidence"
+        batch["completed_at"] = utcnow()
+        data["phase"] = "consolidating-evidence"
+        data["status"] = "active"
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "delegation_batch.completed", None, {"batch_id": args.batch_id, "result_count": len(results)})
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if batch["status"] != "consolidating-evidence":
+        raise SystemExit("delegation batch must be consolidated before proceeding")
+    if args.next_phase not in PHASE_STATUS or PHASE_STATUS[args.next_phase] != "active":
+        raise SystemExit("--next-phase must be an active phase")
+    batch["status"] = "proceeded"
+    batch["proceeded_at"] = utcnow()
+    batch["next_phase"] = args.next_phase
+    data["phase"] = args.next_phase
+    data["status"] = "active"
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "delegation_batch.proceeded", None, {"batch_id": args.batch_id, "next_phase": args.next_phase})
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    changes = normalize_legacy_state(data)
+    if not changes:
+        print(json.dumps({"migrated": False, "state": data}, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "state.normalized", "legacy state normalized", {"changes": changes})
+    print(json.dumps({"migrated": True, "changes": changes, "state": saved}, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    """Atomically persist terminal state, then record completion before unlocking."""
+    data = read_state(args.run_id)
+    normalize_legacy_state(data)
+    lock_path: Path | None = None
+    previous_lock: dict[str, Any] | None = None
+    if args.unlock_owner:
+        lock_path = run_dir(args.run_id) / "lock.json"
+        if not lock_path.exists():
+            raise SystemExit("run is not locked by the requested completion owner")
+        previous_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        if previous_lock.get("owner") != args.unlock_owner:
+            raise SystemExit(f"run lock is owned by {previous_lock.get('owner')!r}")
+    data["phase"] = "dormant"
+    data["status"] = "dormant"
+    data["blocker"] = None
+    data["completion"] = {"completed_at": utcnow(), "message": args.message}
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "objective.complete", args.message, {"revision": saved["revision"]})
+    unlocked: dict[str, Any] | None = None
+    if lock_path is not None and previous_lock is not None:
+        lock_path.unlink()
+        unlocked = {"previous": previous_lock}
+        append_event(args.run_id, "run.unlocked", "completion lock release", unlocked)
+    print(json.dumps({"state": saved, "unlocked": unlocked}, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -544,6 +817,7 @@ def cmd_unlock(args: argparse.Namespace) -> int:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
+    normalize_legacy_state(data)
     data["phase"] = "cancelled"
     data["status"] = "cancelled"
     data["blocker"] = args.reason
@@ -623,10 +897,23 @@ def build_parser() -> argparse.ArgumentParser:
     delegation.add_argument("--work-unit-id")
     delegation.add_argument("--started-at")
     delegation.add_argument("--completed-at")
-    delegation.add_argument("--status", choices=["started", "success", "failed", "blocked"], default="started")
+    delegation.add_argument("--status", choices=["started", "success", "failed", "blocked", "cancelled"], default="started")
+    delegation.add_argument("--outcome", choices=sorted(DELEGATION_OUTCOMES))
+    delegation.add_argument("--evidence-json")
     delegation.add_argument("--correction", action="store_true")
     delegation.add_argument("--expect-revision", type=int)
     delegation.set_defaults(func=cmd_delegation)
+
+    batch = sub.add_parser("delegation-batch")
+    batch.add_argument("run_id")
+    batch.add_argument("batch_action", choices=["start", "collect", "proceed"])
+    batch.add_argument("--batch-id", required=True)
+    batch.add_argument("--task-ids-json")
+    batch.add_argument("--results-json")
+    batch.add_argument("--recover-missing", action="store_true")
+    batch.add_argument("--next-phase")
+    batch.add_argument("--expect-revision", type=int)
+    batch.set_defaults(func=cmd_delegation_batch)
 
     defects = sub.add_parser("defects")
     defects.add_argument("run_id")
@@ -659,6 +946,18 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("--reason", required=True)
     cancel.add_argument("--expect-revision", type=int)
     cancel.set_defaults(func=cmd_cancel)
+
+    migrate = sub.add_parser("migrate")
+    migrate.add_argument("run_id")
+    migrate.add_argument("--expect-revision", type=int)
+    migrate.set_defaults(func=cmd_migrate)
+
+    complete = sub.add_parser("complete")
+    complete.add_argument("run_id")
+    complete.add_argument("--message", required=True)
+    complete.add_argument("--unlock-owner")
+    complete.add_argument("--expect-revision", type=int)
+    complete.set_defaults(func=cmd_complete)
 
     latest = sub.add_parser("latest")
     latest.set_defaults(func=cmd_latest)
