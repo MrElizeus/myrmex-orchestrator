@@ -1,3 +1,11 @@
+<p align="center">
+  <img
+    src="docs/assets/myrmex-readme-banner.png"
+    alt="Myrmex Orchestrator"
+    width="100%"
+  />
+</p>
+
 # Myrmex Orchestrator for OpenCode
 
 Myrmex is an independent open-source agent stack focused exclusively on
