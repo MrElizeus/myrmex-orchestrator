@@ -10,7 +10,7 @@ def main():
  actual=json.loads(subprocess.check_output([sys.executable,str(collector),"--repo",a.repo,"--base-sha",a.base_sha],text=True))
  candidate=Path(a.receipt)
  declared=json.loads(candidate.read_text()) if len(a.receipt) < 4096 and not a.receipt.lstrip().startswith("{") and candidate.is_file() else json.loads(a.receipt)
- keys=["branch","head","base_sha","files","additions","deletions","changed_lines","status","diff_check"]
+ keys=["branch","head","base_sha","files","additions","deletions","changed_lines","status","binary_files","untracked_files","diff_check","diff_check_output"]
  mismatches={k:{"declared":declared.get(k),"observed":actual.get(k)} for k in keys if declared.get(k)!=actual.get(k)}
  result={"ok":not mismatches,"error":None if not mismatches else "FAIL_RECEIPT_MISMATCH","mismatches":mismatches,"observed":actual}
  print(json.dumps(result,indent=2,ensure_ascii=False,sort_keys=True)); return 0 if not mismatches else 1

@@ -19,6 +19,16 @@ with tempfile.TemporaryDirectory(prefix="myrmex-evidence-") as td:
     (repo/"file.txt").write_text("one\ntwo\n")
     receipt=json.loads(run("python3",str(ROOT/"scripts/collect-git-evidence.py"),"--repo",str(repo),"--base-sha",base).stdout)
     assert receipt["additions"]==1 and receipt["changed_lines"]==1
+    (repo/"new-file.py").write_text("".join(f"line-{i}\n" for i in range(1000)))
+    (repo/"binary.dat").write_bytes(b"\x00\x01")
+    (repo/"link.txt").symlink_to("file.txt")
+    receipt=json.loads(run("python3",str(ROOT/"scripts/collect-git-evidence.py"),"--repo",str(repo),"--base-sha",base).stdout)
+    assert "new-file.py" in receipt["files"]
+    assert receipt["untracked_files"][0]["kind"] in {"binary","symlink","text"}
+    assert next(item for item in receipt["untracked_files"] if item["path"]=="new-file.py")["lines"] == 1000
+    assert receipt["changed_lines"] == 1001
+    oversized=run("python3",str(ROOT/"scripts/validate-diff-size.py"),"--changed-lines",str(receipt["changed_lines"]),ok=False)
+    assert "FAIL_SIZE_LIMIT" in oversized.stdout
     good=run("python3",str(ROOT/"scripts/verify-receipt.py"),"--repo",str(repo),"--base-sha",base,"--receipt",json.dumps(receipt))
     assert json.loads(good.stdout)["ok"] is True
     receipt["changed_lines"]=999

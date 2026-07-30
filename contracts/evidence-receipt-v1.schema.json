@@ -15,7 +15,9 @@
     "deletions": {"type": "integer", "minimum": 0},
     "changed_lines": {"type": "integer", "minimum": 0},
     "status": {"type": "array", "items": {"type": "string"}},
+    "binary_files": {"type": "array", "items": {"type": "string"}},
+    "untracked_files": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["path", "kind", "lines", "sha256"], "properties": {"path": {"type": "string"}, "kind": {"enum": ["text", "binary", "symlink", "other"]}, "lines": {"type": "integer", "minimum": 0}, "sha256": {"type": ["string", "null"]}}}},
     "diff_check": {"enum": ["pass", "fail"]},
-    "diff_check_output": {"type": "string"}
+    "diff_check_output": {"type": ["string", "null"]}
   }
 }

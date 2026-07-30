@@ -217,18 +217,20 @@ def main() -> int:
     if resolution_script.is_file():
         try:
             resolution = subprocess.run(
-                [str(resolution_script), "--workspace", str(Path.cwd()), "--config-dir", str(config_dir)],
+                [str(resolution_script), "--workspace", str(Path.cwd()), "--config-dir", str(config_dir), "--enforce"],
                 capture_output=True, text=True, timeout=20,
             )
             payload = json.loads(resolution.stdout)
             checks.append("agent-resolution")
+            if resolution.returncode != 0:
+                errors.append("effective agent resolution failed")
             for agent in payload.get("agents", []):
-                if agent.get("status") == "WARN_SHADOWED_AGENT":
+                status = agent.get("status")
+                if status == "WARN_SHADOWED_AGENT":
                     warnings.append("shadowed local agent: " + str(agent.get("agent")))
-                if agent.get("status") == "BLOCKED_UNRESOLVED_AGENT_MODEL":
-                    warnings.append("unresolved model for delegated agent: " + str(agent.get("agent")))
-                if agent.get("status") == "BLOCKED_NON_ALLOWED_PROVIDER":
-                    errors.append("non-allowed provider for agent: " + str(agent.get("agent")))
+                elif status in {"FAIL_INVALID_AGENT_STEPS", "FAIL_AGENT_NOT_INSTALLED",
+                                 "BLOCKED_UNRESOLVED_AGENT_MODEL", "BLOCKED_NON_ALLOWED_PROVIDER"}:
+                    errors.append(status + ": " + str(agent.get("agent")))
         except Exception as exc:
             warnings.append(f"agent resolution unavailable: {exc}")
 
