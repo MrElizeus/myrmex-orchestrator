@@ -20,7 +20,7 @@ Use this skill when a normal coding objective benefits from fresh context, broad
 - Give the worker a `myrmex.work-order/v1`; never delegate only a vague sentence.
 - Require `myrmex.work-result/v1` evidence.
 - Use `myrmex-verifier` for behavioral, multi-layer, risky, or materially non-trivial changes.
-- Reuse the same task/session for at most one bounded correction attempt.
+- Reuse the same task/session for at most up to two bounded correction attempts.
 - Do not silently expand scope, launch competing writers, or introduce SDD.
 
 ## Flow
@@ -38,3 +38,5 @@ Use this skill when a normal coding objective benefits from fresh context, broad
 Read `references/work-order.md` and `references/verification.md` when constructing the corresponding requests.
 
 Use scripts/collect-git-evidence.py for receipts and scripts/validate-diff-size.py for the flexible 400-line policy.
+
+The state CLI enforces the two-correction budget. A third correction returns BLOCKED_CORRECTION_BUDGET. Record each verification cycle with corrected, remaining, and new defects; two consecutive non-reducing cycles return BLOCKED_NO_PROGRESS.

@@ -91,6 +91,7 @@ PYSCAN
 
 printf '%s\n' '[8/9] Release builder dry-run'
 python3 "$ROOT/scripts/build-release.py" --skip-tests >/dev/null
+python3 "$ROOT/scripts/build-release.py" --skip-tests --reproducibility-check >/dev/null
 python3 - "$ROOT" <<'PYRELEASE'
 from pathlib import Path
 import sys, zipfile

@@ -14,7 +14,7 @@ def files(root):
   out.append(rel)
  return sorted(out)
 def main():
- ap=argparse.ArgumentParser(); ap.add_argument("--output",default="dist"); ap.add_argument("--skip-tests",action="store_true"); a=ap.parse_args()
+ ap=argparse.ArgumentParser(); ap.add_argument("--output",default="dist"); ap.add_argument("--skip-tests",action="store_true"); ap.add_argument("--reproducibility-check",action="store_true"); a=ap.parse_args()
  root=Path(__file__).resolve().parents[1]; version=(root/"VERSION").read_text().strip()
  out=Path(a.output).resolve(); out.mkdir(parents=True,exist_ok=True)
  name=f"myrmex-orchestrator-v{version}"; archive=out/(name+".zip")
@@ -54,5 +54,18 @@ def main():
    subprocess.run([str(unpacked/"scripts/run-tests.sh")],check=True,cwd=unpacked,env=env)
    subprocess.run([str(unpacked/"scripts/preflight.sh"),"--config-dir",str(Path(td)/"unpacked-config"),"--bin-dir",str(Path(td)/"unpacked-bin")],check=True,cwd=unpacked,env=env)
  digest=hashlib.sha256(archive.read_bytes()).hexdigest(); (archive.with_suffix(".zip.sha256")).write_text(digest+"  "+archive.name+"\n")
- print(json.dumps({"archive":str(archive),"sha256":digest,"version":version},indent=2)); return 0
+ result={"archive":str(archive),"sha256":digest,"version":version}
+ if a.reproducibility_check:
+  with tempfile.TemporaryDirectory(prefix="myrmex-repro-") as repro:
+   first=Path(repro)/"a"; second=Path(repro)/"b"
+   for target in (first, second):
+    subprocess.run([os.environ.get("PYTHON", "python3"), str(Path(__file__).resolve()), "--output", str(target), "--skip-tests"], check=True, cwd=root)
+   first_zip=next(first.glob("*.zip")); second_zip=next(second.glob("*.zip"))
+   first_sha=hashlib.sha256(first_zip.read_bytes()).hexdigest()
+   second_sha=hashlib.sha256(second_zip.read_bytes()).hexdigest()
+   if first_sha != second_sha:
+    raise SystemExit(f"non-reproducible release: {first_sha} != {second_sha}")
+   result["reproducible"]=True
+   result["reproducibility_sha256"]=first_sha
+ print(json.dumps(result,indent=2)); return 0
 if __name__=="__main__": raise SystemExit(main())

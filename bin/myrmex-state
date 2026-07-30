@@ -174,6 +174,10 @@ def validate_state(data: dict[str, Any]) -> None:
             raise SystemExit(f"invalid attempt counter: {key}")
     if not isinstance(data.get("defect_history"), list):
         raise SystemExit("defect_history must be an array")
+    if not isinstance(data.get("no_progress_cycles"), int) or data["no_progress_cycles"] < 0:
+        raise SystemExit("no_progress_cycles must be a non-negative integer")
+    if data["attempts"]["corrections"] > data["budgets"]["max_worker_corrections"]:
+        raise SystemExit("BLOCKED_CORRECTION_BUDGET")
     if not isinstance(data.get("revision"), int) or data["revision"] < 0:
         raise SystemExit("revision must be a non-negative integer")
 
@@ -329,6 +333,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "delegation_ledger": [],
         "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
         "defect_history": [],
+        "no_progress_cycles": 0,
         "revision": -1,
         "created_at": now,
         "updated_at": now,
@@ -390,6 +395,19 @@ def cmd_delegation(args: argparse.Namespace) -> int:
     role = args.role
     if role not in {"scout", "writer", "verifier"}:
         raise SystemExit("invalid delegation role")
+    if args.correction and role != "writer":
+        raise SystemExit("corrections can only target the writer")
+    if args.correction and data["attempts"]["corrections"] >= data["budgets"]["max_worker_corrections"]:
+        data["phase"] = "blocked"
+        data["status"] = "blocked"
+        data["blocker"] = "BLOCKED_CORRECTION_BUDGET"
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "delegation.blocked", "correction budget exhausted", {
+            "attempts": data["attempts"]["corrections"],
+            "max_worker_corrections": data["budgets"]["max_worker_corrections"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 1
     attempt = data["attempts"][role + "s"] + 1
     entry = {
         "agent": args.agent, "role": role, "reason": args.reason,
@@ -407,18 +425,53 @@ def cmd_delegation(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_string_list(value: str | None, option: str) -> list[str] | None:
+    if value is None:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise SystemExit(f"{option} must be an array of strings")
+    return parsed
+
+
 def cmd_defects(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
-    defects = json.loads(args.defects_json)
-    if not isinstance(defects, list) or not all(isinstance(item, str) for item in defects):
-        raise SystemExit("--defects-json must be an array of strings")
-    record = {"revision": data["verification_revision"] + 1, "initial": defects, "corrected": [], "remaining": defects, "new": []}
+    initial = parse_string_list(args.defects_json, "--defects-json")
+    corrected = parse_string_list(args.corrected_json, "--corrected-json") or []
+    remaining = parse_string_list(args.remaining_json, "--remaining-json")
+    new = parse_string_list(args.new_json, "--new-json") or []
+    previous = data["defect_history"][-1] if data["defect_history"] else None
+
+    if previous is None and initial is None:
+        raise SystemExit("--defects-json is required for the initial defect record")
+    if initial is None:
+        initial = list(previous["initial"])
+    if remaining is None:
+        remaining = list(initial if previous is None else previous["remaining"])
+    if previous is not None and args.remaining_json is None and args.corrected_json is None and args.new_json is None:
+        raise SystemExit("an update requires corrected, remaining, or new defects")
+
+    reduced = previous is None or len(remaining) < len(previous["remaining"])
+    data["no_progress_cycles"] = 0 if reduced else data["no_progress_cycles"] + 1
+    record = {
+        "revision": data["verification_revision"] + 1,
+        "initial": initial,
+        "corrected": corrected,
+        "remaining": remaining,
+        "new": new,
+        "progress": "reduced" if reduced else "unchanged",
+        "no_progress_cycles": data["no_progress_cycles"],
+    }
     data["defect_history"].append(record)
     data["verification_revision"] = record["revision"]
+    if data["no_progress_cycles"] >= 2:
+        data["phase"] = "blocked"
+        data["status"] = "blocked"
+        data["blocker"] = "BLOCKED_NO_PROGRESS"
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "defects.recorded", None, record)
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 1 if data["blocker"] == "BLOCKED_NO_PROGRESS" else 0
 
 
 def cmd_event(args: argparse.Namespace) -> int:
@@ -577,7 +630,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     defects = sub.add_parser("defects")
     defects.add_argument("run_id")
-    defects.add_argument("--defects-json", required=True)
+    defects.add_argument("--defects-json")
+    defects.add_argument("--corrected-json")
+    defects.add_argument("--remaining-json")
+    defects.add_argument("--new-json")
     defects.add_argument("--expect-revision", type=int)
     defects.set_defaults(func=cmd_defects)
 

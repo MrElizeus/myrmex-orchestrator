@@ -35,38 +35,94 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert state["push_status"] == "not_requested"
     assert state["attempts"] == {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0}
     assert state["delegation_ledger"] == []
+    assert state["no_progress_cycles"] == 0
 
     run("lock", run_id, "--owner", "test-owner", env=env)
     run("lock", run_id, "--owner", "other-owner", env=env, ok=False)
     run("lock", run_id, "--owner", "test-owner", env=env)
 
-    recorded = json.loads(run("delegation", run_id, "--agent", "myrmex-worker", "--role", "writer", "--reason", "bounded implementation", "--task-id", "task-1", "--work-unit-id", "unit-1", "--status", "success", env=env).stdout)
+    recorded = json.loads(run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "bounded implementation", "--task-id", "task-1",
+        "--work-unit-id", "unit-1", "--status", "success", env=env,
+    ).stdout)
+    assert recorded["revision"] == 1
     assert recorded["attempts"]["writers"] == 1
     assert recorded["delegation_ledger"][0]["work_unit_id"] == "unit-1"
-    defects = json.loads(run("defects", run_id, "--defects-json", '["missing assertion"]', env=env).stdout)
-    assert defects["defect_history"][0]["remaining"] == ["missing assertion"]
-    assert defects["verification_revision"] == 1
 
-    patched = json.loads(run("patch", run_id, "--expect-revision", "2", "--set", "phase=collecting-context", env=env).stdout)
-    assert patched["revision"] == 3
-    run("patch", run_id, "--expect-revision", "2", "--set", "phase=requesting-plan", env=env, ok=False)
+    defects = json.loads(run(
+        "defects", run_id, "--defects-json", '["missing assertion", "missing test"]', env=env,
+    ).stdout)
+    assert defects["revision"] == 2
+    assert defects["defect_history"][0]["remaining"] == ["missing assertion", "missing test"]
 
-    artifact = Path(run("artifact-path", run_id, "context.json", env=env).stdout.strip())
-    assert artifact.parent.name == "artifacts" and artifact.name == "context.json"
+    progress = json.loads(run(
+        "defects", run_id, "--corrected-json", '["missing assertion"]',
+        "--remaining-json", '["missing test"]', "--new-json", "[]",
+        "--expect-revision", "2", env=env,
+    ).stdout)
+    assert progress["revision"] == 3
+    assert progress["no_progress_cycles"] == 0
+    assert progress["defect_history"][-1]["progress"] == "reduced"
+
+    patched = json.loads(run(
+        "patch", run_id, "--expect-revision", "3", "--set", "phase=collecting-context",
+        env=env,
+    ).stdout)
+    assert patched["revision"] == 4
+    run("patch", run_id, "--expect-revision", "3", "--set", "phase=requesting-plan", env=env, ok=False)
+
+    correction_one = json.loads(run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "fix verified defects", "--work-unit-id", "unit-1",
+        "--status", "success", "--correction", "--expect-revision", "4", env=env,
+    ).stdout)
+    assert correction_one["attempts"]["corrections"] == 1
+    correction_two = json.loads(run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "fix remaining verified defects", "--work-unit-id", "unit-1",
+        "--status", "success", "--correction", "--expect-revision", "5", env=env,
+    ).stdout)
+    assert correction_two["attempts"]["corrections"] == 2
+
+    blocked = json.loads(run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "third correction must stop", "--work-unit-id", "unit-1",
+        "--status", "blocked", "--correction", "--expect-revision", "6", env=env, ok=False,
+    ).stdout)
+    assert blocked["status"] == "blocked"
+    assert blocked["blocker"] == "BLOCKED_CORRECTION_BUDGET"
+    assert blocked["attempts"]["corrections"] == 2
 
     run("unlock", run_id, "--owner", "other-owner", env=env, ok=False)
     run("unlock", run_id, "--owner", "test-owner", env=env)
+    second = run(
+        "init", "--run-id", "myrmex-no-progress", "--objective", "No progress test",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        env=env,
+    ).stdout.strip()
+    run("defects", second, "--defects-json", '["same defect"]', env=env)
+    unchanged = json.loads(run(
+        "defects", second, "--remaining-json", '["same defect"]', "--expect-revision", "1", env=env,
+    ).stdout)
+    assert unchanged["no_progress_cycles"] == 1
+    blocked_progress = json.loads(run(
+        "defects", second, "--remaining-json", '["same defect"]', "--expect-revision", "2",
+        env=env, ok=False,
+    ).stdout)
+    assert blocked_progress["blocker"] == "BLOCKED_NO_PROGRESS"
+
     doctor = json.loads(run("doctor", env=env).stdout)
-    assert doctor["ok"] is True and doctor["runs"] == 1
+    assert doctor["ok"] is True and doctor["runs"] == 2
 
     schema = json.loads((ROOT / "contracts" / "frontier-state-v1.schema.json").read_text())
-    missing = sorted(set(schema["required"]) - set(patched))
+    missing = sorted(set(schema["required"]) - set(blocked))
     assert not missing, missing
     try:
         import jsonschema  # type: ignore
     except ImportError:
         pass
     else:
-        jsonschema.Draft202012Validator(schema).validate(patched)
+        jsonschema.Draft202012Validator(schema).validate(blocked)
 
 print("state CLI test: PASS")

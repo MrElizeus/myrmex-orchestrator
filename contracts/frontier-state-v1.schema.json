@@ -39,7 +39,8 @@
     "updated_at",
     "delegation_ledger",
     "attempts",
-    "defect_history"
+    "defect_history",
+    "no_progress_cycles"
   ],
   "properties": {
     "schema": {
@@ -363,7 +364,9 @@
           "initial",
           "corrected",
           "remaining",
-          "new"
+          "new",
+          "progress",
+          "no_progress_cycles"
         ],
         "properties": {
           "revision": {
@@ -393,9 +396,23 @@
             "items": {
               "type": "string"
             }
+          },
+          "progress": {
+            "enum": [
+              "reduced",
+              "unchanged"
+            ]
+          },
+          "no_progress_cycles": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       }
+    },
+    "no_progress_cycles": {
+      "type": "integer",
+      "minimum": 0
     }
   }
 }

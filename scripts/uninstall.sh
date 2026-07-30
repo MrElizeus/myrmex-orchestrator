@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONFIG_DIR="$(printenv OPENCODE_CONFIG_DIR 2>/dev/null || printf '%s' "$HOME/.config/opencode")"
 
 while (($#)); do
   case "$1" in
@@ -15,12 +15,32 @@ CONFIG_DIR="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduse
 META="$CONFIG_DIR/myrmex-orchestrator"
 RECORD="$META/install-record.json"
 CONFIG_RECORD="$META/config-change.json"
+RESULT="$(mktemp /tmp/myrmex-uninstall.XXXXXX)"
+trap 'rm -f "$RESULT"' EXIT
 
 python3 "$ROOT/scripts/patch-opencode-config.py" undo --record "$CONFIG_RECORD"
-python3 "$ROOT/scripts/uninstall.py" --record "$RECORD"
+python3 "$ROOT/scripts/uninstall.py" --record "$RECORD" >"$RESULT"
 
-# The record and metadata root are deliberately kept if modified files remain.
-if [[ -f "$RECORD" ]]; then rm -f "$RECORD"; fi
-find "$META" -depth -type d -empty -delete 2>/dev/null || true
+python3 - "$RESULT" "$RECORD" "$META" <<'PY'
+import json
+import pathlib
+import sys
+
+result_path, record_path, meta = map(pathlib.Path, sys.argv[1:])
+result = json.loads(result_path.read_text(encoding="utf-8"))
+preserved = result.get("preserved", [])
+if preserved:
+    print("Preserved install record because modified files remain:")
+    for path in preserved:
+        print("  " + path)
+else:
+    if record_path.exists():
+        record_path.unlink()
+    for directory in sorted([path for path in meta.glob("**/*") if path.is_dir()] + ([meta] if meta.is_dir() else []), key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+PY
 
 echo "Myrmex uninstall completed. Modified files and timestamped backups were preserved. Restart OpenCode."

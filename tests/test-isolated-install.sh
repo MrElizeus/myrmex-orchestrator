@@ -10,6 +10,7 @@ cat > "$CONFIG/opencode.json" <<'JSON'
 {
   "$schema": "https://opencode.ai/config.json",
   "default_agent": "existing-default-agent",
+  "model": "openai/test-model",
   "mcp": {
     "engram": {
       "type": "local",
@@ -71,7 +72,7 @@ PY
 # Test added MCP entries and default-agent rollback in a second clean config.
 CONFIG2="$TMP/opencode2"
 mkdir -p "$CONFIG2"
-printf '%s\n' '{"$schema":"https://opencode.ai/config.json","default_agent":"existing-default-agent"}' > "$CONFIG2/opencode.json"
+printf '%s\n' '{"$schema":"https://opencode.ai/config.json","default_agent":"existing-default-agent","model":"openai/test-model"}' > "$CONFIG2/opencode.json"
 echo "  - scenario 2: add missing MCP entries, set default, and roll back"
 "$ROOT/scripts/install.sh" --config-dir "$CONFIG2" --bin-dir "$BIN" --set-default >"$TMP/install-2.log"
 echo "    install with default-agent patch: OK"
@@ -97,3 +98,20 @@ assert not (pathlib.Path(sys.argv[1])/'myrmex.json').exists(), 'package-created 
 PY
 
 echo "isolated install/uninstall test: PASS"
+
+# Test that modified installed files retain the record needed for future cleanup.
+CONFIG3="$TMP/opencode3"
+mkdir -p "$CONFIG3"
+printf '%s\n' '{"$schema":"https://opencode.ai/config.json","model":"openai/test-model"}' > "$CONFIG3/opencode.json"
+echo "  - scenario 3: preserve tracking when an installed file is modified"
+"$ROOT/scripts/install.sh" --config-dir "$CONFIG3" --bin-dir "$BIN" >"$TMP/install-3.log"
+printf '%s\n' '# user modification' >> "$CONFIG3/agents/myrmex-worker.md"
+"$ROOT/scripts/uninstall.sh" --config-dir "$CONFIG3" >"$TMP/uninstall-3.log"
+python3 - "$CONFIG3" <<'PY'
+import pathlib, sys
+config=pathlib.Path(sys.argv[1])
+assert (config/'agents/myrmex-worker.md').is_file()
+assert (config/'myrmex-orchestrator/install-record.json').is_file()
+assert (config/'myrmex-orchestrator').is_dir()
+PY
+echo "    modified-file tracking preservation: OK"

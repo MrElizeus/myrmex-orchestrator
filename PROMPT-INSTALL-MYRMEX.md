@@ -1,6 +1,6 @@
 # Implementation prompt — install Myrmex Orchestrator
 
-Use this prompt from the extracted `myrmex-orchestrator-v0.1.0` directory with an OpenCode implementation agent that can modify the user's OpenCode configuration directory.
+Use this prompt from the extracted `myrmex-orchestrator-v0.1.0-alpha.1` directory with an OpenCode implementation agent that can modify the user's OpenCode configuration directory.
 
 Default authorization for this prompt:
 
