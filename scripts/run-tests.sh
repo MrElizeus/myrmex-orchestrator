@@ -60,6 +60,7 @@ printf '%s\n' '[6/9] Evidence, size policy, and public identity'
 python3 "$ROOT/tests/test-evidence-and-size.py"
 python3 "$ROOT/tests/test-public-policy.py"
 python3 "$ROOT/tests/test-agent-resolution.py"
+python3 "$ROOT/tests/test-github-pr-recovery.py"
 
 printf '%s\n' '[7/9] Sensitive-file scan'
 python3 - "$ROOT" <<'PYSCAN'

@@ -97,6 +97,10 @@ Use:
 
 Give subagents bounded inputs, exact repository context, acceptance criteria, protected dirty paths, and relevant skill paths. Reuse the same task/session for two bounded correction attempts when the first result has concrete fixable failures. Do not launch competing writers in the same workspace.
 
+Resolve the effective OpenCode agent, model, provider policy, and permissions before a normal delegation. Do **not** inspect, require, print, or infer a provider/API credential from the orchestrator environment: `CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR` is informational, not a preflight block. Invoke `Task` when resolution is valid. Record `PROVIDER_INVOCATION_FAILED` only from a real Task failure with sanitized evidence; `AGENT_MODEL_UNRESOLVED` and `AGENT_NOT_INSTALLED` are resolver-backed blockers.
+
+For a bounded fan-out, record every task ID and expected result in `myrmex-state delegation-batch start`. Treat terminal child states as a join barrier: collect one structured final result per ID, persist the completed batch, consolidate duplicate/contradictory findings, then proceed exactly once to the next gate. A missing final result gets one safe recovery attempt; then block with `BLOCKED_MISSING_DELEGATION_RESULT`. On resume, reconcile the recorded batch before launching any new Task.
+
 The primary agent owns user communication, scope decisions, memory writes, commits, and pushes.
 
 ## FRONTIER route

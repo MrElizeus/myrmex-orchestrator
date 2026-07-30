@@ -36,3 +36,25 @@ Normal and frontier work may continue when local state is healthy, but semantic 
 ## Worker cannot edit
 
 Check that the parent did not pass a repository path outside the active worktree and that `allowed_paths` include the target. Child sessions inherit parent deny/external-directory restrictions.
+
+## Provider credential is not visible to the orchestrator
+
+Do not treat a missing provider environment variable as a delegation failure.
+Myrmex resolves the effective OpenCode agent, model, provider policy, and
+permissions first; OpenCode may route the Task with credentials unavailable to
+the parent process. `CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR` is informational.
+Block only for `AGENT_NOT_INSTALLED`, `AGENT_MODEL_UNRESOLVED`, policy failure,
+or a real `PROVIDER_INVOCATION_FAILED` with sanitized evidence.
+
+## Delegations appear complete but the workflow did not advance
+
+Inspect `myrmex-state show <run-id>` for the delegation batch. The workflow
+waits for a terminal structured result from each recorded task ID. Run the one
+safe recovery only for the listed missing ID; do not rerun completed scouts or
+send a user prompt merely to continue consolidation.
+
+## A GitHub label command failed after PR creation
+
+Do not repeat `gh pr create`. Query the head/base PR first. Use
+`scripts/github-pr-recovery.py` to persist the existing PR and apply the label
+through the narrow issue-label REST fallback when the Projects scope is absent.

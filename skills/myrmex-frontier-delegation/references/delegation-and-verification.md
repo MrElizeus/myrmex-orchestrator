@@ -13,6 +13,10 @@ Translate the approved plan into one or more ordered `myrmex.work-order/v1` unit
 - Validate the returned `myrmex.work-result/v1` against Git state and actual files; never trust the summary alone.
 - Do not continue after scope drift, unresolved repository conflict, unsafe dirty-path ownership, or a material product/data/security decision.
 
+For finite scout or verifier fan-out, persist the complete task-ID set with `myrmex-state delegation-batch start` before launch. Completion is an explicit join: collect exactly one terminal structured result for every ID, persist `delegation_batch.completed`, consolidate evidence, and proceed once. A missing result gets one safe recovery attempt; a second unresolved collection is `BLOCKED_MISSING_DELEGATION_RESULT`. On recovery, use the saved batch rather than repeating already-evidenced inspections.
+
+Do not use missing provider environment variables as a delegation precondition. Resolve the effective OpenCode agent first; credential visibility to the parent is informational, while a real Task failure is recorded as `PROVIDER_INVOCATION_FAILED` with sanitized evidence.
+
 ## Independent verification
 
 Use `myrmex-verifier` for every frontier-planned code change. Supply the objective, approved plan/criteria, base and candidate identity, allowed/protected paths, worker result, known pre-existing failures, and requested checks.

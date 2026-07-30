@@ -16,6 +16,10 @@ requesting-plan
 waiting-for-frontier
 reviewing-plan
 implementing
+waiting-for-delegations
+collecting-delegation-results
+consolidating-evidence
+proceeding-to-next-gate
 verifying
 reporting
 parent-gate
@@ -36,7 +40,11 @@ collecting-context -> requesting-plan
 requesting-plan -> waiting-for-frontier
 waiting-for-frontier -> collecting-context | reviewing-plan | blocked | dormant
 reviewing-plan -> implementing | blocked
-implementing -> verifying | blocked | failed
+implementing -> waiting-for-delegations | verifying | blocked | failed
+waiting-for-delegations -> collecting-delegation-results | blocked
+collecting-delegation-results -> consolidating-evidence | blocked
+consolidating-evidence -> proceeding-to-next-gate | blocked
+proceeding-to-next-gate -> implementing | verifying | requesting-plan | blocked
 verifying -> implementing | reporting | blocked | failed
 reporting -> waiting-for-frontier
 waiting-for-frontier -> parent-gate        # continuous sub-objective complete
@@ -66,7 +74,7 @@ myrmex-state init \
 
 Add each protected dirty path with `--protected-dirty-path`. Persist the returned run ID and acquire `myrmex-state lock <run-id> --owner <stable-session-owner>` before side effects.
 
-Use `myrmex-state patch` for every phase/status/receipt transition and `myrmex-state event` for compact audit events. Prefer `--expect-revision` when recovery or concurrency is possible.
+Use `myrmex-state patch` for every phase/status/receipt transition and `myrmex-state event` for compact audit events. `myrmex-state` accepts only explicit pairs: all work phases are `/active`; `blocked/blocked`, `dormant/dormant`, `failed/failed`, `cancelled/cancelled`, and `superseded/superseded` are terminal. Prefer `--expect-revision` when recovery or concurrency is possible.
 
 ## Interactive gates
 

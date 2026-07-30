@@ -172,7 +172,7 @@ def main() -> int:
             if policy.get("block_shadowed_agents") and args.enforce:
                 failures.append("WARN_SHADOWED_AGENT:" + name)
         if effective is None:
-            status = "FAIL_AGENT_NOT_INSTALLED"
+            status = "AGENT_NOT_INSTALLED"
             if args.enforce:
                 failures.append(status + ":" + name)
 
@@ -184,7 +184,7 @@ def main() -> int:
 
         requires_model = name not in {"myrmex-orchestrator", "myrmex-frontier"}
         if requires_model and policy.get("require_resolved_model_for_delegation") and not model:
-            status = "BLOCKED_UNRESOLVED_AGENT_MODEL"
+            status = "AGENT_MODEL_UNRESOLVED"
             if args.enforce:
                 failures.append(status + ":" + name)
         if model and not any(model.startswith(prefix) for prefix in policy.get("allowed_provider_prefixes", [])):
@@ -211,6 +211,7 @@ def main() -> int:
         "agents": rows,
         "warnings": warnings,
         "errors": failures,
+        "credential_visibility": "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR is informational; environment credentials are not inspected for delegation readiness",
     }
     print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
     return 0 if not failures else 1

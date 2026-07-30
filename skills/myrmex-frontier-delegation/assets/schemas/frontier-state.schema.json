@@ -96,7 +96,11 @@
         "dormant",
         "failed",
         "cancelled",
-        "superseded"
+        "superseded",
+        "waiting-for-delegations",
+        "collecting-delegation-results",
+        "consolidating-evidence",
+        "proceeding-to-next-gate"
       ]
     },
     "status": {
@@ -320,9 +324,24 @@
               "started",
               "success",
               "failed",
-              "blocked"
+              "blocked",
+              "cancelled"
             ]
-          }
+          },
+          "outcome": {
+            "enum": [
+              "STARTED",
+              "SUCCESS",
+              "FAILED",
+              "BLOCKED",
+              "CANCELLED",
+              "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR",
+              "PROVIDER_INVOCATION_FAILED",
+              "AGENT_MODEL_UNRESOLVED",
+              "AGENT_NOT_INSTALLED"
+            ]
+          },
+          "evidence": {}
         }
       }
     },
@@ -413,6 +432,119 @@
     "no_progress_cycles": {
       "type": "integer",
       "minimum": 0
+    },
+    "delegation_batches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "batch_id",
+          "task_ids",
+          "expected_results",
+          "status",
+          "started_at",
+          "recovery_attempted",
+          "results",
+          "missing_task_ids",
+          "contradictions"
+        ],
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "task_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "expected_results": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "enum": [
+              "waiting-for-delegations",
+              "recovering-missing-delegation-result",
+              "consolidating-evidence",
+              "proceeded",
+              "blocked"
+            ]
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "completed_at": {
+            "type": "string"
+          },
+          "proceeded_at": {
+            "type": "string"
+          },
+          "next_phase": {
+            "type": "string"
+          },
+          "recovery_attempted": {
+            "type": "boolean"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "task_id",
+                "status",
+                "payload"
+              ],
+              "properties": {
+                "task_id": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "success",
+                    "failed",
+                    "blocked",
+                    "cancelled"
+                  ]
+                },
+                "payload": {}
+              }
+            }
+          },
+          "missing_task_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "contradictions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "completion": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "completed_at": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

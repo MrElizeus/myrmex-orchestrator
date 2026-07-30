@@ -54,6 +54,29 @@ Resume in OpenCode:
 
 The resume flow reconciles local state, memory, Git, and browser state before repeating any side effect.
 
+For a completed finite fan-out, resume from the persisted delegation batch rather
+than asking the user to continue. Myrmex records task IDs, waits for every final
+result, consolidates evidence once, and advances to the next gate once. A missing
+result gets one safe recovery attempt before `BLOCKED_MISSING_DELEGATION_RESULT`.
+
+Successful completion uses:
+
+```bash
+myrmex-state complete <run-id> --message "objective complete" --unlock-owner <owner>
+```
+
+This persists `dormant/dormant` and the completion event before releasing the
+run lock. Legacy `dormant/active` runs can be normalized safely with
+`myrmex-state migrate <run-id>`.
+
+## Draft PR recovery
+
+Keep GitHub create and label operations separate. When a draft PR may have been
+created before a later command failed, query the exact head/base pair first and
+use `scripts/github-pr-recovery.py`. It writes `PR_CREATED_LABEL_PENDING`
+immediately after creation and can use the issue-label REST fallback when
+`gh pr edit --add-label` lacks Projects scope, without creating a duplicate PR.
+
 ## Updating
 
 Re-run `install.sh` from a newer package. Existing Myrmex files and the state binary are timestamped into backups before replacement. Unrelated files remain untouched.
