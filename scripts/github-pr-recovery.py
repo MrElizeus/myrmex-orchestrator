@@ -2,8 +2,10 @@
 """Create and label a draft GitHub PR without repeating successful side effects.
 
 The helper deliberately separates discovery, creation, persistence, and label
-application. It never pushes a branch and it never prints command stderr, which
-may contain environment-specific details.
+application. It owns only its local artifact receipt: the caller must persist
+the typed `pull_request` operation intent/receipt/confirmation in
+`myrmex-state`. It never pushes a branch and it never prints command stderr,
+which may contain environment-specific details.
 """
 from __future__ import annotations
 
@@ -62,20 +64,8 @@ def find_pr(repo: str, head: str, base: str) -> dict[str, Any] | None:
     return None
 
 
-def persist(record: dict[str, Any], receipt: Path, state_bin: str | None, state_run: str | None) -> None:
+def persist(record: dict[str, Any], receipt: Path) -> None:
     atomic_json(receipt, record)
-    if state_bin and state_run:
-        patch = json.dumps({"receipts.github_pr": record}, ensure_ascii=False)
-        result = subprocess.run(
-            [state_bin, "patch", state_run, "--json-patch", patch],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("could not persist GitHub PR receipt to myrmex-state")
-        subprocess.run(
-            [state_bin, "event", state_run, "--type", "github.pr_receipt", "--data-json", json.dumps(record)],
-            capture_output=True, text=True, timeout=30,
-        )
 
 
 def result_record(status: str, repo: str, head: str, base: str, pr: dict[str, Any] | None, label: str | None) -> dict[str, Any]:
@@ -99,11 +89,17 @@ def main() -> int:
     parser.add_argument("--body-file", required=True)
     parser.add_argument("--label")
     parser.add_argument("--receipt-file", required=True)
-    parser.add_argument("--state-bin")
-    parser.add_argument("--state-run")
+    # Retain the old flags only long enough to fail safely before any GitHub
+    # effect.  A blind `patch` had no optimistic revision and could overwrite
+    # typed state written by a concurrent recovery process.
+    parser.add_argument("--state-bin", help=argparse.SUPPRESS)
+    parser.add_argument("--state-run", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if bool(args.state_bin) != bool(args.state_run):
-        raise SystemExit("--state-bin and --state-run must be provided together")
+    if args.state_bin or args.state_run:
+        raise SystemExit(
+            "--state-bin/--state-run are retired: persist a typed pull_request operation "
+            "with myrmex-state before and after github-pr-recovery.py"
+        )
 
     receipt = Path(args.receipt_file).expanduser().resolve()
     pr = find_pr(args.repo, args.head, args.base)
@@ -122,16 +118,16 @@ def main() -> int:
             pr = find_pr(args.repo, args.head, args.base)
             if pr is None:
                 record = result_record("PR_CREATION_FAILED", args.repo, args.head, args.base, None, args.label)
-                persist(record, receipt, args.state_bin, args.state_run)
+                persist(record, receipt)
                 print(json.dumps(record, indent=2, sort_keys=True))
                 return 1
 
     record = result_record("PR_CREATED_LABEL_PENDING", args.repo, args.head, args.base, pr, args.label)
     record["created_now"] = created_now
-    persist(record, receipt, args.state_bin, args.state_run)
+    persist(record, receipt)
     if not args.label:
         record["status"] = "PR_CREATED"
-        persist(record, receipt, args.state_bin, args.state_run)
+        persist(record, receipt)
         print(json.dumps(record, indent=2, sort_keys=True))
         return 0
 
@@ -139,7 +135,7 @@ def main() -> int:
     if edit.returncode == 0:
         record["status"] = "PR_CREATED"
         record["label_method"] = "gh-pr-edit"
-        persist(record, receipt, args.state_bin, args.state_run)
+        persist(record, receipt)
         print(json.dumps(record, indent=2, sort_keys=True))
         return 0
 
@@ -148,7 +144,7 @@ def main() -> int:
     if confirmed is None:
         record["status"] = "LABEL_APPLICATION_FAILED"
         record["label_method"] = "pr-not-found-after-edit-error"
-        persist(record, receipt, args.state_bin, args.state_run)
+        persist(record, receipt)
         print(json.dumps(record, indent=2, sort_keys=True))
         return 1
     pr = confirmed
@@ -160,12 +156,12 @@ def main() -> int:
     if fallback.returncode != 0:
         record["status"] = "LABEL_APPLICATION_FAILED"
         record["label_method"] = "rest-fallback-failed"
-        persist(record, receipt, args.state_bin, args.state_run)
+        persist(record, receipt)
         print(json.dumps(record, indent=2, sort_keys=True))
         return 1
     record["status"] = "PR_CREATED"
     record["label_method"] = "rest-issue-label-fallback"
-    persist(record, receipt, args.state_bin, args.state_run)
+    persist(record, receipt)
     print(json.dumps(record, indent=2, sort_keys=True))
     return 0
 

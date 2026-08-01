@@ -28,6 +28,9 @@ elif args[:2] == ["pr", "edit"]:
     print("error: your authentication token is missing required scopes [read:project]", file=sys.stderr)
     raise SystemExit(1)
 elif args[:1] == ["api"]:
+    if os.environ.get("FAKE_GH_API_FAIL") == "1":
+        print("label fallback failed", file=sys.stderr)
+        raise SystemExit(1)
     print("[]")
 else:
     raise SystemExit("unexpected gh invocation: " + repr(args))
@@ -57,5 +60,28 @@ with tempfile.TemporaryDirectory(prefix="myrmex-gh-recovery-") as td:
     assert sum(call[:2] == ["pr", "edit"] for call in calls) == 1, calls
     assert sum(call[:1] == ["api"] for call in calls) == 1, calls
     assert sum(call[:2] == ["pr", "list"] for call in calls) >= 2, calls
+
+    # A failed narrow label fallback still writes the terminal artifact record
+    # rather than throwing while attempting obsolete state persistence.
+    failed_receipt = root / "failed-receipt.json"
+    fallback_failure = subprocess.run([
+        "python3", str(HELPER), "--repo", "acme/myrmex", "--head", "fix/example", "--base", "main",
+        "--title", "fix: example", "--body-file", str(body), "--label", "type:bug", "--receipt-file", str(failed_receipt),
+    ], capture_output=True, text=True, env=dict(env, FAKE_GH_API_FAIL="1"), timeout=30)
+    assert fallback_failure.returncode == 1, fallback_failure.stderr
+    failed_payload = json.loads(fallback_failure.stdout)
+    assert failed_payload["status"] == "LABEL_APPLICATION_FAILED"
+    assert json.loads(failed_receipt.read_text())["label_method"] == "rest-fallback-failed"
+
+    # The helper no longer accepts the old revision-less state patch bridge.
+    # Refusal occurs before discovery/create can cause another GitHub effect.
+    before = (root / "log").read_text()
+    retired = subprocess.run([
+        "python3", str(HELPER), "--repo", "acme/myrmex", "--head", "fix/example", "--base", "main",
+        "--title", "fix: example", "--body-file", str(body), "--label", "type:bug", "--receipt-file", str(receipt),
+        "--state-bin", "/bin/false", "--state-run", "myrmex-test-run",
+    ], capture_output=True, text=True, env=env, timeout=30)
+    assert retired.returncode != 0 and "retired" in retired.stderr
+    assert (root / "log").read_text() == before
 
 print("GitHub PR recovery test: PASS")

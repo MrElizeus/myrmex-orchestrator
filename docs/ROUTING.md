@@ -13,6 +13,25 @@ Prefer DIRECT when:
 
 File count alone does not disqualify DIRECT.
 
+### Persisted `direct-only`
+
+For a long-running or resumable run, an explicit user instruction such as
+“resolve it yourself” or “do not delegate” is persisted as `direct-only`:
+
+```bash
+myrmex-state route set <run-id> \
+  --policy direct-only --authority user --request-id <request-id> \
+  --expect-revision <n>
+```
+
+It locks the effective route to DIRECT, rejects new delegation batches and
+Frontier requests with `BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY`, and
+survives resume/migration. Tests, linters, type checks, builds, diff review,
+and ordinary Git safety gates remain available. Switching into this policy is
+rejected while child tasks, an incomplete batch, a pending Frontier exchange,
+or a pending external operation still needs reconciliation. The legacy spelling
+`myrmex-state route <run-id> set ...` remains accepted for persisted runbooks.
+
 ## DELEGATED
 
 Prefer DELEGATED when:

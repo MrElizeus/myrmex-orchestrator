@@ -55,6 +55,9 @@ send a user prompt merely to continue consolidation.
 
 ## A GitHub label command failed after PR creation
 
-Do not repeat `gh pr create`. Query the head/base PR first. Use
-`scripts/github-pr-recovery.py` to persist the existing PR and apply the label
-through the narrow issue-label REST fallback when the Projects scope is absent.
+Do not repeat `gh pr create`. Run `myrmex-state reconcile <run-id>`, query the
+saved head/base PR identity first, and use `scripts/github-pr-recovery.py` to
+write a local artifact and apply the label through the narrow issue-label REST
+fallback when the Projects scope is absent. Persist discovery/receipt through
+the typed `pull_request` operation lifecycle; the helper no longer patches
+state directly.

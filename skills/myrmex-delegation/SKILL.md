@@ -24,6 +24,9 @@ Use this skill when a normal coding objective benefits from fresh context, broad
 - Do not silently expand scope, launch competing writers, or introduce SDD.
 - Resolve an agent/model/provider through OpenCode precedence before delegation. Never treat an absent provider environment variable as proof that Task cannot route the agent.
 - `CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR` is informational. Only a real Task failure records `PROVIDER_INVOCATION_FAILED`; resolver-backed `AGENT_MODEL_UNRESOLVED` and `AGENT_NOT_INSTALLED` are blocking states.
+- For a persisted run, enforce `execution.requested_policy` before starting a
+  Task. `direct-only` forbids new delegation and must never be bypassed by a
+  resume or a correction loop.
 
 ## Flow
 
@@ -53,4 +56,12 @@ Read `references/work-order.md` and `references/verification.md` when constructi
 
 Use scripts/collect-git-evidence.py for receipts and scripts/validate-diff-size.py for the flexible 400-line policy.
 
-The state CLI enforces the two-correction budget. A third correction returns BLOCKED_CORRECTION_BUDGET. Record each verification cycle with corrected, remaining, and new defects; two consecutive non-reducing cycles return BLOCKED_NO_PROGRESS.
+The state CLI enforces the default two-correction budget **per work unit**.
+Use `myrmex-state correction start` to record each correction with its
+work-unit ID, source request, defect-scope digest, and source candidate SHA. A third correction blocks only that work
+unit (`BLOCKED_CORRECTION_BUDGET`); a separately configured
+`max_total_corrections` can block the run as a cost guard. Use the typed
+`myrmex-state correction authorize` command for a bounded, matching override;
+never clear a correction blocker with `patch`. Record each verification cycle
+against the same work unit; two consecutive non-reducing cycles return
+`BLOCKED_NO_PROGRESS` for that unit.

@@ -24,10 +24,14 @@ Use only for explicit frontier/browser intent or a Myrmex frontier command. Use 
 Before sending:
 
 1. Run `myrmex-state doctor` and initialize/resume a run.
-2. Confirm `myrmex-frontier` and Playwright MCP are available with an already authenticated profile/conversation.
-3. Confirm repository evidence can be sanitized without secrets, customer/production data, or unrelated source.
-4. Record commit and push policies separately.
-5. Treat semantic memory as recommended continuity; local state remains authoritative for exact phase/receipts.
+2. Inspect the persisted execution policy. If it is `direct-only`, do not start
+   or recover a Frontier exchange; report the execution-policy blocker.
+3. Confirm `myrmex-frontier` and Playwright MCP are available with an already authenticated profile/conversation.
+4. Confirm repository evidence can be sanitized without secrets, customer/production data, or unrelated source.
+5. Before browser transport, use `myrmex-state frontier <run-id> start` to
+   record the stable request/task idempotency identity; it enforces the route.
+6. Record commit and push policies separately.
+7. Treat semantic memory as recommended continuity; local state remains authoritative for exact phase/receipts.
 
 If a prerequisite fails, persist `blocked` and report the single human action required. Never invent a local replacement plan.
 
@@ -50,7 +54,7 @@ Read before execution:
 1. Initialize/resume and lock the run with `myrmex-state`.
 2. Build a compact sanitized `myrmex.repository-context/v1`, normally through `myrmex-scout` plus targeted reads.
 3. Render `assets/proposed-plan-prompt.md` with a unique request ID.
-4. Persist the outbound artifact/digest, construct `myrmex.frontier-exchange/v1`, and delegate exactly one exchange to `myrmex-frontier`.
+4. Persist the outbound artifact/digest, record `myrmex-state frontier <run-id> start`, construct `myrmex.frontier-exchange/v1`, and delegate exactly one exchange to `myrmex-frontier`.
 5. The transport actively waits; validate its stable newest-assistant result and parse only the exact request-scoped frontier response.
 6. Repository-answerable clarification: collect safe supplemental evidence and continue. Material human decision: block.
 7. Plan: translate ordered work to `myrmex.work-order/v1`, execute one writer at a time, and verify proportionately.
@@ -68,7 +72,7 @@ Read before execution:
 - Never commit without local verification; never push without explicit current-run authorization.
 - Autonomous waiting occurs inside `myrmex-frontier`; neither transport nor parent may end with a mere waiting status while a response can still arrive.
 - Apply bounded iterations, one reload, and at most one failover chat. Exhaustion becomes `blocked`.
-- Persist before every browser exchange, delegation, correction, commit/push, and terminal transition.
+- Persist before every browser exchange, delegation, correction, commit/push, and terminal transition. Use the typed operation ledger as `intent → observed effect → receipt → terminal confirmation`, and call `myrmex-state reconcile` before resume can repeat an external effect.
 
 ## Report
 

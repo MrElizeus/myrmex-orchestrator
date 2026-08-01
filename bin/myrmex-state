@@ -18,7 +18,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "myrmex.frontier-state/v1"
+SCHEMA_V1 = "myrmex.frontier-state/v1"
+SCHEMA_V2 = "myrmex.frontier-state/v2"
+# New runs always use v2.  v1 remains readable only so an operator can inspect
+# it and perform an explicit, auditable migration.
+SCHEMA = SCHEMA_V2
+SUPPORTED_SCHEMAS = {
+    (SCHEMA_V1, 1),
+    (SCHEMA_V2, 2),
+}
 PHASES = {
     "initializing", "collecting-context", "requesting-plan", "waiting-for-frontier",
     "reviewing-plan", "implementing", "verifying", "reporting", "parent-gate",
@@ -28,6 +36,14 @@ PHASES = {
 }
 STATUSES = {"active", "blocked", "dormant", "failed", "cancelled", "superseded"}
 POLICIES = {"deny", "ask", "authorized"}
+EXECUTION_POLICIES = {"auto", "direct-only", "delegated", "frontier"}
+EFFECTIVE_ROUTES = {"auto", "direct", "delegated", "frontier"}
+EXECUTION_ROUTE = {
+    "auto": "auto",
+    "direct-only": "direct",
+    "delegated": "delegated",
+    "frontier": "frontier",
+}
 PUSH_STATUSES = {"not_requested", "unauthorized", "pending", "pushed", "failed"}
 MEMORY_STATUSES = {"available", "degraded", "unavailable"}
 PHASE_STATUS = {
@@ -43,12 +59,81 @@ PHASE_STATUS = {
     "cancelled": "cancelled",
     "superseded": "superseded",
 }
+# Normal active-run phase changes are deliberately narrow. Operations with
+# stronger preconditions (completion, cancellation, delegation batches, and
+# correction recovery) keep their own domain commands instead of flowing
+# through this generic transition primitive.
+ALLOWED_ACTIVE_TRANSITIONS = {
+    "initializing": {"collecting-context"},
+    "collecting-context": {"requesting-plan", "implementing", "waiting-for-delegations"},
+    "requesting-plan": {"waiting-for-frontier", "reviewing-plan", "implementing"},
+    "waiting-for-frontier": {"reviewing-plan"},
+    "reviewing-plan": {"implementing", "parent-gate"},
+    "implementing": {"verifying", "waiting-for-delegations", "reporting"},
+    "waiting-for-delegations": {"collecting-delegation-results", "consolidating-evidence"},
+    "collecting-delegation-results": {"consolidating-evidence"},
+    "consolidating-evidence": {"proceeding-to-next-gate"},
+    "proceeding-to-next-gate": {"implementing", "verifying", "reporting", "parent-gate", "committing"},
+    "verifying": {"implementing", "reporting", "parent-gate", "committing"},
+    "reporting": {"parent-gate", "committing"},
+    "parent-gate": {"implementing", "verifying", "reporting", "committing"},
+    "committing": {"pushing", "reporting"},
+    "pushing": {"reporting"},
+}
 DELEGATION_OUTCOMES = {
     "STARTED", "SUCCESS", "FAILED", "BLOCKED", "CANCELLED",
     "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR", "PROVIDER_INVOCATION_FAILED",
     "AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED",
 }
 TERMINAL_TASK_STATUSES = {"success", "failed", "blocked", "cancelled"}
+WORK_UNIT_STATUSES = {"active", "remediating", "complete", "blocked", "cancelled", "legacy-ambiguous"}
+CORRECTION_AUTHORITIES = {"frontier", "verifier", "user"}
+OPERATION_KINDS = {
+    "frontier_exchange", "delegation", "tracking_issue", "pull_request",
+    "ci", "local_verification", "parent_gate", "git_delivery",
+}
+OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirmed", "failed", "abandoned"}
+TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
+PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+GIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+WORK_UNIT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+OPERATION_ID_RE = re.compile(r"op-[0-9a-f]{24}")
+# `patch` is retained only for non-critical metadata while the state-machine
+# commands are introduced incrementally. These prefixes are intentionally
+# checked before applying a dotted key so a caller cannot bypass a domain
+# transition by writing a descendant directly.
+PROTECTED_PATCH_PATHS = {
+    "phase",
+    "status",
+    "blocker",
+    "execution",
+    "commit_policy",
+    "push_policy",
+    "push_status",
+    "branch",
+    "base_sha",
+    "commit_sha",
+    "completion",
+    "frontier_task_id",
+    "last_request_id",
+    "last_outbound_digest",
+    "last_response_digest",
+    "plan_revision",
+    "worker_task_id",
+    "verification_revision",
+    "receipts",
+    "budgets",
+    "attempts",
+    "active_work_unit_id",
+    "work_units",
+    "remediation",
+    "correction",
+    "authorizations",
+    "pending_operations",
+    "delegation_ledger",
+    "delegation_batches",
+}
 
 
 def utcnow() -> str:
@@ -110,9 +195,25 @@ def read_state(run_id: str) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise SystemExit(f"invalid state for {run_id}: {exc}") from exc
-    if data.get("schema") != SCHEMA:
-        raise SystemExit(f"unsupported state schema for {run_id}: {data.get('schema')!r}")
+    pair = (data.get("schema"), data.get("schema_version"))
+    if pair not in SUPPORTED_SCHEMAS:
+        raise SystemExit(
+            f"unsupported state schema/version for {run_id}: "
+            f"{data.get('schema')!r}/{data.get('schema_version')!r}"
+        )
     return data
+
+
+def state_is_v2(data: dict[str, Any]) -> bool:
+    return data.get("schema") == SCHEMA_V2 and data.get("schema_version") == 2
+
+
+def require_v2(data: dict[str, Any], command: str) -> None:
+    """Keep schema upgrades explicit instead of changing a run during a write."""
+    if not state_is_v2(data):
+        raise SystemExit(
+            f"{command} requires {SCHEMA_V2}; run `myrmex-state migrate {data.get('run_id')}` first"
+        )
 
 
 def sanitize_evidence(value: Any) -> Any:
@@ -151,10 +252,41 @@ def normalize_legacy_state(data: dict[str, Any]) -> list[str]:
     elif isinstance(data["delegation_ledger"], dict):
         data["delegation_ledger"] = [data["delegation_ledger"]]
         changes.append("wrapped legacy delegation_ledger object")
+    if "execution" not in data:
+        data["execution"] = {
+            "requested_policy": "auto",
+            "effective_route": "auto",
+            "authority": "system",
+            "request_id": None,
+            "set_at": data.get("created_at") or utcnow(),
+            "locked": False,
+        }
+        changes.append("initialized execution policy")
+    if "pending_operations" not in data:
+        data["pending_operations"] = []
+        changes.append("initialized pending operation ledger")
     return changes
 
 
+def ensure_v2_defaults(data: dict[str, Any]) -> None:
+    """Hydrate additive v2 fields on the next explicit state write.
+
+    The operation ledger was added after v2 shipped.  Treat a missing field as
+    an older v2 shape while reading, but make the first typed write durable so
+    new recovery logic never has to infer an empty ledger from an omission.
+    """
+    if state_is_v2(data) and "pending_operations" not in data:
+        data["pending_operations"] = []
+
+
 def write_state(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
+    """Atomically write only v2 state.
+
+    A v1 state is intentionally never upgraded as a side effect of an ordinary
+    domain command.  `migrate` performs that conversion after creating a backup.
+    """
+    require_v2(data, "state write")
+    ensure_v2_defaults(data)
     run_id = str(data["run_id"])
     path = run_dir(run_id) / "state.json"
     current_revision = -1
@@ -187,7 +319,92 @@ def write_state(data: dict[str, Any], expected_revision: int | None = None) -> d
     return data
 
 
-def validate_state(data: dict[str, Any]) -> None:
+def validate_execution(data: dict[str, Any], *, required: bool) -> None:
+    execution = data.get("execution")
+    if execution is None and not required:
+        return
+    if not isinstance(execution, dict):
+        raise SystemExit("execution must be an object")
+    if execution.get("requested_policy") not in EXECUTION_POLICIES:
+        raise SystemExit("invalid requested execution policy")
+    expected_route = EXECUTION_ROUTE[execution["requested_policy"]]
+    if execution.get("effective_route") != expected_route or execution.get("effective_route") not in EFFECTIVE_ROUTES:
+        raise SystemExit("invalid effective execution route")
+    if not isinstance(execution.get("authority"), str) or not execution["authority"]:
+        raise SystemExit("execution authority must be a non-empty string")
+    if execution.get("request_id") is not None and not isinstance(execution["request_id"], str):
+        raise SystemExit("execution request_id must be a string or null")
+    if not isinstance(execution.get("set_at"), str) or not execution["set_at"]:
+        raise SystemExit("execution set_at must be a timestamp string")
+    if not isinstance(execution.get("locked"), bool):
+        raise SystemExit("execution locked must be boolean")
+
+
+def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None:
+    """Validate the durable side-effect ledger without interpreting effects.
+
+    `required=False` accepts the first v2 shape that predates this additive
+    ledger.  A mutating command hydrates it through ``ensure_v2_defaults``;
+    reconciliation then treats legacy external identifiers conservatively.
+    """
+    operations = data.get("pending_operations")
+    if operations is None and not required:
+        return
+    if not isinstance(operations, list):
+        raise SystemExit("pending_operations must be an array")
+    operation_ids: set[str] = set()
+    idempotency: set[tuple[str, str]] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise SystemExit("pending operation must be an object")
+        operation_id = operation.get("operation_id")
+        if not isinstance(operation_id, str) or not OPERATION_ID_RE.fullmatch(operation_id):
+            raise SystemExit("pending operation has an invalid operation_id")
+        if operation_id in operation_ids:
+            raise SystemExit("pending operation IDs must be unique")
+        operation_ids.add(operation_id)
+        kind = operation.get("kind")
+        if kind not in OPERATION_KINDS:
+            raise SystemExit("pending operation has an invalid kind")
+        key = operation.get("idempotency_key")
+        if not isinstance(key, str) or not key:
+            raise SystemExit("pending operation requires an idempotency_key")
+        identity = (kind, key)
+        if identity in idempotency:
+            raise SystemExit("pending operation kind/idempotency_key must be unique")
+        idempotency.add(identity)
+        if operation.get("status") not in OPERATION_STATUSES:
+            raise SystemExit("pending operation has an invalid status")
+        if not isinstance(operation.get("intent"), dict):
+            raise SystemExit("pending operation intent must be an object")
+        for timestamp in ("created_at", "updated_at"):
+            if not isinstance(operation.get(timestamp), str) or not operation[timestamp]:
+                raise SystemExit(f"pending operation {timestamp} must be a timestamp string")
+        effect = operation.get("effect")
+        receipt = operation.get("receipt")
+        if effect is not None and not isinstance(effect, dict):
+            raise SystemExit("pending operation effect must be an object or null")
+        if receipt is not None and not isinstance(receipt, dict):
+            raise SystemExit("pending operation receipt must be an object or null")
+        if operation["status"] == "intent" and (effect is not None or receipt is not None):
+            raise SystemExit("intent operation cannot already have effect or receipt")
+        if operation["status"] == "effect-observed" and effect is None:
+            raise SystemExit("effect-observed operation requires effect")
+        if operation["status"] == "receipt-recorded" and (effect is None or receipt is None):
+            raise SystemExit("receipt-recorded operation requires effect and receipt")
+        if operation["status"] == "confirmed" and (effect is None or receipt is None):
+            raise SystemExit("confirmed operation requires observed effect and receipt")
+        if operation["status"] in TERMINAL_OPERATION_STATUSES:
+            if not isinstance(operation.get("confirmed_at"), str) or not operation["confirmed_at"]:
+                raise SystemExit("terminal operation requires confirmed_at")
+        elif operation.get("confirmed_at") is not None:
+            raise SystemExit("non-terminal operation cannot have confirmed_at")
+        reason = operation.get("terminal_reason")
+        if reason is not None and not isinstance(reason, str):
+            raise SystemExit("pending operation terminal_reason must be a string or null")
+
+
+def validate_common_state(data: dict[str, Any]) -> None:
     required = [
         "schema", "schema_version", "run_id", "objective_id", "objective", "scope",
         "mode", "phase", "status", "repository_root", "protected_dirty_paths",
@@ -196,7 +413,7 @@ def validate_state(data: dict[str, Any]) -> None:
     missing = [key for key in required if key not in data]
     if missing:
         raise SystemExit(f"state missing fields: {', '.join(missing)}")
-    if data["schema"] != SCHEMA or data["schema_version"] != 1:
+    if (data["schema"], data["schema_version"]) not in SUPPORTED_SCHEMAS:
         raise SystemExit("unsupported state schema/version")
     validate_run_id(str(data["run_id"]))
     if data["scope"] not in {"narrow", "continuous"}:
@@ -223,13 +440,6 @@ def validate_state(data: dict[str, Any]) -> None:
         raise SystemExit("invalid memory_status")
     if not isinstance(data["protected_dirty_paths"], list) or not all(isinstance(x, str) for x in data["protected_dirty_paths"]):
         raise SystemExit("protected_dirty_paths must be an array of strings")
-    if not isinstance(data.get("budgets"), dict):
-        raise SystemExit("budgets must be an object")
-    for key in ["max_wait_seconds", "max_plan_iterations", "max_worker_corrections", "max_failover_chats"]:
-        if not isinstance(data["budgets"].get(key), int) or data["budgets"][key] < 0:
-            raise SystemExit(f"invalid budget: {key}")
-    if data["budgets"]["max_wait_seconds"] < 30 or data["budgets"]["max_plan_iterations"] < 1:
-        raise SystemExit("invalid frontier budgets")
     if not isinstance(data.get("receipts"), dict):
         raise SystemExit("receipts must be an object")
     if not isinstance(data.get("delegation_ledger"), list):
@@ -256,11 +466,142 @@ def validate_state(data: dict[str, Any]) -> None:
         raise SystemExit("defect_history must be an array")
     if not isinstance(data.get("no_progress_cycles"), int) or data["no_progress_cycles"] < 0:
         raise SystemExit("no_progress_cycles must be a non-negative integer")
-    if data["attempts"]["corrections"] > data["budgets"]["max_worker_corrections"]:
-        raise SystemExit("BLOCKED_CORRECTION_BUDGET")
     if not isinstance(data.get("revision"), int) or data["revision"] < 0:
         raise SystemExit("revision must be a non-negative integer")
 
+
+def validate_state(data: dict[str, Any]) -> None:
+    validate_common_state(data)
+    is_v2 = state_is_v2(data)
+    validate_execution(data, required=is_v2)
+    validate_pending_operations(data, required=False)
+    if not isinstance(data.get("budgets"), dict):
+        raise SystemExit("budgets must be an object")
+
+    if not is_v2:
+        for key in ["max_wait_seconds", "max_plan_iterations", "max_worker_corrections", "max_failover_chats"]:
+            if not isinstance(data["budgets"].get(key), int) or data["budgets"][key] < 0:
+                raise SystemExit(f"invalid budget: {key}")
+        if data["budgets"]["max_wait_seconds"] < 30 or data["budgets"]["max_plan_iterations"] < 1:
+            raise SystemExit("invalid frontier budgets")
+        if data["attempts"]["corrections"] > data["budgets"]["max_worker_corrections"]:
+            raise SystemExit("BLOCKED_CORRECTION_BUDGET")
+        return
+
+    for key in ["max_wait_seconds", "max_plan_iterations", "max_corrections_per_work_unit", "max_failover_chats"]:
+        if not isinstance(data["budgets"].get(key), int) or data["budgets"][key] < 0:
+            raise SystemExit(f"invalid budget: {key}")
+    if data["budgets"]["max_wait_seconds"] < 30 or data["budgets"]["max_plan_iterations"] < 1:
+        raise SystemExit("invalid frontier budgets")
+    max_total = data["budgets"].get("max_total_corrections")
+    if max_total is not None and (not isinstance(max_total, int) or max_total < 0):
+        raise SystemExit("invalid budget: max_total_corrections")
+
+    work_units = data.get("work_units")
+    if not isinstance(work_units, dict):
+        raise SystemExit("work_units must be an object")
+    normal_total = 0
+    legacy_total = 0
+    for work_unit_id, work_unit in work_units.items():
+        if not isinstance(work_unit_id, str) or not isinstance(work_unit, dict):
+            raise SystemExit("work_units must map IDs to objects")
+        status = work_unit.get("status")
+        if work_unit_id == "__legacy__":
+            if status != "legacy-ambiguous":
+                raise SystemExit("__legacy__ work unit must be legacy-ambiguous")
+            legacy_total = work_unit.get("corrections_used", -1)
+        else:
+            if not WORK_UNIT_ID_RE.fullmatch(work_unit_id):
+                raise SystemExit(f"invalid work unit id: {work_unit_id!r}")
+            if work_unit.get("work_unit_id") != work_unit_id:
+                raise SystemExit("work unit key/id mismatch")
+            if status not in WORK_UNIT_STATUSES - {"legacy-ambiguous"}:
+                raise SystemExit("invalid work unit status")
+            normal_total += work_unit.get("corrections_used", -1)
+        for key in ["base_correction_limit", "corrections_used", "no_progress_cycles"]:
+            if not isinstance(work_unit.get(key), int) or work_unit[key] < 0:
+                raise SystemExit(f"invalid work unit {key}")
+
+    active_work_unit_id = data.get("active_work_unit_id")
+    if active_work_unit_id is not None and active_work_unit_id not in work_units:
+        raise SystemExit("active_work_unit_id must reference a work unit")
+    if active_work_unit_id == "__legacy__":
+        raise SystemExit("__legacy__ cannot be active")
+
+    remediation = data.get("remediation")
+    if not isinstance(remediation, dict):
+        raise SystemExit("remediation must be an object")
+    total = remediation.get("total_corrections_used")
+    if not isinstance(total, int) or total < 0:
+        raise SystemExit("invalid remediation total_corrections_used")
+    if remediation.get("max_total_corrections") != max_total:
+        raise SystemExit("remediation max_total_corrections must match budgets")
+    if total != normal_total + legacy_total or data["attempts"]["corrections"] != total:
+        raise SystemExit("correction totals are inconsistent")
+    if max_total is not None and total > max_total:
+        raise SystemExit("BLOCKED_TOTAL_CORRECTION_BUDGET")
+    grants = remediation.get("grants")
+    if not isinstance(grants, list):
+        raise SystemExit("remediation grants must be an array")
+    grant_ids: set[str] = set()
+    consumed_by_work_unit: dict[str, int] = {}
+    for grant in grants:
+        if not isinstance(grant, dict):
+            raise SystemExit("remediation grant must be an object")
+        grant_id = grant.get("grant_id")
+        if not isinstance(grant_id, str) or not grant_id or grant_id in grant_ids:
+            raise SystemExit("remediation grant_id must be unique")
+        grant_ids.add(grant_id)
+        if grant.get("authority") not in CORRECTION_AUTHORITIES:
+            raise SystemExit("invalid remediation grant authority")
+        work_unit_id = grant.get("work_unit_id")
+        if work_unit_id not in work_units or work_unit_id == "__legacy__":
+            raise SystemExit("remediation grant references unknown work unit")
+        if not isinstance(grant.get("request_id"), str) or not grant["request_id"]:
+            raise SystemExit("remediation grant request_id is required")
+        if not isinstance(grant.get("scope_digest"), str) or not SHA256_RE.fullmatch(grant["scope_digest"]):
+            raise SystemExit("remediation grant scope_digest must be lowercase SHA-256")
+        if not isinstance(grant.get("source_candidate_sha"), str) or not GIT_SHA_RE.fullmatch(grant["source_candidate_sha"]):
+            raise SystemExit("remediation grant source_candidate_sha is invalid")
+        for key in ["granted_attempts", "consumed_attempts"]:
+            if not isinstance(grant.get(key), int) or grant[key] < 0:
+                raise SystemExit(f"invalid remediation grant {key}")
+        if grant["consumed_attempts"] > grant["granted_attempts"]:
+            raise SystemExit("remediation grant over-consumed")
+        if grant.get("status") not in {"open", "consumed", "expired", "revoked"}:
+            raise SystemExit("invalid remediation grant status")
+        consumed_by_work_unit[work_unit_id] = consumed_by_work_unit.get(work_unit_id, 0) + grant["consumed_attempts"]
+    for work_unit_id, work_unit in work_units.items():
+        if work_unit_id == "__legacy__":
+            continue
+        if work_unit["corrections_used"] > work_unit["base_correction_limit"] + consumed_by_work_unit.get(work_unit_id, 0):
+            raise SystemExit("work unit correction count exceeds authorized capacity")
+
+    blocked = remediation.get("blocked")
+    if blocked is not None:
+        if not isinstance(blocked, dict):
+            raise SystemExit("remediation blocked must be an object or null")
+        scope = blocked.get("scope")
+        if scope not in {"work_unit", "run", "legacy-ambiguous"}:
+            raise SystemExit("invalid remediation blocker scope")
+        if data["phase"] != "blocked" or data["status"] != "blocked":
+            raise SystemExit("remediation blocker requires blocked run")
+        if scope == "work_unit":
+            if data.get("blocker") != "BLOCKED_CORRECTION_BUDGET" or blocked.get("work_unit_id") not in work_units:
+                raise SystemExit("invalid work-unit correction blocker")
+            if not isinstance(blocked.get("source_request_id"), str) or not blocked["source_request_id"]:
+                raise SystemExit("work-unit correction blocker requires source_request_id")
+            if not isinstance(blocked.get("scope_digest"), str) or not SHA256_RE.fullmatch(blocked["scope_digest"]):
+                raise SystemExit("work-unit correction blocker requires scope_digest")
+            if not isinstance(blocked.get("source_candidate_sha"), str) or not GIT_SHA_RE.fullmatch(blocked["source_candidate_sha"]):
+                raise SystemExit("work-unit correction blocker requires source_candidate_sha")
+        elif scope == "run":
+            if data.get("blocker") != "BLOCKED_TOTAL_CORRECTION_BUDGET" or blocked.get("work_unit_id") is not None:
+                raise SystemExit("invalid run correction blocker")
+        elif blocked.get("work_unit_id") is not None:
+            raise SystemExit("legacy correction blocker cannot identify a work unit")
+    elif data.get("blocker") in {"BLOCKED_CORRECTION_BUDGET", "BLOCKED_TOTAL_CORRECTION_BUDGET"}:
+        raise SystemExit("correction blocker requires remediation context")
 
 def latest_run() -> str:
     marker = state_home() / "latest"
@@ -301,6 +642,19 @@ def set_dotted(target: dict[str, Any], key: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
+def ensure_patch_key_is_allowed(key: str) -> None:
+    """Reject generic writes to state-machine-owned fields.
+
+    This check intentionally runs before `set_dotted`: allowing a parent or a
+    child path would otherwise make the protected list trivially bypassable.
+    """
+    root = key.split(".", 1)[0]
+    if root in PROTECTED_PATCH_PATHS:
+        raise SystemExit(
+            f"patch cannot modify protected state path: {key}; use a typed domain command"
+        )
+
+
 def append_event(run_id: str, event_type: str, message: str | None, data: Any) -> dict[str, Any]:
     directory = run_dir(run_id)
     if not (directory / "state.json").is_file():
@@ -339,10 +693,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for path in runs_dir().glob("*/state.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                changes = normalize_legacy_state(data)
+                changes: list[str] = []
+                if not state_is_v2(data):
+                    # Normalize only the in-memory diagnostic copy.  A read or
+                    # doctor run never upgrades the on-disk v1 state.
+                    changes = normalize_legacy_state(data)
                 validate_state(data)
-                if changes:
-                    warnings.append(f"{path.parent.name}: legacy state can be normalized: {', '.join(changes)}")
+                if not state_is_v2(data):
+                    detail = f"; normalizations available: {', '.join(changes)}" if changes else ""
+                    warnings.append(f"{path.parent.name}: v1 state requires explicit `myrmex-state migrate {path.parent.name}`{detail}")
             except BaseException as exc:  # validate_state raises SystemExit
                 invalid_runs.append(f"{path.parent.name}: {exc}")
     if invalid_runs:
@@ -379,8 +738,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         raise SystemExit(f"run already exists: {run_id}")
     objective_id = hashlib.sha256((repo + "\0" + objective.strip()).encode()).hexdigest()[:20]
     data: dict[str, Any] = {
-        "schema": SCHEMA,
-        "schema_version": 1,
+        "schema": SCHEMA_V2,
+        "schema_version": 2,
         "run_id": run_id,
         "objective_id": objective_id,
         "objective": objective.strip(),
@@ -405,19 +764,41 @@ def cmd_init(args: argparse.Namespace) -> int:
         "verification_revision": 0,
         "commit_sha": None,
         "push_status": "not_requested" if args.push_policy == "deny" else "unauthorized",
+        "execution": {
+            "requested_policy": "auto",
+            "effective_route": "auto",
+            "authority": "system",
+            "request_id": None,
+            "set_at": now,
+            "locked": False,
+        },
         "blocker": None,
         "budgets": {
             "max_wait_seconds": args.max_wait_seconds,
             "max_plan_iterations": args.max_plan_iterations,
-            "max_worker_corrections": args.max_worker_corrections,
+            "max_corrections_per_work_unit": (
+                args.legacy_max_worker_corrections
+                if args.legacy_max_worker_corrections is not None
+                else args.max_corrections_per_work_unit
+            ),
+            "max_total_corrections": args.max_total_corrections,
             "max_failover_chats": args.max_failover_chats,
         },
         "receipts": {},
+        "pending_operations": [],
         "delegation_ledger": [],
         "delegation_batches": [],
         "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
         "defect_history": [],
         "no_progress_cycles": 0,
+        "active_work_unit_id": None,
+        "work_units": {},
+        "remediation": {
+            "total_corrections_used": 0,
+            "max_total_corrections": args.max_total_corrections,
+            "grants": [],
+            "blocked": None,
+        },
         "revision": -1,
         "created_at": now,
         "updated_at": now,
@@ -456,17 +837,20 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_patch(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "patch")
+    require_active_run(data, "patch")
     if args.json_patch:
         patch = json.loads(args.json_patch)
         if not isinstance(patch, dict):
             raise SystemExit("--json-patch must be an object")
         for key, value in patch.items():
+            ensure_patch_key_is_allowed(key)
             set_dotted(data, key, value)
     for item in args.set or []:
         if "=" not in item:
             raise SystemExit(f"--set requires key=value: {item}")
         key, value = item.split("=", 1)
+        ensure_patch_key_is_allowed(key)
         set_dotted(data, key, parse_scalar(value))
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "state.patched", None, {"revision": saved["revision"], "keys": args.set or []})
@@ -474,34 +858,799 @@ def cmd_patch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_transition(args: argparse.Namespace) -> int:
+    """Move an active run through one explicit state-machine transition.
+
+    Completion and cancellation keep their dedicated commands because they
+    have additional ordering and audit semantics. A blocked run also cannot be
+    reopened here: a future domain-specific recovery command must prove the
+    authority and scope for that operation.
+    """
+    data = read_state(args.run_id)
+    require_v2(data, "transition")
+    if data["revision"] != args.expect_revision:
+        raise SystemExit(
+            f"revision conflict for {args.run_id}: expected {args.expect_revision}, observed {data['revision']}"
+        )
+    if data["status"] != "active":
+        raise SystemExit("transition requires an active run; use the applicable recovery or terminal command")
+    target_phase = args.to_phase
+    target_status = PHASE_STATUS[target_phase]
+    if target_status not in {"active", "blocked"}:
+        raise SystemExit("transition only supports active phases or an explicit blocked state")
+    if target_status == "blocked" and not args.blocker:
+        raise SystemExit("--blocker is required when transitioning to blocked")
+    if target_status == "active" and args.blocker:
+        raise SystemExit("--blocker is valid only when transitioning to blocked")
+
+    if data["phase"] == target_phase and data.get("blocker") == args.blocker:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if target_status == "active" and target_phase not in ALLOWED_ACTIVE_TRANSITIONS[data["phase"]]:
+        raise SystemExit(f"invalid state transition: {data['phase']} -> {target_phase}")
+
+    previous_phase = data["phase"]
+    data["phase"] = target_phase
+    data["status"] = target_status
+    data["blocker"] = args.blocker if target_status == "blocked" else None
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "state.transitioned", args.reason, {
+        "from_phase": previous_phase,
+        "to_phase": target_phase,
+        "to_status": target_status,
+        "blocker": data["blocker"],
+        "reason": args.reason,
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+TERMINAL_RUN_STATUSES = {"dormant", "failed", "cancelled", "superseded"}
+
+
+def require_active_run(data: dict[str, Any], command: str) -> None:
+    """Reject new domain work after a run has stopped being active."""
+    if data.get("status") != "active":
+        raise SystemExit(f"{command} requires an active run")
+
+
+def require_nonterminal_run(data: dict[str, Any], command: str) -> None:
+    """Permit typed recovery of an existing blocker, never terminal revival."""
+    if data.get("status") in TERMINAL_RUN_STATUSES:
+        raise SystemExit(f"{command} cannot modify a terminal run")
+
+
+def require_batch_collect_allowed(data: dict[str, Any], batch: dict[str, Any]) -> None:
+    """Allow collection only for active work or its own missing-result recovery.
+
+    A delayed child result must not clear an unrelated human, policy, or safety
+    blocker just because it completes a batch.  The one existing blocked-run
+    exception is the batch's own missing-result state, whose purpose is to
+    accept the late terminal result it explicitly awaited.
+    """
+    require_nonterminal_run(data, "delegation-batch collect")
+    if data.get("status") == "active":
+        return
+    if (
+        data.get("status") == "blocked"
+        and data.get("phase") == "blocked"
+        and data.get("blocker") == "BLOCKED_MISSING_DELEGATION_RESULT"
+        and batch.get("status") == "blocked"
+    ):
+        return
+    raise SystemExit("delegation-batch collect cannot clear an unrelated blocker")
+
+
+def active_task_ids(data: dict[str, Any]) -> list[str]:
+    """Return task IDs whose last persisted delegation record is non-terminal."""
+    latest: dict[str, str] = {}
+    for entry in data.get("delegation_ledger", []):
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("task_id")
+        status = entry.get("status")
+        if isinstance(task_id, str) and task_id and isinstance(status, str):
+            latest[task_id] = status
+    return sorted(task_id for task_id, status in latest.items() if status == "started")
+
+
+def route_change_blockers(data: dict[str, Any]) -> list[str]:
+    """Identify persisted work that must be reconciled before switching to direct."""
+    blockers: list[str] = []
+    tasks = active_task_ids(data)
+    if tasks:
+        blockers.append("active delegation tasks: " + ", ".join(tasks))
+    # Older state files may contain a started record from before task IDs were
+    # mandatory.  It is still live work even though we cannot name it, so it
+    # must block a direct-only route change rather than being silently ignored.
+    anonymous_started = sum(
+        1 for entry in data.get("delegation_ledger", [])
+        if isinstance(entry, dict)
+        and entry.get("status") == "started"
+        and not (isinstance(entry.get("task_id"), str) and entry["task_id"])
+    )
+    if anonymous_started:
+        blockers.append(f"anonymous active delegation records: {anonymous_started}")
+    incomplete_batches = [
+        str(batch.get("batch_id")) for batch in data.get("delegation_batches", [])
+        if isinstance(batch, dict) and batch.get("status") not in {"proceeded", "blocked"}
+    ]
+    if incomplete_batches:
+        blockers.append("incomplete delegation batches: " + ", ".join(incomplete_batches))
+    pending_operations = data.get("pending_operations")
+    frontier_operations = [
+        operation for operation in pending_operations or []
+        if isinstance(operation, dict) and operation.get("kind") == "frontier_exchange"
+    ] if isinstance(pending_operations, list) else []
+    frontier_identity = bool(data.get("frontier_task_id") or data.get("last_request_id"))
+    if (
+        data.get("phase") == "waiting-for-frontier"
+        or any(operation.get("status") not in TERMINAL_OPERATION_STATUSES for operation in frontier_operations)
+        # An external identity without any matching operation is incomplete
+        # whether it predates the ledger or was partially written by a crash.
+        or (frontier_identity and not frontier_operations)
+    ):
+        blockers.append("frontier exchange is pending")
+    if isinstance(pending_operations, list) and any(
+        isinstance(operation, dict)
+        and operation.get("kind") != "frontier_exchange"
+        and operation.get("status") not in TERMINAL_OPERATION_STATUSES
+        for operation in pending_operations
+    ):
+        blockers.append("external operation is pending")
+    return blockers
+
+
+def ensure_route_allows(data: dict[str, Any], action: str) -> None:
+    """Enforce the persisted direct-only policy at stateful entry points."""
+    policy = data["execution"]["requested_policy"]
+    if policy != "direct-only":
+        return
+    if action in {"delegation", "frontier"}:
+        raise SystemExit("BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY")
+    raise SystemExit(f"unsupported execution-policy action: {action}")
+
+
+def resolve_route_positionals(args: argparse.Namespace) -> tuple[str, str]:
+    """Accept both documented `route set RUN_ID` and legacy `route RUN_ID set`.
+
+    The command is used in persisted runbooks, so accepting the legacy order
+    avoids a compatibility break while making the canonical typed-command form
+    match the rest of the state CLI.
+    """
+    actions = {"set", "assert"}
+    first = args.first
+    second = args.second
+    if first in actions and second not in actions:
+        return second, first
+    if second in actions and first not in actions:
+        return first, second
+    raise SystemExit("route syntax is `myrmex-state route set RUN_ID` (legacy `route RUN_ID set` is also accepted)")
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    run_id, route_action = resolve_route_positionals(args)
+    data = read_state(run_id)
+    require_v2(data, "route")
+    if route_action == "assert":
+        if data["revision"] != args.expect_revision:
+            raise SystemExit(
+                f"revision conflict for {run_id}: expected {args.expect_revision}, observed {data['revision']}"
+            )
+        if args.action is None:
+            raise SystemExit("--action is required for route assert")
+        ensure_route_allows(data, args.action)
+        print(json.dumps(data["execution"], indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if args.policy is None or args.authority is None or args.request_id is None:
+        raise SystemExit("route set requires --policy, --authority, and --request-id")
+    current = data["execution"]
+    policy = args.policy
+    target_identity = {
+        "requested_policy": policy,
+        "effective_route": EXECUTION_ROUTE[policy],
+        "authority": args.authority,
+        "request_id": args.request_id,
+        "locked": policy == "direct-only",
+    }
+    # A retry of the exact request is harmless and must remain idempotent even
+    # if the caller only retained the revision from its original attempt.
+    if all(current.get(key) == value for key, value in target_identity.items()):
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if data["revision"] != args.expect_revision:
+        raise SystemExit(
+            f"revision conflict for {run_id}: expected {args.expect_revision}, observed {data['revision']}"
+        )
+    if data["status"] != "active":
+        raise SystemExit("route changes require an active run")
+    if policy == "direct-only" and args.authority != "user":
+        raise SystemExit("direct-only execution policy requires --authority user")
+    # `direct-only` is a user lock, not merely a policy value.  In particular,
+    # do not let a later actor rewrite its provenance by re-setting the same
+    # policy without an explicit user override.
+    if current["locked"] and not args.override_locked:
+        raise SystemExit("BLOCKED_EXECUTION_POLICY_LOCKED")
+    if current["locked"] and args.authority != "user":
+        raise SystemExit("only user authority may override a locked execution policy")
+    if policy == "direct-only":
+        blockers = route_change_blockers(data)
+        if blockers:
+            raise SystemExit("BLOCKED_ROUTE_CHANGE_PENDING_WORK: " + "; ".join(blockers))
+
+    target = {
+        **target_identity,
+        "set_at": utcnow(),
+    }
+    previous = dict(current)
+    data["execution"] = target
+    saved = write_state(data, args.expect_revision)
+    append_event(run_id, "execution.route_set", None, {
+        "previous": previous,
+        "current": target,
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def parse_object_json(value: str | None, option: str, *, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    if value is None:
+        return dict(default or {})
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid {option}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"{option} must be an object")
+    return sanitize_evidence(parsed)
+
+
+def operation_id(kind: str, idempotency_key: str) -> str:
+    return "op-" + hashlib.sha256((kind + "\0" + idempotency_key).encode()).hexdigest()[:24]
+
+
+def find_operation(data: dict[str, Any], operation_id_value: str) -> dict[str, Any]:
+    if not isinstance(operation_id_value, str) or not OPERATION_ID_RE.fullmatch(operation_id_value):
+        raise SystemExit("--operation-id must be a valid operation ID")
+    for operation in data.get("pending_operations", []):
+        if isinstance(operation, dict) and operation.get("operation_id") == operation_id_value:
+            return operation
+    raise SystemExit(f"operation not found: {operation_id_value}")
+
+
+def find_operation_by_identity(data: dict[str, Any], kind: str, idempotency_key: str) -> dict[str, Any] | None:
+    for operation in data.get("pending_operations", []):
+        if (
+            isinstance(operation, dict)
+            and operation.get("kind") == kind
+            and operation.get("idempotency_key") == idempotency_key
+        ):
+            return operation
+    return None
+
+
+def nonterminal_operations(data: dict[str, Any], kind: str | None = None) -> list[dict[str, Any]]:
+    return [
+        operation for operation in data.get("pending_operations", [])
+        if isinstance(operation, dict)
+        and operation.get("status") not in TERMINAL_OPERATION_STATUSES
+        and (kind is None or operation.get("kind") == kind)
+    ]
+
+
+def require_operation_route(data: dict[str, Any], kind: str) -> None:
+    if kind == "frontier_exchange":
+        ensure_route_allows(data, "frontier")
+    elif kind == "delegation":
+        ensure_route_allows(data, "delegation")
+
+
+def record_operation_intent(
+    data: dict[str, Any], *, kind: str, idempotency_key: str, intent: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Create one idempotent durable side-effect intent in memory.
+
+    The caller owns the state write so it can atomically add the companion
+    task/frontier identity before returning control to an external tool.
+    """
+    if kind not in OPERATION_KINDS:
+        raise SystemExit("invalid operation kind")
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        raise SystemExit("--idempotency-key must be a non-empty string")
+    normalized_intent = sanitize_evidence(intent)
+    identity = operation_id(kind, idempotency_key)
+    existing = find_operation_by_identity(data, kind, idempotency_key)
+    if existing is not None:
+        if existing.get("operation_id") != identity or existing.get("intent") != normalized_intent:
+            raise SystemExit("OPERATION_IDEMPOTENCY_CONFLICT")
+        return existing, False
+    now = utcnow()
+    operation = {
+        "operation_id": identity,
+        "kind": kind,
+        "idempotency_key": idempotency_key,
+        "status": "intent",
+        "intent": normalized_intent,
+        "effect": None,
+        "receipt": None,
+        "terminal_reason": None,
+        "created_at": now,
+        "updated_at": now,
+        "confirmed_at": None,
+    }
+    data["pending_operations"].append(operation)
+    return operation, True
+
+
+def cmd_operation(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "operation")
+    ensure_v2_defaults(data)
+    action = args.operation_action
+    if action == "intent":
+        require_active_run(data, "operation intent")
+        if args.kind is None:
+            raise SystemExit("operation intent requires --kind")
+        if args.idempotency_key is None:
+            raise SystemExit("operation intent requires --idempotency-key")
+        if args.kind == "delegation":
+            raise SystemExit("delegation intent must use delegation-preflight")
+        if args.kind == "frontier_exchange":
+            raise SystemExit("Frontier exchange intent must use frontier start")
+        require_operation_route(data, args.kind)
+        intent = parse_object_json(args.intent_json, "--intent-json")
+        operation, created = record_operation_intent(
+            data, kind=args.kind, idempotency_key=args.idempotency_key, intent=intent,
+        )
+        if not created:
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "operation.intent_recorded", None, {
+            "operation_id": operation["operation_id"], "kind": operation["kind"],
+            "idempotency_key": operation["idempotency_key"], "revision": saved["revision"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    require_nonterminal_run(data, f"operation {action}")
+    if args.operation_id is None:
+        raise SystemExit(f"operation {action} requires --operation-id")
+    operation = find_operation(data, args.operation_id)
+    if action == "observe":
+        if args.effect_json is None:
+            raise SystemExit("operation observe requires --effect-json")
+        effect = parse_object_json(args.effect_json, "--effect-json")
+        if operation["status"] in TERMINAL_OPERATION_STATUSES:
+            if operation.get("effect") == effect:
+                print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            raise SystemExit("OPERATION_TERMINAL_EFFECT_CONFLICT")
+        if operation.get("effect") is not None and operation["effect"] != effect:
+            raise SystemExit("OPERATION_EFFECT_IDEMPOTENCY_CONFLICT")
+        # Re-observing a discovery result after a receipt was stored is also
+        # a no-op.  Do not regress ``receipt-recorded`` back to
+        # ``effect-observed`` on a retry.
+        if operation.get("effect") == effect:
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        operation["effect"] = effect
+        operation["status"] = "effect-observed"
+        operation["updated_at"] = utcnow()
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "operation.effect_observed", None, {
+            "operation_id": operation["operation_id"], "kind": operation["kind"], "revision": saved["revision"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if action == "receipt":
+        if args.receipt_json is None:
+            raise SystemExit("operation receipt requires --receipt-json")
+        receipt = parse_object_json(args.receipt_json, "--receipt-json")
+        if operation["status"] in TERMINAL_OPERATION_STATUSES:
+            if operation.get("receipt") == receipt:
+                print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            raise SystemExit("OPERATION_TERMINAL_RECEIPT_CONFLICT")
+        if operation.get("effect") is None:
+            raise SystemExit("operation receipt requires an observed effect")
+        if operation.get("receipt") is not None and operation["receipt"] != receipt:
+            raise SystemExit("OPERATION_RECEIPT_IDEMPOTENCY_CONFLICT")
+        if operation.get("receipt") == receipt and operation["status"] == "receipt-recorded":
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        operation["receipt"] = receipt
+        operation["status"] = "receipt-recorded"
+        operation["updated_at"] = utcnow()
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "operation.receipt_recorded", None, {
+            "operation_id": operation["operation_id"], "kind": operation["kind"], "revision": saved["revision"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    # Terminal confirmation is deliberately separate from receipt recording:
+    # discovery can establish a remote effect while a later gate still fails.
+    terminal_status = args.status
+    reason = args.reason
+    if terminal_status not in TERMINAL_OPERATION_STATUSES:
+        raise SystemExit("operation confirm requires --status confirmed, failed, or abandoned")
+    if not isinstance(reason, str) or not reason.strip():
+        raise SystemExit("operation confirm requires --reason")
+    if operation["status"] in TERMINAL_OPERATION_STATUSES:
+        if operation["status"] == terminal_status and operation.get("terminal_reason") == reason:
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("OPERATION_TERMINAL_IDEMPOTENCY_CONFLICT")
+    if terminal_status == "confirmed" and (operation.get("effect") is None or operation.get("receipt") is None):
+        raise SystemExit("confirmed operation requires an observed effect and recorded receipt")
+    operation["status"] = terminal_status
+    operation["terminal_reason"] = reason
+    operation["confirmed_at"] = utcnow()
+    operation["updated_at"] = operation["confirmed_at"]
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "operation.confirmed", reason, {
+        "operation_id": operation["operation_id"], "kind": operation["kind"],
+        "status": terminal_status, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_frontier(args: argparse.Namespace) -> int:
+    """Persist a Frontier exchange intent before browser transport is invoked."""
+    data = read_state(args.run_id)
+    require_v2(data, "frontier")
+    ensure_v2_defaults(data)
+    require_active_run(data, "frontier start")
+    ensure_route_allows(data, "frontier")
+    if not isinstance(args.request_id, str) or not args.request_id.strip():
+        raise SystemExit("--request-id must be a non-empty string")
+    if not isinstance(args.task_id, str) or not args.task_id.strip():
+        raise SystemExit("--task-id must be a non-empty string")
+    intent = parse_object_json(args.intent_json, "--intent-json")
+    intent.update({"request_id": args.request_id, "task_id": args.task_id})
+    if args.chat_url is not None:
+        intent["chat_url"] = args.chat_url
+    key = args.idempotency_key or f"frontier:{args.request_id}"
+    operation, created = record_operation_intent(
+        data, kind="frontier_exchange", idempotency_key=key, intent=intent,
+    )
+    if not created:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    data["last_request_id"] = args.request_id
+    data["frontier_task_id"] = args.task_id
+    if args.chat_url is not None:
+        data["frontier_chat_url"] = args.chat_url
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "frontier.intent_recorded", None, {
+        "operation_id": operation["operation_id"], "request_id": args.request_id,
+        "task_id": args.task_id, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def accessible_workspace(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("--workspace is required")
+    try:
+        workspace = Path(value).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"workspace is not accessible: {value!r}: {exc}") from exc
+    if not workspace.is_dir() or not os.access(workspace, os.R_OK | os.X_OK):
+        raise SystemExit(f"workspace is not an accessible directory: {workspace}")
+    return str(workspace)
+
+
+def cmd_delegation_preflight(args: argparse.Namespace) -> int:
+    """Record WU/task/workspace identity before launching a Task side effect."""
+    data = read_state(args.run_id)
+    require_v2(data, "delegation-preflight")
+    ensure_v2_defaults(data)
+    require_active_run(data, "delegation-preflight")
+    ensure_route_allows(data, "delegation")
+    if args.role not in {"scout", "writer", "verifier"}:
+        raise SystemExit("invalid delegation role")
+    if not isinstance(args.task_id, str) or not args.task_id.strip():
+        raise SystemExit("--task-id must be a non-empty string")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    workspace = accessible_workspace(args.workspace)
+    intent = {
+        "task_id": args.task_id,
+        "work_unit_id": work_unit_id,
+        "workspace": workspace,
+        "agent": args.agent,
+        "role": args.role,
+        "reason": args.reason,
+    }
+    existing = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
+    # A stale/legacy started row cannot be silently claimed by a new preflight.
+    # The only retry allowed is the exact same operation that previously wrote
+    # this task identity atomically with its ledger row.
+    for entry in data.get("delegation_ledger", []):
+        if not isinstance(entry, dict) or entry.get("status") != "started":
+            continue
+        if entry.get("task_id") == args.task_id and (
+            existing is None
+            or entry.get("operation_id") != existing.get("operation_id")
+            or existing.get("intent") != intent
+        ):
+            raise SystemExit("BLOCKED_DELEGATION_TASK_ALREADY_ACTIVE")
+    if args.role == "writer":
+        for operation in nonterminal_operations(data, "delegation"):
+            operation_intent = operation.get("intent")
+            if (
+                isinstance(operation_intent, dict)
+                and operation_intent.get("role") == "writer"
+                and operation_intent.get("work_unit_id") == work_unit_id
+                and (existing is None or operation.get("operation_id") != existing.get("operation_id"))
+            ):
+                raise SystemExit("BLOCKED_CONCURRENT_WRITER_WORK_UNIT")
+        for entry in data.get("delegation_ledger", []):
+            if (
+                isinstance(entry, dict)
+                and entry.get("status") == "started"
+                and entry.get("role") == "writer"
+                and entry.get("work_unit_id") == work_unit_id
+                and (existing is None or entry.get("operation_id") != existing.get("operation_id"))
+            ):
+                raise SystemExit("BLOCKED_CONCURRENT_WRITER_WORK_UNIT")
+    operation, created = record_operation_intent(
+        data, kind="delegation", idempotency_key=f"task:{args.task_id}", intent=intent,
+    )
+    if not created:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    work_unit = get_or_create_work_unit(data, work_unit_id)
+    entry = {
+        "agent": args.agent, "role": args.role, "reason": args.reason,
+        "task_id": args.task_id, "work_unit_id": work_unit_id, "workspace": workspace,
+        "attempt": data["attempts"][args.role + "s"] + 1,
+        "started_at": utcnow(), "completed_at": None, "status": "started", "outcome": "STARTED",
+        "operation_id": operation["operation_id"],
+    }
+    data["delegation_ledger"].append(entry)
+    data["attempts"][args.role + "s"] = entry["attempt"]
+    data["active_work_unit_id"] = work_unit["work_unit_id"]
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "delegation.preflight_recorded", None, {
+        "operation_id": operation["operation_id"], "task_id": args.task_id,
+        "work_unit_id": work_unit_id, "workspace": workspace, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_work_unit(args: argparse.Namespace) -> int:
+    """Close one verified work unit so terminal completion can prove no WU is open."""
+    data = read_state(args.run_id)
+    require_v2(data, "work-unit complete")
+    require_active_run(data, "work-unit complete")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    work_unit = data["work_units"].get(work_unit_id)
+    if not isinstance(work_unit, dict):
+        raise SystemExit(f"work unit not found: {work_unit_id}")
+    if work_unit.get("status") == "complete":
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if work_unit.get("status") in {"blocked", "cancelled", "legacy-ambiguous"}:
+        raise SystemExit(f"work unit {work_unit_id} cannot be completed from status {work_unit.get('status')!r}")
+    if any(
+        isinstance(operation.get("intent"), dict)
+        and operation["intent"].get("work_unit_id") == work_unit_id
+        for operation in nonterminal_operations(data)
+    ):
+        raise SystemExit("work unit has a pending operation")
+    if any(
+        grant.get("work_unit_id") == work_unit_id
+        and grant.get("status") == "open"
+        and grant.get("consumed_attempts", 0) < grant.get("granted_attempts", 0)
+        for grant in data["remediation"]["grants"]
+        if isinstance(grant, dict)
+    ):
+        raise SystemExit("work unit has an unconsumed correction authorization")
+    evidence = parse_object_json(args.evidence_json, "--evidence-json")
+    latest_defects = next(
+        (record for record in reversed(data["defect_history"])
+         if isinstance(record, dict) and record.get("work_unit_id") == work_unit_id),
+        None,
+    )
+    if latest_defects is not None and latest_defects.get("remaining"):
+        raise SystemExit("work unit has remaining verified defects")
+    work_unit["status"] = "complete"
+    work_unit["completed_at"] = utcnow()
+    work_unit["completion_evidence"] = evidence
+    if data.get("active_work_unit_id") == work_unit_id:
+        data["active_work_unit_id"] = None
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "work_unit.completed", None, {
+        "work_unit_id": work_unit_id, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+
+def require_work_unit_id(value: str | None) -> str:
+    if not isinstance(value, str) or not WORK_UNIT_ID_RE.fullmatch(value) or value == "__legacy__":
+        raise SystemExit("--work-unit-id must be a non-empty safe work-unit identifier")
+    return value
+
+
+def require_scope_digest(value: str | None, option: str = "--scope-digest") -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise SystemExit(f"{option} must be a lowercase SHA-256 hex digest")
+    return value
+
+
+def require_candidate_sha(value: str | None, option: str = "--source-candidate-sha") -> str:
+    if not isinstance(value, str) or not GIT_SHA_RE.fullmatch(value):
+        raise SystemExit(f"{option} must be a Git SHA (7-64 hexadecimal characters)")
+    return value.lower()
+
+
+def get_or_create_work_unit(data: dict[str, Any], work_unit_id: str) -> dict[str, Any]:
+    work_units: dict[str, dict[str, Any]] = data["work_units"]
+    current = work_units.get(work_unit_id)
+    if current is None:
+        current = {
+            "work_unit_id": work_unit_id,
+            "status": "active",
+            "base_correction_limit": data["budgets"]["max_corrections_per_work_unit"],
+            "corrections_used": 0,
+            "no_progress_cycles": 0,
+        }
+        work_units[work_unit_id] = current
+    if current.get("status") in {"cancelled", "complete", "legacy-ambiguous"}:
+        raise SystemExit(f"work unit {work_unit_id} cannot accept a correction in status {current.get('status')!r}")
+    return current
+
+
+def correction_grant_id(authority: str, request_id: str, work_unit_id: str, scope_digest: str) -> str:
+    value = "\0".join((authority, request_id, work_unit_id, scope_digest))
+    return "grant-" + hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def grant_is_expired(grant: dict[str, Any]) -> bool:
+    value = grant.get("expires_at")
+    if value is None:
+        return False
+    try:
+        expires = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        # Validation prevents newly created bad timestamps. Treat an old bad
+        # value as unusable rather than accidentally spending it.
+        return True
+    if expires.tzinfo is None:
+        return True
+    return expires <= dt.datetime.now(dt.timezone.utc)
+
+
+def matching_correction_grant(
+    data: dict[str, Any], work_unit_id: str, scope_digest: str, source_candidate_sha: str,
+) -> dict[str, Any] | None:
+    for grant in data["remediation"]["grants"]:
+        if grant["status"] == "open" and grant_is_expired(grant):
+            grant["status"] = "expired"
+            grant["closed_at"] = utcnow()
+        if (
+            grant["status"] == "open"
+            and grant["work_unit_id"] == work_unit_id
+            and grant["scope_digest"] == scope_digest
+            and grant["source_candidate_sha"].lower() == source_candidate_sha.lower()
+            and grant["consumed_attempts"] < grant["granted_attempts"]
+        ):
+            return grant
+    return None
+
+
+def block_correction(
+    data: dict[str, Any], *, scope: str, work_unit_id: str | None, code: str,
+    used: int, limit: int | None, reason: str, source_request_id: str | None = None,
+    scope_digest: str | None = None, source_candidate_sha: str | None = None,
+) -> None:
+    data["phase"] = "blocked"
+    data["status"] = "blocked"
+    data["blocker"] = code
+    context: dict[str, Any] = {
+        "scope": scope,
+        "work_unit_id": work_unit_id,
+        "code": code,
+        "used": used,
+        "limit": limit,
+        "reason": reason,
+        "blocked_at": utcnow(),
+    }
+    if scope == "work_unit":
+        context.update({
+            "source_request_id": source_request_id,
+            "scope_digest": scope_digest,
+            "source_candidate_sha": source_candidate_sha,
+        })
+    data["remediation"]["blocked"] = context
+    if scope == "work_unit" and work_unit_id is not None:
+        data["work_units"][work_unit_id]["status"] = "blocked"
+
 
 def cmd_delegation(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "delegation")
+    require_active_run(data, "delegation")
+    if args.status == "started" or args.correction:
+        ensure_route_allows(data, "delegation")
+    if args.status == "started" and (not isinstance(args.task_id, str) or not args.task_id.strip()):
+        raise SystemExit("delegation --status started requires a non-empty --task-id")
     role = args.role
     if role not in {"scout", "writer", "verifier"}:
         raise SystemExit("invalid delegation role")
     if args.correction and role != "writer":
         raise SystemExit("corrections can only target the writer")
-    if args.correction and data["attempts"]["corrections"] >= data["budgets"]["max_worker_corrections"]:
-        data["phase"] = "blocked"
-        data["status"] = "blocked"
-        data["blocker"] = "BLOCKED_CORRECTION_BUDGET"
-        saved = write_state(data, args.expect_revision)
-        append_event(args.run_id, "delegation.blocked", "correction budget exhausted", {
-            "attempts": data["attempts"]["corrections"],
-            "max_worker_corrections": data["budgets"]["max_worker_corrections"],
-        })
-        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
-        return 1
+
+    correction: dict[str, Any] | None = None
+    work_unit: dict[str, Any] | None = None
+    grant: dict[str, Any] | None = None
+    if args.correction:
+        if args.expect_revision is None:
+            raise SystemExit("--expect-revision is required for corrections")
+        if data["status"] != "active":
+            raise SystemExit("correction requires an active run; use correction authorize for an exhausted work-unit budget")
+        work_unit_id = require_work_unit_id(args.work_unit_id)
+        if not isinstance(args.source_request_id, str) or not args.source_request_id:
+            raise SystemExit("--source-request-id is required for corrections")
+        scope_digest = require_scope_digest(args.scope_digest)
+        source_candidate_sha = require_candidate_sha(args.source_candidate_sha)
+        work_unit = get_or_create_work_unit(data, work_unit_id)
+        remediation = data["remediation"]
+        total = remediation["total_corrections_used"]
+        max_total = remediation["max_total_corrections"]
+        if max_total is not None and total >= max_total:
+            block_correction(
+                data, scope="run", work_unit_id=None, code="BLOCKED_TOTAL_CORRECTION_BUDGET",
+                used=total, limit=max_total, reason="run-global correction cost ceiling exhausted",
+            )
+            saved = write_state(data, args.expect_revision)
+            append_event(args.run_id, "correction.blocked", "run-global correction budget exhausted", data["remediation"]["blocked"])
+            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+            return 1
+        if work_unit["corrections_used"] >= work_unit["base_correction_limit"]:
+            grant = matching_correction_grant(data, work_unit_id, scope_digest, source_candidate_sha)
+            if grant is None:
+                block_correction(
+                    data, scope="work_unit", work_unit_id=work_unit_id, code="BLOCKED_CORRECTION_BUDGET",
+                    used=work_unit["corrections_used"], limit=work_unit["base_correction_limit"],
+                    reason="work-unit correction budget exhausted for the supplied scope and candidate",
+                    source_request_id=args.source_request_id, scope_digest=scope_digest,
+                    source_candidate_sha=source_candidate_sha,
+                )
+                saved = write_state(data, args.expect_revision)
+                append_event(args.run_id, "correction.blocked", "work-unit correction budget exhausted", data["remediation"]["blocked"])
+                print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+                return 1
+        correction = {
+            "work_unit_id": work_unit_id,
+            "work_unit_attempt": work_unit["corrections_used"] + 1,
+            "source_request_id": args.source_request_id,
+            "scope_digest": scope_digest,
+            "source_candidate_sha": source_candidate_sha,
+            "grant_id": grant["grant_id"] if grant is not None else None,
+        }
+
     attempt = data["attempts"][role + "s"] + 1
-    entry = {
+    entry: dict[str, Any] = {
         "agent": args.agent, "role": role, "reason": args.reason,
         "task_id": args.task_id, "work_unit_id": args.work_unit_id,
         "attempt": attempt, "started_at": args.started_at or utcnow(),
         "completed_at": args.completed_at, "status": args.status,
         "outcome": args.outcome or {"success": "SUCCESS", "failed": "FAILED", "blocked": "BLOCKED", "cancelled": "CANCELLED", "started": "STARTED"}[args.status],
     }
+    if correction is not None:
+        entry["correction"] = correction
     if args.evidence_json:
         try:
             entry["evidence"] = sanitize_evidence(json.loads(args.evidence_json))
@@ -512,14 +1661,190 @@ def cmd_delegation(args: argparse.Namespace) -> int:
         data["status"] = "blocked"
         data["blocker"] = entry["outcome"]
     data["delegation_ledger"].append(entry)
+    # `delegation-preflight` persists the launch intent before Task is
+    # invoked.  When its terminal result is recorded through this established
+    # compatibility command, close the matching typed operation atomically so
+    # resume/complete do not mistake an already-returned child for live work.
+    if not args.correction and args.status in TERMINAL_TASK_STATUSES and isinstance(args.task_id, str) and args.task_id:
+        operation = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
+        if operation is not None:
+            effect = {
+                "task_id": args.task_id,
+                "status": args.status,
+                "outcome": entry["outcome"],
+            }
+            receipt = {
+                "task_id": args.task_id,
+                "status": args.status,
+                "outcome": entry["outcome"],
+                "evidence": entry.get("evidence"),
+            }
+            if operation.get("status") in TERMINAL_OPERATION_STATUSES:
+                if operation.get("effect") != effect or operation.get("receipt") != receipt:
+                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+            else:
+                if operation.get("effect") is not None and operation["effect"] != effect:
+                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+                if operation.get("receipt") is not None and operation["receipt"] != receipt:
+                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+                now = utcnow()
+                operation["effect"] = effect
+                operation["receipt"] = receipt
+                operation["status"] = "confirmed" if args.status == "success" else "failed"
+                operation["terminal_reason"] = None if args.status == "success" else f"delegation task ended {args.status}"
+                operation["confirmed_at"] = now
+                operation["updated_at"] = now
     data["attempts"][role + "s"] = attempt
-    if args.correction:
+    if correction is not None and work_unit is not None:
+        work_unit["corrections_used"] += 1
+        work_unit["status"] = "remediating"
+        data["active_work_unit_id"] = correction["work_unit_id"]
+        data["remediation"]["total_corrections_used"] += 1
         data["attempts"]["corrections"] += 1
+        if grant is not None:
+            grant["consumed_attempts"] += 1
+            if grant["consumed_attempts"] == grant["granted_attempts"]:
+                grant["status"] = "consumed"
+                grant["closed_at"] = utcnow()
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "delegation.recorded", None, entry)
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
+
+def cmd_correction_authorize(args: argparse.Namespace) -> int:
+    """Grant a bounded, auditable extra correction for one exhausted work unit."""
+    data = read_state(args.run_id)
+    require_v2(data, "correction authorize")
+    if data["revision"] != args.expect_revision:
+        raise SystemExit(
+            f"revision conflict for {args.run_id}: expected {args.expect_revision}, observed {data['revision']}"
+        )
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    scope_digest = require_scope_digest(args.scope_digest)
+    source_candidate_sha = require_candidate_sha(args.source_candidate_sha)
+    if args.authority not in CORRECTION_AUTHORITIES:
+        raise SystemExit("invalid correction authority")
+    if not isinstance(args.request_id, str) or not args.request_id:
+        raise SystemExit("--request-id is required")
+    if not isinstance(args.max_additional_attempts, int) or args.max_additional_attempts < 1:
+        raise SystemExit("--max-additional-attempts must be a positive integer")
+    if args.expires_at is not None:
+        try:
+            parsed_expiry = dt.datetime.fromisoformat(args.expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SystemExit("--expires-at must be an ISO-8601 timestamp with timezone") from exc
+        if parsed_expiry.tzinfo is None:
+            raise SystemExit("--expires-at must include a timezone")
+    grant_id = correction_grant_id(args.authority, args.request_id, work_unit_id, scope_digest)
+    existing = next((grant for grant in data["remediation"]["grants"] if grant["grant_id"] == grant_id), None)
+    if existing is not None:
+        expected = {
+            "authority": args.authority,
+            "request_id": args.request_id,
+            "work_unit_id": work_unit_id,
+            "scope_digest": scope_digest,
+            "source_candidate_sha": source_candidate_sha,
+            "granted_attempts": args.max_additional_attempts,
+            "expires_at": args.expires_at,
+        }
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDEMPOTENCY_CONFLICT")
+        blocked = data["remediation"].get("blocked")
+        if (
+            existing["status"] == "open" and existing["consumed_attempts"] < existing["granted_attempts"]
+            and isinstance(blocked, dict) and blocked.get("scope") == "work_unit"
+            and blocked.get("work_unit_id") == work_unit_id and data.get("blocker") == "BLOCKED_CORRECTION_BUDGET"
+        ):
+            # A stale candidate can create a newer blocker while a previously
+            # authorized, still-open grant remains valid for its original
+            # scope.  Replaying that exact grant is the typed recovery path:
+            # it reopens the run, but only a correction carrying this grant's
+            # own scope/SHA can consume it.  New grants still require an exact
+            # match to the current blocker below, so this cannot authorize the
+            # stale candidate or cross a work-unit boundary.
+            data["remediation"]["blocked"] = None
+            data["active_work_unit_id"] = work_unit_id
+            data["work_units"][work_unit_id]["status"] = "remediating"
+            data["phase"] = "implementing"
+            data["status"] = "active"
+            data["blocker"] = None
+            saved = write_state(data, args.expect_revision)
+            append_event(args.run_id, "correction.authorization_replayed", "reopened matching unconsumed grant", {
+                "grant_id": grant_id,
+                "grant_scope_digest": scope_digest,
+                "grant_candidate_sha": source_candidate_sha,
+                "replaced_blocked_scope_digest": blocked.get("scope_digest"),
+                "replaced_blocked_candidate_sha": blocked.get("source_candidate_sha"),
+                "revision": saved["revision"],
+            })
+            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    blocked = data["remediation"].get("blocked")
+    if (
+        data["phase"] != "blocked" or data["status"] != "blocked"
+        or data.get("blocker") != "BLOCKED_CORRECTION_BUDGET"
+        or not isinstance(blocked, dict) or blocked.get("scope") != "work_unit"
+        or blocked.get("work_unit_id") != work_unit_id
+        or blocked.get("scope_digest") != scope_digest
+        or str(blocked.get("source_candidate_sha", "")).lower() != source_candidate_sha
+    ):
+        raise SystemExit("correction authorization requires the matching work-unit correction-budget blocker")
+    work_unit = data["work_units"].get(work_unit_id)
+    if not isinstance(work_unit, dict):
+        raise SystemExit("correction authorization references an unknown work unit")
+    grant = {
+        "grant_id": grant_id,
+        "authority": args.authority,
+        "request_id": args.request_id,
+        "work_unit_id": work_unit_id,
+        "scope_digest": scope_digest,
+        "source_candidate_sha": source_candidate_sha,
+        "granted_attempts": args.max_additional_attempts,
+        "consumed_attempts": 0,
+        "status": "open",
+        "authorized_at": utcnow(),
+        "expires_at": args.expires_at,
+        "closed_at": None,
+    }
+    data["remediation"]["grants"].append(grant)
+    data["remediation"]["blocked"] = None
+    data["active_work_unit_id"] = work_unit_id
+    work_unit["status"] = "remediating"
+    data["phase"] = "implementing"
+    data["status"] = "active"
+    data["blocker"] = None
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "correction.authorized", "bounded work-unit correction grant authorized", {
+        "grant_id": grant_id,
+        "authority": args.authority,
+        "request_id": args.request_id,
+        "work_unit_id": work_unit_id,
+        "scope_digest": scope_digest,
+        "source_candidate_sha": source_candidate_sha,
+        "granted_attempts": args.max_additional_attempts,
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_correction_start(args: argparse.Namespace) -> int:
+    """Start one typed writer correction without exposing generic delegation flags.
+
+    The legacy `delegation --correction` spelling remains compatible during the
+    rollout, but both spellings execute the same protected accounting path.
+    """
+    args.correction = True
+    args.role = "writer"
+    args.status = "started"
+    args.outcome = None
+    args.completed_at = None
+    args.evidence_json = None
+    return cmd_delegation(args)
 
 def parse_string_list(value: str | None, option: str) -> list[str] | None:
     if value is None:
@@ -531,47 +1856,84 @@ def parse_string_list(value: str | None, option: str) -> list[str] | None:
 
 
 def cmd_defects(args: argparse.Namespace) -> int:
+    """Record verifier evidence against one work unit rather than a run-global list."""
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "defects")
+    require_active_run(data, "defects")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    if not isinstance(args.verification_request_id, str) or not args.verification_request_id:
+        raise SystemExit("--verification-request-id is required")
+    scope_digest = require_scope_digest(args.scope_digest)
+    candidate_sha = require_candidate_sha(args.candidate_sha, "--candidate-sha")
+    work_unit = get_or_create_work_unit(data, work_unit_id)
     initial = parse_string_list(args.defects_json, "--defects-json")
     corrected = parse_string_list(args.corrected_json, "--corrected-json") or []
     remaining = parse_string_list(args.remaining_json, "--remaining-json")
     new = parse_string_list(args.new_json, "--new-json") or []
-    previous = data["defect_history"][-1] if data["defect_history"] else None
+    if len(set(corrected)) != len(corrected) or len(set(new)) != len(new):
+        raise SystemExit("defect IDs must be unique")
+    previous = next(
+        (record for record in reversed(data["defect_history"])
+         if isinstance(record, dict) and record.get("work_unit_id") == work_unit_id),
+        None,
+    )
 
     if previous is None and initial is None:
-        raise SystemExit("--defects-json is required for the initial defect record")
+        raise SystemExit("--defects-json is required for the initial work-unit defect record")
     if initial is None:
-        initial = list(previous["initial"])
+        initial = list(previous["remaining"])
     if remaining is None:
-        remaining = list(initial if previous is None else previous["remaining"])
+        remaining = list(initial)
+    if len(set(initial)) != len(initial) or len(set(remaining)) != len(remaining):
+        raise SystemExit("defect IDs must be unique")
     if previous is not None and args.remaining_json is None and args.corrected_json is None and args.new_json is None:
         raise SystemExit("an update requires corrected, remaining, or new defects")
 
-    reduced = previous is None or len(remaining) < len(previous["remaining"])
-    data["no_progress_cycles"] = 0 if reduced else data["no_progress_cycles"] + 1
+    if previous is None:
+        progress = "initial"
+        work_unit["no_progress_cycles"] = 0
+    else:
+        prior_remaining = set(previous["remaining"])
+        resolved = prior_remaining - set(remaining)
+        if new:
+            progress = "regressed"
+            work_unit["no_progress_cycles"] += 1
+        elif resolved:
+            progress = "reduced"
+            work_unit["no_progress_cycles"] = 0
+        else:
+            progress = "unchanged"
+            work_unit["no_progress_cycles"] += 1
+    data["no_progress_cycles"] = work_unit["no_progress_cycles"]
     record = {
         "revision": data["verification_revision"] + 1,
+        "work_unit_id": work_unit_id,
+        "verification_request_id": args.verification_request_id,
+        "candidate_sha": candidate_sha,
+        "scope_digest": scope_digest,
         "initial": initial,
         "corrected": corrected,
         "remaining": remaining,
         "new": new,
-        "progress": "reduced" if reduced else "unchanged",
-        "no_progress_cycles": data["no_progress_cycles"],
+        "progress": progress,
+        "no_progress_cycles": work_unit["no_progress_cycles"],
     }
     data["defect_history"].append(record)
     data["verification_revision"] = record["revision"]
-    if data["no_progress_cycles"] >= 2:
+    data["active_work_unit_id"] = work_unit_id
+    if work_unit["no_progress_cycles"] >= 2:
         data["phase"] = "blocked"
         data["status"] = "blocked"
         data["blocker"] = "BLOCKED_NO_PROGRESS"
+        work_unit["status"] = "blocked"
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "defects.recorded", None, record)
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 1 if data["blocker"] == "BLOCKED_NO_PROGRESS" else 0
 
-
 def cmd_event(args: argparse.Namespace) -> int:
+    data_state = read_state(args.run_id)
+    require_v2(data_state, "event")
     data: Any = None
     if args.data_json:
         data = json.loads(args.data_json)
@@ -626,10 +1988,12 @@ def contradictory_claims(results: list[dict[str, Any]]) -> list[str]:
 
 def cmd_delegation_batch(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "delegation-batch")
     batches: list[dict[str, Any]] = data["delegation_batches"]
     batch = next((item for item in batches if item.get("batch_id") == args.batch_id), None)
     if args.batch_action == "start":
+        require_active_run(data, "delegation-batch start")
+        ensure_route_allows(data, "delegation")
         if batch is not None:
             raise SystemExit(f"delegation batch already exists: {args.batch_id}")
         task_ids = parse_string_list(args.task_ids_json, "--task-ids-json")
@@ -653,6 +2017,7 @@ def cmd_delegation_batch(args: argparse.Namespace) -> int:
     if batch is None:
         raise SystemExit(f"delegation batch not found: {args.batch_id}")
     if args.batch_action == "collect":
+        require_batch_collect_allowed(data, batch)
         if args.results_json is None:
             raise SystemExit("--results-json is required for delegation-batch collect")
         results = parse_batch_results(args.results_json)
@@ -701,6 +2066,7 @@ def cmd_delegation_batch(args: argparse.Namespace) -> int:
         print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
+    require_active_run(data, "delegation-batch proceed")
     if batch["status"] != "consolidating-evidence":
         raise SystemExit("delegation batch must be consolidated before proceeding")
     if args.next_phase not in PHASE_STATUS or PHASE_STATUS[args.next_phase] != "active":
@@ -716,22 +2082,405 @@ def cmd_delegation_batch(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_migrate(args: argparse.Namespace) -> int:
-    data = read_state(args.run_id)
+def write_v1_backup(run_id: str, revision: int, raw: bytes) -> Path:
+    """Persist the exact pre-migration bytes once, without replacing a prior backup."""
+    backup = run_dir(run_id) / f"state.v1.r{revision}.json"
+    try:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if backup.read_bytes() != raw:
+            raise SystemExit(f"existing migration backup differs: {backup}")
+        return backup
+    try:
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(fd, raw[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return backup
+
+
+def upgrade_v1_to_v2(data: dict[str, Any], backup_name: str) -> tuple[dict[str, Any], list[str]]:
+    """Convert only unequivocal v1 data; never invent historic WU ownership."""
     changes = normalize_legacy_state(data)
-    if not changes:
+    validate_state(data)
+    old_budget = data["budgets"]
+    old_corrections = data["attempts"]["corrections"]
+    legacy_needed = bool(old_corrections or data["defect_history"] or data["no_progress_cycles"])
+    work_units: dict[str, dict[str, Any]] = {}
+    if legacy_needed:
+        work_units["__legacy__"] = {
+            "status": "legacy-ambiguous",
+            "base_correction_limit": old_budget["max_worker_corrections"],
+            "corrections_used": old_corrections,
+            "no_progress_cycles": data["no_progress_cycles"],
+            "legacy_defect_history": data["defect_history"],
+            "migration_note": "v1 correction counts were run-global and cannot be assigned to a work unit",
+        }
+    blocked: dict[str, Any] | None = None
+    if data.get("blocker") == "BLOCKED_CORRECTION_BUDGET":
+        blocked = {
+            "scope": "legacy-ambiguous",
+            "work_unit_id": None,
+            "code": "BLOCKED_CORRECTION_BUDGET",
+            "used": old_corrections,
+            "limit": old_budget["max_worker_corrections"],
+            "reason": "v1 global correction blocker cannot be assigned to a work unit",
+            "blocked_at": data.get("updated_at") or utcnow(),
+        }
+    data["schema"] = SCHEMA_V2
+    data["schema_version"] = 2
+    data["budgets"] = {
+        "max_wait_seconds": old_budget["max_wait_seconds"],
+        "max_plan_iterations": old_budget["max_plan_iterations"],
+        "max_corrections_per_work_unit": old_budget["max_worker_corrections"],
+        "max_total_corrections": None,
+        "max_failover_chats": old_budget["max_failover_chats"],
+    }
+    data["active_work_unit_id"] = None
+    data["work_units"] = work_units
+    data["remediation"] = {
+        "total_corrections_used": old_corrections,
+        "max_total_corrections": None,
+        "grants": [],
+        "blocked": blocked,
+    }
+    data["migration"] = {
+        "from_schema": SCHEMA_V1,
+        "from_schema_version": 1,
+        "backup": backup_name,
+        "legacy_correction_accounting": "preserved under work_units.__legacy__ without WU attribution",
+        "migrated_at": utcnow(),
+    }
+    changes.append("migrated v1 correction accounting to explicit legacy work-unit record")
+    return data, changes
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    run_id = args.run_id
+    path = run_dir(run_id) / "state.json"
+    raw = path.read_bytes() if path.is_file() else None
+    if raw is None:
+        raise SystemExit(f"run not found: {run_id}")
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise SystemExit(f"invalid state for {run_id}: {exc}") from exc
+    if (data.get("schema"), data.get("schema_version")) not in SUPPORTED_SCHEMAS:
+        raise SystemExit("unsupported state schema/version")
+    observed_revision = data.get("revision")
+    if args.expect_revision != observed_revision:
+        raise SystemExit(
+            f"revision conflict for {run_id}: expected {args.expect_revision}, observed {observed_revision}"
+        )
+    if state_is_v2(data):
+        validate_state(data)
         print(json.dumps({"migrated": False, "state": data}, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
-    saved = write_state(data, args.expect_revision)
-    append_event(args.run_id, "state.normalized", "legacy state normalized", {"changes": changes})
-    print(json.dumps({"migrated": True, "changes": changes, "state": saved}, indent=2, ensure_ascii=False, sort_keys=True))
+    backup = write_v1_backup(run_id, int(observed_revision), raw)
+    upgraded, changes = upgrade_v1_to_v2(data, backup.name)
+    saved = write_state(upgraded, args.expect_revision)
+    append_event(run_id, "state.migrated", "v1 state migrated to v2", {
+        "from_schema": SCHEMA_V1,
+        "to_schema": SCHEMA_V2,
+        "backup": backup.name,
+        "changes": changes,
+        "revision": saved["revision"],
+    })
+    print(json.dumps({"migrated": True, "changes": changes, "backup": str(backup), "state": saved}, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
+
+REQUIRED_RECEIPT_KINDS = {"tracking_issue", "pull_request", "ci", "local_verification", "parent_gate"}
+RECEIPT_ALIASES = {
+    "tracking_issue": ("tracking_issue", "github_tracking_issue", "github_issue"),
+    "pull_request": ("pull_request", "github_pr", "github_pull_request"),
+    "ci": ("ci", "github_ci", "continuous_integration"),
+    "local_verification": ("local_verification", "verification"),
+    "parent_gate": ("parent_gate", "parent_objective_gate"),
+}
+RECEIPT_SUCCESS = {
+    "tracking_issue": {"ISSUE_APPROVED", "ISSUE_REUSED", "APPROVED", "REUSED", "SUCCESS", "CONFIRMED"},
+    "pull_request": {"PR_CREATED", "SUCCESS", "CONFIRMED"},
+    "ci": {"SUCCESS", "PASSED", "CI_PASSED", "CONFIRMED", "COMPLETED"},
+    "local_verification": {"SUCCESS", "PASSED", "VERIFIED", "CONFIRMED", "COMPLETED"},
+    "parent_gate": {"SUCCESS", "PASSED", "APPROVED", "CONFIRMED", "COMPLETED", "PARENT_GATE_PASSED"},
+}
+
+
+def receipt_status(value: Any) -> str | None:
+    """Extract a conservative outcome from a receipt without inventing one."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    if not isinstance(value, dict):
+        return None
+    for key in ("status", "conclusion", "outcome", "state"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().upper()
+    return None
+
+
+def operation_is_required(operation: dict[str, Any]) -> bool:
+    """An explicitly optional delivery record never turns into a hidden gate."""
+    intent = operation.get("intent")
+    return not (isinstance(intent, dict) and intent.get("required") is False)
+
+
+def open_work_units(data: dict[str, Any]) -> list[str]:
+    work_units = data.get("work_units", {})
+    if not isinstance(work_units, dict):
+        return ["<invalid-work-units>"]
+    return sorted(
+        str(work_unit_id) for work_unit_id, work_unit in work_units.items()
+        if not isinstance(work_unit, dict) or work_unit.get("status") != "complete"
+    )
+
+
+def incomplete_batch_ids(data: dict[str, Any]) -> list[str]:
+    batches = data.get("delegation_batches", [])
+    if not isinstance(batches, list):
+        return ["<invalid-delegation-batches>"]
+    return sorted(
+        str(batch.get("batch_id") or "<unnamed>") for batch in batches
+        if not isinstance(batch, dict) or batch.get("status") != "proceeded"
+    )
+
+
+def pending_correction_ids(data: dict[str, Any]) -> list[str]:
+    remediation = data.get("remediation")
+    if not isinstance(remediation, dict):
+        return ["<invalid-remediation>"]
+    grants = remediation.get("grants", [])
+    pending: list[str] = []
+    if isinstance(grants, list):
+        for grant in grants:
+            if not isinstance(grant, dict):
+                pending.append("<invalid-grant>")
+                continue
+            if grant.get("status") == "open" and grant.get("consumed_attempts", 0) < grant.get("granted_attempts", 0):
+                pending.append(str(grant.get("grant_id") or "<unnamed-grant>"))
+    else:
+        pending.append("<invalid-grants>")
+    return sorted(pending)
+
+
+def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
+    """Validate only delivery checks that this run explicitly persisted.
+
+    No default issue/PR/CI requirement is inferred for a small local run.  Once
+    a typed operation or named legacy receipt exists, however, an ambiguous,
+    partial, failed, or cancelled result is a real completion blocker rather
+    than a reason to claim success.
+    """
+    blockers: list[str] = []
+    operations = data.get("pending_operations", [])
+    if isinstance(operations, list):
+        for operation in operations:
+            if not isinstance(operation, dict) or not operation_is_required(operation):
+                continue
+            kind = operation.get("kind")
+            status = operation.get("status")
+            operation_id_value = str(operation.get("operation_id") or "<unnamed-operation>")
+            if status != "confirmed":
+                # A pending record is reported separately, but a terminal
+                # failed/abandoned effect must remain visible in the terminal
+                # gate as well.
+                if status in TERMINAL_OPERATION_STATUSES:
+                    blockers.append(f"required operation {operation_id_value} ({kind}) ended {status}")
+                continue
+            if kind not in REQUIRED_RECEIPT_KINDS:
+                continue
+            outcome = receipt_status(operation.get("receipt"))
+            if outcome not in RECEIPT_SUCCESS[kind]:
+                blockers.append(
+                    f"required {kind} operation {operation_id_value} has incomplete receipt "
+                    f"({outcome or 'unknown'})"
+                )
+
+    receipts = data.get("receipts", {})
+    if not isinstance(receipts, dict):
+        return blockers + ["delivery receipts are invalid"]
+    for kind, aliases in RECEIPT_ALIASES.items():
+        for alias in aliases:
+            if alias not in receipts:
+                continue
+            outcome = receipt_status(receipts[alias])
+            if outcome not in RECEIPT_SUCCESS[kind]:
+                blockers.append(f"required {kind} receipt {alias} is incomplete ({outcome or 'unknown'})")
+            break
+    return blockers
+
+
+def parent_gate_evaluated(data: dict[str, Any]) -> bool:
+    """A continuous parent objective needs one explicit, successful gate."""
+    if not data.get("parent_objective"):
+        return True
+    for operation in data.get("pending_operations", []):
+        if (
+            isinstance(operation, dict)
+            and operation.get("kind") == "parent_gate"
+            and operation.get("status") == "confirmed"
+            and receipt_status(operation.get("receipt")) in RECEIPT_SUCCESS["parent_gate"]
+        ):
+            return True
+    receipts = data.get("receipts", {})
+    if isinstance(receipts, dict):
+        return any(
+            receipt_status(receipts.get(alias)) in RECEIPT_SUCCESS["parent_gate"]
+            for alias in RECEIPT_ALIASES["parent_gate"]
+            if alias in receipts
+        )
+    return False
+
+
+def completion_blockers(data: dict[str, Any]) -> list[str]:
+    """Return every persisted condition that makes terminal completion unsafe.
+
+    This is intentionally pure so both `reconcile` and `complete` share the
+    same gate.  It does not infer that absent integrations were required; it
+    only refuses to finish work that the run itself says is still open or
+    whose explicitly recorded delivery result is not successful.
+    """
+    blockers: list[str] = []
+    work_units = open_work_units(data)
+    if work_units:
+        blockers.append("open work units: " + ", ".join(work_units))
+    batches = incomplete_batch_ids(data)
+    if batches:
+        blockers.append("incomplete delegation batches: " + ", ".join(batches))
+    tasks = active_task_ids(data)
+    if tasks:
+        blockers.append("active delegation tasks: " + ", ".join(tasks))
+    corrections = pending_correction_ids(data)
+    if corrections:
+        blockers.append("pending corrections: " + ", ".join(corrections))
+    pending = nonterminal_operations(data)
+    if pending:
+        blockers.append("pending operations: " + ", ".join(str(item["operation_id"]) for item in pending))
+
+    # An external Frontier identity without its matching ledger record cannot
+    # prove which exchange finished, including a partial write on a newer run.
+    frontier_operations = [
+        operation for operation in data.get("pending_operations", [])
+        if isinstance(operation, dict) and operation.get("kind") == "frontier_exchange"
+    ]
+    if (data.get("frontier_task_id") or data.get("last_request_id")) and not frontier_operations:
+        blockers.append("frontier exchange lacks a typed operation record")
+    if data.get("phase") == "waiting-for-frontier":
+        blockers.append("frontier exchange is not reconciled")
+
+    remediation = data.get("remediation")
+    if isinstance(remediation, dict) and remediation.get("blocked") is not None:
+        blockers.append("correction remediation is blocked")
+    if not parent_gate_evaluated(data):
+        blockers.append("parent objective has not passed a parent gate")
+    if data.get("push_status") in {"pending", "failed"}:
+        blockers.append(f"push status is {data.get('push_status')}")
+    blockers.extend(receipt_completion_blockers(data))
+    # Keep messages deterministic even if a legacy receipt and its operation
+    # report the same problem.
+    return list(dict.fromkeys(blockers))
+
+
+def operation_reconcile_action(operation: dict[str, Any]) -> tuple[str, str]:
+    """Map one durable in-flight operation to its single safe next action."""
+    kind = operation.get("kind")
+    status = operation.get("status")
+    operation_id_value = str(operation.get("operation_id") or "<unnamed-operation>")
+    if kind == "delegation":
+        return "COLLECT_DELEGATIONS", f"delegation operation {operation_id_value} is {status}"
+    if kind == "frontier_exchange":
+        action = "WAIT_FRONTIER" if status in {"effect-observed", "receipt-recorded"} else "RECOVER_FRONTIER_EXCHANGE"
+        return action, f"Frontier exchange {operation_id_value} is {status}"
+    if kind == "tracking_issue":
+        return "RECONCILE_TRACKING_ISSUE", f"tracking issue operation {operation_id_value} is {status}"
+    if kind in {"pull_request", "git_delivery"}:
+        return "RECONCILE_PULL_REQUEST", f"delivery operation {operation_id_value} is {status}"
+    if kind in {"ci", "local_verification"}:
+        return "RUN_LOCAL_VERIFICATION", f"verification operation {operation_id_value} is {status}"
+    if kind == "parent_gate":
+        return "RUN_PARENT_GATE", f"parent gate operation {operation_id_value} is {status}"
+    return "BLOCKED_STATE_INCOMPLETE", f"operation {operation_id_value} has an unsupported kind"
+
+
+def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
+    """Derive, but never execute, exactly one next recovery action."""
+    if data.get("status") in TERMINAL_RUN_STATUSES:
+        return "NO_ACTION", "run is terminal", []
+
+    if data.get("status") == "blocked":
+        blocker = data.get("blocker")
+        if blocker == "BLOCKED_MISSING_DELEGATION_RESULT":
+            return "RECOVER_MISSING_RESULT", "a delegation result is missing", []
+        if blocker in {"BLOCKED_CORRECTION_BUDGET", "BLOCKED_TOTAL_CORRECTION_BUDGET", "BLOCKED_NO_PROGRESS"}:
+            return "REQUEST_CORRECTION", f"correction recovery is required ({blocker})", []
+        if blocker == "HUMAN_DECISION_REQUIRED":
+            return "HUMAN_DECISION_REQUIRED", "a persisted human decision is required", []
+        return "BLOCKED_STATE_INCOMPLETE", f"run is blocked ({blocker or 'unspecified blocker'})", []
+
+    pending = nonterminal_operations(data)
+    if pending:
+        action, reason = operation_reconcile_action(pending[0])
+        return action, reason, [str(operation["operation_id"]) for operation in pending]
+
+    frontier_operations = [
+        operation for operation in data.get("pending_operations", [])
+        if isinstance(operation, dict) and operation.get("kind") == "frontier_exchange"
+    ]
+    if (data.get("frontier_task_id") or data.get("last_request_id")) and not frontier_operations:
+        return "RECOVER_FRONTIER_EXCHANGE", "external Frontier identity lacks a typed operation record", []
+
+    tasks = active_task_ids(data)
+    if tasks:
+        return "COLLECT_DELEGATIONS", "persisted delegation tasks are still active", tasks
+    batches = incomplete_batch_ids(data)
+    if batches:
+        return "COLLECT_DELEGATIONS", "a delegation batch is incomplete", batches
+
+    phase = data.get("phase")
+    if phase == "waiting-for-frontier":
+        if data.get("frontier_task_id") or data.get("last_request_id"):
+            return "RECOVER_FRONTIER_EXCHANGE", "legacy Frontier identity requires discovery", []
+        return "BLOCKED_STATE_INCOMPLETE", "waiting-for-frontier has no typed operation or external identity", []
+    if phase == "verifying":
+        return "RUN_LOCAL_VERIFICATION", "run is at the verification phase", []
+    if phase == "parent-gate":
+        return "RUN_PARENT_GATE", "run is at the parent gate", []
+    if phase in {"reporting", "committing", "pushing", "proceeding-to-next-gate"}:
+        blockers = completion_blockers(data)
+        if blockers:
+            return "BLOCKED_STATE_INCOMPLETE", blockers[0], []
+        return "COMPLETE_RUN", "all persisted terminal gates are satisfied", []
+    return "CONTINUE_PHASE", f"continue persisted phase {phase}", []
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Print one recovery action without writing state, events, or receipts."""
+    data = read_state(args.run_id)
+    require_v2(data, "reconcile")
+    validate_state(data)
+    action, reason, identifiers = derive_reconcile_action(data)
+    result = {
+        "run_id": data["run_id"],
+        "revision": data["revision"],
+        "action": action,
+        "reason": reason,
+        "operation_ids": identifiers,
+        "completion_blockers": completion_blockers(data) if action in {"COMPLETE_RUN", "BLOCKED_STATE_INCOMPLETE"} else [],
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
 
 def cmd_complete(args: argparse.Namespace) -> int:
     """Atomically persist terminal state, then record completion before unlocking."""
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "complete")
+    require_active_run(data, "complete")
+    blockers = completion_blockers(data)
+    if blockers:
+        raise SystemExit("BLOCKED_COMPLETION_INCOMPLETE: " + "; ".join(blockers))
     lock_path: Path | None = None
     previous_lock: dict[str, Any] | None = None
     if args.unlock_owner:
@@ -757,7 +2506,8 @@ def cmd_complete(args: argparse.Namespace) -> int:
 
 
 def cmd_artifact_path(args: argparse.Namespace) -> int:
-    read_state(args.run_id)
+    data = read_state(args.run_id)
+    require_v2(data, "artifact-path")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.name):
         raise SystemExit("invalid artifact name")
     path = run_dir(args.run_id) / "artifacts" / args.name
@@ -767,7 +2517,8 @@ def cmd_artifact_path(args: argparse.Namespace) -> int:
 
 
 def cmd_lock(args: argparse.Namespace) -> int:
-    read_state(args.run_id)
+    data = read_state(args.run_id)
+    require_v2(data, "lock")
     path = run_dir(args.run_id) / "lock.json"
     lock = {"owner": args.owner, "acquired_at": utcnow(), "pid": os.getpid()}
 
@@ -801,7 +2552,8 @@ def cmd_lock(args: argparse.Namespace) -> int:
 
 
 def cmd_unlock(args: argparse.Namespace) -> int:
-    read_state(args.run_id)
+    data = read_state(args.run_id)
+    require_v2(data, "unlock")
     path = run_dir(args.run_id) / "lock.json"
     if not path.exists():
         print(json.dumps({"unlocked": False, "reason": "not locked"}, indent=2))
@@ -817,7 +2569,8 @@ def cmd_unlock(args: argparse.Namespace) -> int:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
-    normalize_legacy_state(data)
+    require_v2(data, "cancel")
+    require_nonterminal_run(data, "cancel")
     data["phase"] = "cancelled"
     data["status"] = "cancelled"
     data["blocker"] = args.reason
@@ -861,7 +2614,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--chat-url")
     init.add_argument("--max-wait-seconds", type=int, default=900)
     init.add_argument("--max-plan-iterations", type=int, default=6)
-    init.add_argument("--max-worker-corrections", type=int, default=2)
+    init.add_argument("--max-corrections-per-work-unit", type=int, default=2)
+    init.add_argument(
+        "--max-worker-corrections", type=int, dest="legacy_max_worker_corrections",
+        help="deprecated alias for --max-corrections-per-work-unit",
+    )
+    init.add_argument("--max-total-corrections", type=int)
     init.add_argument("--max-failover-chats", type=int, default=1)
     init.set_defaults(func=cmd_init)
 
@@ -878,8 +2636,81 @@ def build_parser() -> argparse.ArgumentParser:
     patch.add_argument("run_id")
     patch.add_argument("--set", action="append")
     patch.add_argument("--json-patch")
+    # `patch` remains a temporary metadata/receipt compatibility escape hatch
+    # while typed delivery operations are rolled out.  Domain mutators require
+    # revisions; callers that can provide one still get optimistic checks.
     patch.add_argument("--expect-revision", type=int)
     patch.set_defaults(func=cmd_patch)
+
+    transition = sub.add_parser("transition", help="apply one validated active-run phase transition")
+    transition.add_argument("run_id")
+    transition.add_argument("--to-phase", choices=sorted(PHASES), required=True)
+    transition.add_argument("--reason", required=True)
+    transition.add_argument("--blocker")
+    transition.add_argument("--expect-revision", type=int, required=True)
+    transition.set_defaults(func=cmd_transition)
+
+    route = sub.add_parser(
+        "route",
+        help="persist or enforce an execution route (`route set RUN_ID`; legacy `route RUN_ID set` also works)",
+    )
+    route.add_argument("first")
+    route.add_argument("second")
+    route.add_argument("--policy", choices=sorted(EXECUTION_POLICIES))
+    route.add_argument("--authority")
+    route.add_argument("--request-id")
+    route.add_argument("--override-locked", action="store_true")
+    route.add_argument("--action", choices=["delegation", "frontier"])
+    route.add_argument("--expect-revision", type=int, required=True)
+    route.set_defaults(func=cmd_route)
+
+    operation = sub.add_parser("operation", help="persist one external-effect lifecycle without generic patches")
+    operation.add_argument("run_id")
+    operation.add_argument("operation_action", choices=["intent", "observe", "receipt", "confirm"])
+    operation.add_argument("--kind", choices=sorted(OPERATION_KINDS))
+    operation.add_argument("--idempotency-key")
+    operation.add_argument("--intent-json")
+    operation.add_argument("--operation-id")
+    operation.add_argument("--effect-json")
+    operation.add_argument("--receipt-json")
+    operation.add_argument("--status", choices=sorted(TERMINAL_OPERATION_STATUSES))
+    operation.add_argument("--reason")
+    operation.add_argument("--expect-revision", type=int, required=True)
+    operation.set_defaults(func=cmd_operation)
+
+    frontier = sub.add_parser("frontier", help="record a Frontier exchange intent before browser transport")
+    frontier.add_argument("run_id")
+    frontier.add_argument("frontier_action", choices=["start"])
+    frontier.add_argument("--request-id", required=True)
+    frontier.add_argument("--task-id", required=True)
+    frontier.add_argument("--idempotency-key")
+    frontier.add_argument("--intent-json", default="{}")
+    frontier.add_argument("--chat-url")
+    frontier.add_argument("--expect-revision", type=int, required=True)
+    frontier.set_defaults(func=cmd_frontier)
+
+    preflight = sub.add_parser("delegation-preflight", help="persist WU/task/workspace before launching a Task")
+    preflight.add_argument("run_id")
+    preflight.add_argument("--agent", required=True)
+    preflight.add_argument("--role", choices=["scout", "writer", "verifier"], required=True)
+    preflight.add_argument("--reason", required=True)
+    preflight.add_argument("--task-id", required=True)
+    preflight.add_argument("--work-unit-id", required=True)
+    preflight.add_argument("--workspace", required=True)
+    preflight.add_argument("--expect-revision", type=int, required=True)
+    preflight.set_defaults(func=cmd_delegation_preflight)
+
+    work_unit = sub.add_parser("work-unit", help="close a fully verified work unit")
+    work_unit.add_argument("run_id")
+    work_unit.add_argument("work_unit_action", choices=["complete"])
+    work_unit.add_argument("--work-unit-id", required=True)
+    work_unit.add_argument("--evidence-json", required=True)
+    work_unit.add_argument("--expect-revision", type=int, required=True)
+    work_unit.set_defaults(func=cmd_work_unit)
+
+    reconcile = sub.add_parser("reconcile", help="derive one safe recovery action without side effects")
+    reconcile.add_argument("run_id")
+    reconcile.set_defaults(func=cmd_reconcile)
 
     event = sub.add_parser("event")
     event.add_argument("run_id")
@@ -901,8 +2732,38 @@ def build_parser() -> argparse.ArgumentParser:
     delegation.add_argument("--outcome", choices=sorted(DELEGATION_OUTCOMES))
     delegation.add_argument("--evidence-json")
     delegation.add_argument("--correction", action="store_true")
-    delegation.add_argument("--expect-revision", type=int)
+    delegation.add_argument("--source-request-id")
+    delegation.add_argument("--scope-digest")
+    delegation.add_argument("--source-candidate-sha")
+    delegation.add_argument("--expect-revision", type=int, required=True)
     delegation.set_defaults(func=cmd_delegation)
+
+    correction = sub.add_parser("correction", help="typed work-unit remediation operations")
+    correction_sub = correction.add_subparsers(dest="correction_action", required=True)
+    start_correction = correction_sub.add_parser("start", help="persist and charge one bounded writer correction")
+    start_correction.add_argument("run_id")
+    start_correction.add_argument("--agent", default="myrmex-worker")
+    start_correction.add_argument("--reason", required=True)
+    start_correction.add_argument("--task-id", required=True)
+    start_correction.add_argument("--work-unit-id", required=True)
+    start_correction.add_argument("--started-at")
+    start_correction.add_argument("--source-request-id", required=True)
+    start_correction.add_argument("--scope-digest", required=True)
+    start_correction.add_argument("--source-candidate-sha", required=True)
+    start_correction.add_argument("--expect-revision", type=int, required=True)
+    start_correction.set_defaults(func=cmd_correction_start)
+
+    authorize = correction_sub.add_parser("authorize", help="authorize bounded extra attempts for an exhausted work unit")
+    authorize.add_argument("run_id")
+    authorize.add_argument("--work-unit-id", required=True)
+    authorize.add_argument("--authority", choices=sorted(CORRECTION_AUTHORITIES), required=True)
+    authorize.add_argument("--request-id", required=True)
+    authorize.add_argument("--scope-digest", required=True)
+    authorize.add_argument("--source-candidate-sha", required=True)
+    authorize.add_argument("--max-additional-attempts", type=int, required=True)
+    authorize.add_argument("--expires-at")
+    authorize.add_argument("--expect-revision", type=int, required=True)
+    authorize.set_defaults(func=cmd_correction_authorize)
 
     batch = sub.add_parser("delegation-batch")
     batch.add_argument("run_id")
@@ -912,16 +2773,20 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--results-json")
     batch.add_argument("--recover-missing", action="store_true")
     batch.add_argument("--next-phase")
-    batch.add_argument("--expect-revision", type=int)
+    batch.add_argument("--expect-revision", type=int, required=True)
     batch.set_defaults(func=cmd_delegation_batch)
 
     defects = sub.add_parser("defects")
     defects.add_argument("run_id")
+    defects.add_argument("--work-unit-id", required=True)
+    defects.add_argument("--verification-request-id", required=True)
+    defects.add_argument("--candidate-sha", required=True)
+    defects.add_argument("--scope-digest", required=True)
     defects.add_argument("--defects-json")
     defects.add_argument("--corrected-json")
     defects.add_argument("--remaining-json")
     defects.add_argument("--new-json")
-    defects.add_argument("--expect-revision", type=int)
+    defects.add_argument("--expect-revision", type=int, required=True)
     defects.set_defaults(func=cmd_defects)
 
     artifact = sub.add_parser("artifact-path")
@@ -944,19 +2809,19 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel")
     cancel.add_argument("run_id")
     cancel.add_argument("--reason", required=True)
-    cancel.add_argument("--expect-revision", type=int)
+    cancel.add_argument("--expect-revision", type=int, required=True)
     cancel.set_defaults(func=cmd_cancel)
 
     migrate = sub.add_parser("migrate")
     migrate.add_argument("run_id")
-    migrate.add_argument("--expect-revision", type=int)
+    migrate.add_argument("--expect-revision", type=int, required=True)
     migrate.set_defaults(func=cmd_migrate)
 
     complete = sub.add_parser("complete")
     complete.add_argument("run_id")
     complete.add_argument("--message", required=True)
     complete.add_argument("--unlock-owner")
-    complete.add_argument("--expect-revision", type=int)
+    complete.add_argument("--expect-revision", type=int, required=True)
     complete.set_defaults(func=cmd_complete)
 
     latest = sub.add_parser("latest")
