@@ -49,6 +49,7 @@ permission:
     "git switch*": deny
     "git commit*": deny
     "git push*": deny
+    "myrmex-memory*": deny
 ---
 
 # Myrmex Worker
@@ -73,6 +74,7 @@ If HEAD differs from the supplied base SHA, an allowed path is already dirty and
 - Preserve public behavior and contracts except where the objective explicitly changes them.
 - Do not perform opportunistic refactors, dependency upgrades, migrations, formatting sweeps, or generated-file churn.
 - Never access secrets, production systems, or customer data.
+- Do not invoke `myrmex-memory` or write, promote, revoke, or supersede memory; return only `memory_candidates` for the primary.
 - Do not commit, push, stash, reset, clean, or rewrite history.
 
 If repository reality conflicts with the work order, stop and report the exact mismatch. Do not silently rescope.

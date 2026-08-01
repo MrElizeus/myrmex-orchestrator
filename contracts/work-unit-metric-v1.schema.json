@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:work-unit-metric:v1",
+  "title": "Myrmex Work-unit Metric v1",
+  "description": "Normalized, sanitized installation-local work-unit outcome telemetry. It is not myrmex-state and must not carry raw project content.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "metric_id",
+    "scope",
+    "sensitivity",
+    "project_identity",
+    "work_unit_id",
+    "outcome",
+    "corrections",
+    "verification",
+    "recovery",
+    "tests",
+    "applicability",
+    "provenance",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.work-unit-metric/v1"
+    },
+    "metric_id": {
+      "type": "string",
+      "pattern": "^metric_[A-Za-z0-9_-]{8,128}$"
+    },
+    "scope": {
+      "const": "installation"
+    },
+    "sensitivity": {
+      "const": "sanitized"
+    },
+    "project_identity": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "work_unit_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "outcome": {
+      "enum": [
+        "success",
+        "partial",
+        "failed",
+        "blocked"
+      ]
+    },
+    "corrections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "defect_evidence"
+      ],
+      "properties": {
+        "used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "defect_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sanitized_evidence"
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "request_id",
+        "evidence"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "blocked",
+            "unknown"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sanitized_evidence"
+          }
+        }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "events",
+        "recovered"
+      ],
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "reconcile",
+              "receipt-replayed",
+              "operation-recovered",
+              "result-collected",
+              "retry-resumed",
+              "none"
+            ]
+          }
+        },
+        "recovered": {
+          "type": "boolean"
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/test"
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_version",
+        "model"
+      ],
+      "properties": {
+        "tool_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "request_id",
+        "run_id"
+      ],
+      "properties": {
+        "authority": {
+          "const": "primary"
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "outcome",
+        "artifact_digest",
+        "duration_seconds"
+      ],
+      "properties": {
+        "category": {
+          "enum": [
+            "unit",
+            "integration",
+            "e2e",
+            "lint",
+            "typecheck",
+            "build",
+            "smoke",
+            "other"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "artifact_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "duration_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "sanitized_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "digest",
+        "run_id",
+        "work_unit_id",
+        "commit_sha",
+        "verifier_request_id",
+        "frontier_request_id",
+        "artifact_digest"
+      ],
+      "properties": {
+        "kind": {
+          "const": "sanitized-receipt"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^sanitized/[0-9a-f]{64}$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "run_id": {
+          "const": null
+        },
+        "work_unit_id": {
+          "const": null
+        },
+        "commit_sha": {
+          "const": null
+        },
+        "verifier_request_id": {
+          "const": null
+        },
+        "frontier_request_id": {
+          "const": null
+        },
+        "artifact_digest": {
+          "const": null
+        }
+      }
+    }
+  }
+}

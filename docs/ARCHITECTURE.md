@@ -17,9 +17,11 @@ Child agents cannot invoke `Task`, preventing recursive swarms and making owners
 
 `myrmex-state` is a small dependency-free CLI that stores exact frontier state atomically under the user's XDG state directory: phase, revisions, task/request IDs, locks, digests, delivery receipts, and blockers.
 
-Semantic memory stores durable continuity: decisions, plans, root causes, and compact summaries. The primary is the sole memory writer. Browser/scout/worker/verifier return evidence or memory candidates.
+`myrmex-memory` is a separate dependency-free local JSONL/index backend for evidence-backed claims: private **project** architecture invariants, decisions, conventions, and known failure modes, plus sanitized **installation**-local operational lessons. It records candidate, verified, revoked, superseded, and confirmed lifecycle snapshots without turning semantic memory into a transaction database. Installation retrieval is filtered/ranked by tool/model applicability and freshness (TTL/decay); project scope ranks first. The primary is the sole native-memory writer/promoter/revoker/confirmer; browser/scout/worker/verifier return evidence or `memory_candidates` only.
 
-This split avoids using semantic search as a transaction database while keeping recovery across sessions and compacted conversations.
+Installation promotion is an explicit privacy boundary: raw project-private claims and proof metadata are never copied. The backend validates a newly supplied local proof, then stores only a digest-derived sanitized handle with an opaque source-memory reference. Normalized work-unit metrics live in a separate installation-local JSONL stream, so they cannot alter semantic confidence, policy, or exact run state. There is no cross-installation sharing, model training, automatic policy change, daemon, or scheduler.
+
+Engram remains an optional semantic adapter for compact continuity across sessions. Exact run state and receipts stay in `myrmex-state`; native memory and Engram can degrade safely rather than inventing a receipt. This split keeps recovery durable without a database service, vector store, or daemon.
 
 ## Frontier plane
 

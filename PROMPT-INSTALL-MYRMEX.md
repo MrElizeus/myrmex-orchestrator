@@ -24,7 +24,7 @@ Install and verify:
 - subagents `myrmex-scout`, `myrmex-worker`, `myrmex-verifier`, and `myrmex-frontier`;
 - skills `myrmex-delegation`, `myrmex-frontier-delegation`, `myrmex-memory`, and `myrmex-git-delivery`;
 - all seven `myrmex-*` commands;
-- executable `myrmex-state` in the selected user bin directory;
+- executables `myrmex-state` and `myrmex-memory` in the selected user bin directory;
 - contracts, docs, prompts, install metadata, and optional Myrmex defaults;
 - existing memory and browser MCP definitions, or safe missing entries added by the installer.
 
@@ -33,7 +33,9 @@ The behavioral goals are:
 - DIRECT is the normal route for clear bounded work;
 - delegation is proportional and uses one writer;
 - autonomous frontier work uses the isolated `myrmex-frontier` browser transport;
-- exact autonomous state is stored by `myrmex-state` while memory stores durable semantic continuity.
+- exact autonomous state is stored by `myrmex-state`; native `myrmex-memory`
+  stores evidence-backed private project claims and sanitized local installation
+  lessons/metrics offline, while Engram remains optional semantic continuity.
 
 ## Authority and safety boundary
 
@@ -63,6 +65,7 @@ skills/
 commands/
 contracts/
 bin/myrmex-state
+bin/myrmex-memory
 scripts/
 ```
 
@@ -134,15 +137,15 @@ Use the same `--config-dir` and `--bin-dir` values used during installation. The
 
 - `myrmex-orchestrator` is `mode: primary`;
 - all four children are hidden `mode: subagent`;
-- worker cannot use `Task`, memory, browser tools, Git commit, or Git push;
-- verifier cannot edit, delegate, write memory, commit, or push;
+- worker cannot use `Task`, native/Engram memory, browser tools, Git commit, or Git push;
+- verifier cannot edit, delegate, write native/Engram memory, commit, or push;
 - scout cannot edit, test, delegate, browse, or write memory;
 - frontier can use browser tools but cannot read the repository, run Bash, edit, delegate, load skills, or write memory;
 - primary denies direct browser tools and delegates transport to `myrmex-frontier`;
 - destructive Git commands, force push, `sudo`, and secret reads are denied by policy;
 - the four skills and seven commands are installed;
-- `myrmex-state doctor` succeeds using the installed executable;
-- `myrmex-state` is executable and its bin directory is on `PATH`, or a precise PATH remediation is reported without editing shell startup files;
+- `myrmex-state doctor` and `myrmex-memory doctor` succeed using the installed executables;
+- both state/memory CLIs are executable and their bin directory is on `PATH`, or a precise PATH remediation is reported without editing shell startup files;
 - existing model, plugin, MCP, and unrelated config remained intact;
 - the previous default agent remained unchanged unless `SET_DEFAULT_AGENT=true`.
 
@@ -169,7 +172,7 @@ Return a concise evidence-based installation report containing:
 - package tests and installed verification results;
 - MCP entries preserved or added, without exposing profile internals beyond necessary path-level diagnostics;
 - previous and resulting default-agent state;
-- state CLI and PATH status;
+- state/memory CLI and PATH status;
 - memory and browser capability status;
 - whether live frontier testing was intentionally not run;
 - warnings or incomplete work with exact reasons;

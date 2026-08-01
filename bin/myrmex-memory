@@ -1,0 +1,1865 @@
+#!/usr/bin/env python3
+"""Offline, evidence-backed project memory for Myrmex.
+
+`myrmex-state` remains authoritative for exact run transitions and receipts.
+This utility stores only governed semantic records in an append-only local JSONL
+log with a replaceable materialized index. It intentionally has no network or
+MCP dependency; Engram is an optional adapter used by the primary agent.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import urlparse
+
+try:  # Linux is the supported baseline; make the failure explicit elsewhere.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on unsupported platforms
+    fcntl = None  # type: ignore[assignment]
+
+SCHEMA = "myrmex.memory/v1"
+INDEX_SCHEMA = "myrmex.memory-index/v1"
+EVENT_SCHEMA = "myrmex.memory-event/v1"
+METRIC_SCHEMA = "myrmex.work-unit-metric/v1"
+PROJECT_SCOPE = "project"
+INSTALLATION_SCOPE = "installation"
+ALL_SCOPES = {"project", "installation"}
+STATUSES = {"candidate", "verified", "revoked", "superseded"}
+SENSITIVITIES = {"project-private", "sanitized", "restricted"}
+TERMINAL_STATUSES = {"revoked", "superseded"}
+ID_RE = re.compile(r"^mem_[A-Za-z0-9_-]{8,128}$")
+METRIC_ID_RE = re.compile(r"^metric_[A-Za-z0-9_-]{8,128}$")
+KIND_RE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
+SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,63}", re.I)
+DECAY_RE = re.compile(r"^(?:half-life|linear):[1-9][0-9]*$")
+SENSITIVE_TEXT_PATTERNS = [
+    re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----", re.I),
+    re.compile(r"\b(?:sk|gh[opsu])-[A-Za-z0-9_-]{12,}\b", re.I),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~-]{12,}\b", re.I),
+    re.compile(r"\b(?:api[_-]?key|password|secret|authorization|cookie)\s*[:=]\s*[^\s]{6,}", re.I),
+]
+METRIC_OUTCOMES = {"success", "partial", "failed", "blocked"}
+VERIFICATION_VERDICTS = {"pass", "fail", "blocked", "unknown"}
+METRIC_RECOVERY_EVENTS = {"reconcile", "receipt-replayed", "operation-recovered", "result-collected", "retry-resumed", "none"}
+TEST_OUTCOMES = {"passed", "failed", "skipped", "cancelled", "unknown"}
+METRIC_TEST_CATEGORIES = {"unit", "integration", "e2e", "lint", "typecheck", "build", "smoke", "other"}
+
+
+class MemoryError(Exception):
+    """A safe, user-actionable failure that must not print a success receipt."""
+
+
+def utcnow() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def fail(message: str) -> None:
+    raise MemoryError(message)
+
+
+def memory_home() -> Path:
+    explicit = os.environ.get("MYRMEX_MEMORY_HOME")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return (base / "opencode" / "myrmex-orchestrator" / "memory").resolve()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_origin(value: str) -> str:
+    """Canonicalize common Git remotes before hashing their private identity."""
+    text = value.strip().rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    parsed = urlparse(text)
+    if parsed.hostname:
+        # URL remotes can contain a username/password. The repository identity
+        # must not retain either, and SSH/HTTPS forms of one remote should map
+        # to the same project store.
+        path = parsed.path.strip("/")
+        return (parsed.hostname + (f"/{path}" if path else "")).lower()
+    scp_style = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", text)
+    if scp_style:
+        return f"{scp_style.group(1)}/{scp_style.group(2).strip('/')}".lower()
+    return text.lower()
+
+
+def project_identity_from_root(value: str) -> str:
+    root = Path(value).expanduser().resolve()
+    if not root.is_dir():
+        fail(f"repository root does not exist: {root}")
+    remote: str | None = None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            remote = normalize_origin(result.stdout)
+    except (OSError, subprocess.SubprocessError):
+        remote = None
+    source = "git:" + remote if remote else "path:" + str(root)
+    return "sha256:" + sha256_bytes(source.encode("utf-8"))
+
+
+def project_identity(args: argparse.Namespace) -> str:
+    supplied = getattr(args, "project_identity", None)
+    root = getattr(args, "repository_root", None)
+    if supplied:
+        if not isinstance(supplied, str) or not supplied.strip() or len(supplied) > 512:
+            fail("invalid --project-identity")
+        reject_sensitive_text(supplied, "project identity")
+        return supplied.strip()
+    if not root:
+        fail("one of --project-identity or --repository-root is required")
+    return project_identity_from_root(root)
+
+
+def project_root(args: argparse.Namespace) -> Path | None:
+    root = getattr(args, "repository_root", None)
+    if not root:
+        return None
+    candidate = Path(root).expanduser().resolve()
+    if not candidate.is_dir():
+        fail(f"repository root does not exist: {candidate}")
+    return candidate
+
+
+def project_dir(identity: str) -> Path:
+    return memory_home() / "projects" / sha256_bytes(identity.encode("utf-8"))
+
+
+def paths_for(identity: str) -> dict[str, Path]:
+    root = project_dir(identity)
+    return {
+        "root": root,
+        "events": root / "events.jsonl",
+        "index": root / "index.json",
+        "lock": root / "lock",
+    }
+
+
+def installation_paths() -> dict[str, Path]:
+    root = memory_home() / "installation"
+    return {
+        "root": root,
+        "events": root / "events.jsonl",
+        "index": root / "index.json",
+        "metrics": root / "work-unit-metrics.jsonl",
+        "lock": root / "lock",
+    }
+
+
+def make_directory(path: Path) -> None:
+    try:
+        # The local store can contain project-private claims and evidence links;
+        # secure every Myrmex-owned directory created on its path.
+        home = memory_home()
+        try:
+            relative = path.relative_to(home)
+        except ValueError:
+            fail("MEMORY_BACKEND_UNAVAILABLE: memory directory escapes its configured home")
+        directories = [home]
+        current = home
+        for part in relative.parts:
+            current = current / part
+            directories.append(current)
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot create memory directory: {exc}")
+
+
+def atomic_write(path: Path, data: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o600
+        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+            try:
+                directory_fd = os.open(path.parent, os.O_DIRECTORY)
+            except (AttributeError, OSError):
+                directory_fd = -1
+            if directory_fd >= 0:
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot write {path.name}: {exc}")
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace a private file atomically after fully syncing its contents."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o600
+        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+            try:
+                directory_fd = os.open(path.parent, os.O_DIRECTORY)
+            except (AttributeError, OSError):
+                directory_fd = -1
+            if directory_fd >= 0:
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot write {path.name}: {exc}")
+
+
+@contextmanager
+def lock_paths(paths: dict[str, Path], *, create: bool, label: str) -> Iterator[dict[str, Path]]:
+    if fcntl is None:
+        fail("MEMORY_BACKEND_UNAVAILABLE: file locking is unavailable on this platform")
+    if create:
+        make_directory(paths["root"])
+    elif not paths["root"].is_dir():
+        yield paths
+        return
+    try:
+        fd = os.open(paths["lock"], os.O_CREAT | os.O_RDWR, 0o600)
+        os.chmod(paths["lock"], 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot lock {label} memory: {exc}")
+    try:
+        yield paths
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def store_lock(identity: str, *, create: bool) -> Iterator[dict[str, Path]]:
+    with lock_paths(paths_for(identity), create=create, label="project") as paths:
+        yield paths
+
+
+@contextmanager
+def installation_lock(*, create: bool) -> Iterator[dict[str, Path]]:
+    with lock_paths(installation_paths(), create=create, label="installation") as paths:
+        yield paths
+
+
+def reject_sensitive_text(value: str, label: str) -> None:
+    if any(pattern.search(value) for pattern in SENSITIVE_TEXT_PATTERNS):
+        fail(f"MEMORY_SENSITIVITY_REJECTED: {label} appears to contain a secret")
+
+
+def safe_relative_path(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        fail("evidence path must be a non-empty relative string")
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts or any(part in {"", "."} for part in candidate.parts):
+        fail("MEMORY_EVIDENCE_REJECTED: evidence path must stay below the project root")
+    if any(part == ".env" or part.startswith(".env.") for part in candidate.parts):
+        fail("MEMORY_SENSITIVITY_REJECTED: environment files cannot be memory evidence")
+    return candidate.as_posix()
+
+
+def parse_json(value: str, option: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        fail(f"invalid {option}: {exc}")
+
+
+def nullable_string(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        fail(f"{label} must be a string or null")
+    reject_sensitive_text(value, label)
+    return value
+
+
+def nullable_timestamp(value: Any, label: str) -> str | None:
+    """Accept only timezone-aware ISO/RFC3339 timestamps used by the schema."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        fail(f"{label} must be an RFC3339 timestamp or null")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail(f"{label} must be an RFC3339 timestamp or null")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        fail(f"{label} must include a timezone")
+    return value
+
+
+def parse_timestamp(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def nullable_sha(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not SHA_RE.fullmatch(value):
+        fail(f"{label} must be a lowercase git SHA or null")
+    return value
+
+
+def nullable_digest(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        fail(f"{label} must be a sha256 digest or null")
+    return value
+
+
+def normalize_evidence_item(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("each evidence item must be an object")
+    allowed = {
+        "kind", "path", "digest", "run_id", "work_unit_id", "commit_sha",
+        "verifier_request_id", "frontier_request_id", "artifact_digest",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        fail("unknown evidence fields: " + ", ".join(unknown))
+    kind = value.get("kind")
+    if not isinstance(kind, str) or not kind or len(kind) > 64:
+        fail("evidence kind must be a non-empty string")
+    reject_sensitive_text(kind, "evidence kind")
+    digest = value.get("digest")
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        fail("evidence digest must be sha256:<64 lowercase hex characters>")
+    return {
+        "kind": kind,
+        "path": safe_relative_path(value.get("path")),
+        "digest": digest,
+        "run_id": nullable_string(value.get("run_id"), "evidence run_id"),
+        "work_unit_id": nullable_string(value.get("work_unit_id"), "evidence work_unit_id"),
+        "commit_sha": nullable_sha(value.get("commit_sha"), "evidence commit_sha"),
+        "verifier_request_id": nullable_string(value.get("verifier_request_id"), "evidence verifier_request_id"),
+        "frontier_request_id": nullable_string(value.get("frontier_request_id"), "evidence frontier_request_id"),
+        "artifact_digest": nullable_digest(value.get("artifact_digest"), "evidence artifact_digest"),
+    }
+
+
+def parse_evidence(value: str | None, option: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    parsed = parse_json(value, option)
+    return normalize_evidence_list(parsed, option)
+
+
+def normalize_evidence_list(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        fail(f"{label} must be an array")
+    return [normalize_evidence_item(item) for item in value]
+
+
+def sanitize_installation_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain only non-project-identifying proof handles in installation scope.
+
+    A local path, run/work-unit ID, commit, or verifier request can reveal a
+    project even when a claim was rewritten.  Validation happens against the
+    caller-provided project-local evidence first; the installation log stores
+    only an opaque digest and a synthetic path derived from that digest.
+    """
+    sanitized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        digest = item["digest"]
+        encoded = digest
+        if encoded in seen:
+            continue
+        seen.add(encoded)
+        sanitized.append({
+            "kind": "sanitized-receipt",
+            "path": "sanitized/" + digest.removeprefix("sha256:"),
+            "digest": digest,
+            "run_id": None,
+            "work_unit_id": None,
+            "commit_sha": None,
+            "verifier_request_id": None,
+            "frontier_request_id": None,
+            "artifact_digest": None,
+        })
+    return sanitized
+
+
+def validate_sanitized_installation_evidence(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        digest = item["digest"]
+        expected_path = "sanitized/" + digest.removeprefix("sha256:")
+        if item["kind"] != "sanitized-receipt" or item["path"] != expected_path:
+            fail("MEMORY_BACKEND_UNAVAILABLE: installation evidence is not sanitized")
+        if any(item[key] is not None for key in (
+            "run_id", "work_unit_id", "commit_sha", "verifier_request_id",
+            "frontier_request_id", "artifact_digest",
+        )):
+            fail("MEMORY_BACKEND_UNAVAILABLE: installation evidence retains project metadata")
+
+
+def validate_accessible_evidence(items: list[dict[str, Any]], root: Path | None) -> None:
+    if not items:
+        fail("MEMORY_EVIDENCE_REJECTED: promotion/refutation requires at least one evidence item")
+    if root is None:
+        fail("MEMORY_EVIDENCE_REJECTED: --repository-root is required to validate evidence")
+    for item in items:
+        path = (root / item["path"]).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            fail("MEMORY_EVIDENCE_REJECTED: evidence path escapes repository root")
+        if not path.is_file():
+            fail(f"MEMORY_EVIDENCE_REJECTED: evidence file is not accessible: {item['path']}")
+        observed = "sha256:" + sha256_file(path)
+        if observed != item["digest"]:
+            fail(f"MEMORY_EVIDENCE_REJECTED: evidence digest mismatch: {item['path']}")
+
+
+def validate_optional_accessible_evidence(items: list[dict[str, Any]], root: Path | None) -> None:
+    if items:
+        validate_accessible_evidence(items, root)
+
+
+def parse_provenance(value: str | None, request_id: str | None) -> dict[str, Any]:
+    raw: Any = {} if value is None else parse_json(value, "--provenance-json")
+    if not isinstance(raw, dict):
+        fail("--provenance-json must be an object")
+    allowed = {"source", "run_id", "work_unit_id"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        fail("unknown provenance fields: " + ", ".join(unknown))
+    source = raw.get("source", "primary")
+    if not isinstance(source, str) or not source or len(source) > 128:
+        fail("provenance source must be a non-empty string")
+    reject_sensitive_text(source, "provenance source")
+    return {
+        "source": source,
+        "authority": "primary",
+        "request_id": request_id,
+        "run_id": nullable_string(raw.get("run_id"), "provenance run_id"),
+        "work_unit_id": nullable_string(raw.get("work_unit_id"), "provenance work_unit_id"),
+    }
+
+
+def parse_applicability(value: str | None) -> dict[str, Any]:
+    raw: Any = {} if value is None else parse_json(value, "--applicability-json")
+    if not isinstance(raw, dict):
+        fail("--applicability-json must be an object")
+    allowed = {"repository_ref", "tool_version_range", "model"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        fail("unknown applicability fields: " + ", ".join(unknown))
+    return {
+        "repository_ref": nullable_string(raw.get("repository_ref"), "applicability repository_ref"),
+        "tool_version_range": nullable_string(raw.get("tool_version_range"), "applicability tool_version_range"),
+        "model": nullable_string(raw.get("model"), "applicability model"),
+    }
+
+
+def version_tuple(value: str) -> tuple[int, ...] | None:
+    match = re.fullmatch(r"v?([0-9]+(?:\.[0-9]+){0,5})(?:[-+][A-Za-z0-9.-]+)?", value.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def compare_versions(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+    size = max(len(left), len(right))
+    left = left + (0,) * (size - len(left))
+    right = right + (0,) * (size - len(right))
+    return (left > right) - (left < right)
+
+
+def parse_version_range(specification: str) -> list[tuple[str, tuple[int, ...]]] | None:
+    text = specification.strip()
+    if text == "*":
+        return []
+    clauses: list[tuple[str, tuple[int, ...]]] = []
+    for raw in text.split(","):
+        match = re.fullmatch(r"\s*(>=|<=|>|<|==|=)?\s*(v?[0-9]+(?:\.[0-9]+){0,5}(?:[-+][A-Za-z0-9.-]+)?)\s*", raw)
+        if not match:
+            return None
+        version = version_tuple(match.group(2))
+        if version is None:
+            return None
+        clauses.append((match.group(1) or "=", version))
+    return clauses
+
+
+def version_matches(specification: str, actual: str | None) -> bool | None:
+    clauses = parse_version_range(specification)
+    if clauses is None:
+        return None
+    if actual is None:
+        return None
+    observed = version_tuple(actual)
+    if observed is None:
+        return None
+    for operator, target in clauses:
+        comparison = compare_versions(observed, target)
+        if {
+            ">=": comparison >= 0,
+            "<=": comparison <= 0,
+            ">": comparison > 0,
+            "<": comparison < 0,
+            "=": comparison == 0,
+            "==": comparison == 0,
+        }[operator] is False:
+            return False
+    return True
+
+
+def validate_installation_applicability(applicability: dict[str, Any]) -> None:
+    if applicability["repository_ref"] is not None:
+        fail("MEMORY_SENSITIVITY_REJECTED: installation records cannot retain a repository reference")
+    if applicability["tool_version_range"] is None and applicability["model"] is None:
+        fail("MEMORY_APPLICABILITY_REQUIRED: installation records require tool or model applicability")
+    tool_range = applicability["tool_version_range"]
+    if tool_range is not None and parse_version_range(tool_range) is None:
+        fail("MEMORY_APPLICABILITY_REJECTED: unsupported tool_version_range")
+
+
+def parse_freshness(value: str | None) -> dict[str, Any]:
+    raw: Any = {} if value is None else parse_json(value, "--freshness-json")
+    if not isinstance(raw, dict):
+        fail("--freshness-json must be an object")
+    allowed = {"basis_commit_sha", "valid_until", "ttl_seconds", "decay"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        fail("unknown freshness fields: " + ", ".join(unknown))
+    sha = nullable_sha(raw.get("basis_commit_sha"), "freshness basis_commit_sha")
+    valid_until = nullable_timestamp(raw.get("valid_until"), "freshness valid_until")
+    ttl = raw.get("ttl_seconds")
+    if ttl is not None and (not isinstance(ttl, int) or ttl < 0):
+        fail("freshness ttl_seconds must be a non-negative integer or null")
+    decay = nullable_string(raw.get("decay"), "freshness decay")
+    if decay is not None and not DECAY_RE.fullmatch(decay):
+        fail("freshness decay must be `half-life:<positive-seconds>` or `linear:<positive-seconds>`")
+    return {
+        "basis_commit_sha": sha,
+        "last_confirmed_at": None,
+        "valid_until": valid_until,
+        "ttl_seconds": ttl,
+        "decay": decay,
+    }
+
+
+def validate_record(
+    record: Any,
+    identity: str | None = None,
+    *,
+    expected_scope: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        fail("MEMORY_BACKEND_UNAVAILABLE: event record is not an object")
+    required = {
+        "schema", "memory_id", "scope", "status", "kind", "claim", "confidence", "sensitivity",
+        "project_identity", "evidence", "provenance", "applicability", "freshness", "created_at",
+        "updated_at", "supersedes", "superseded_by", "revoked_by", "refutation", "revision",
+    }
+    if set(record) != required:
+        fail("MEMORY_BACKEND_UNAVAILABLE: memory record has an unsupported shape")
+    if record["schema"] != SCHEMA or not isinstance(record["memory_id"], str) or not ID_RE.fullmatch(record["memory_id"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory identity")
+    if record["scope"] not in ALL_SCOPES or record["status"] not in STATUSES:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory scope/status")
+    if expected_scope is not None and record["scope"] != expected_scope:
+        fail("MEMORY_BACKEND_UNAVAILABLE: record scope does not match its local store")
+    if record["scope"] == PROJECT_SCOPE:
+        if identity is not None and record["project_identity"] != identity:
+            fail("MEMORY_BACKEND_UNAVAILABLE: record project identity mismatch")
+        if not isinstance(record["project_identity"], str) or not record["project_identity"]:
+            fail("MEMORY_BACKEND_UNAVAILABLE: project record lacks an identity")
+    else:
+        if record["project_identity"] is not None:
+            fail("MEMORY_BACKEND_UNAVAILABLE: installation record must not retain a project identity")
+    if not isinstance(record["kind"], str) or not KIND_RE.fullmatch(record["kind"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory kind")
+    if not isinstance(record["claim"], str) or not record["claim"] or len(record["claim"]) > 4000:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory claim")
+    if not isinstance(record["confidence"], (int, float)) or isinstance(record["confidence"], bool) or not 0 <= record["confidence"] <= 1:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid confidence")
+    if record["sensitivity"] not in SENSITIVITIES or not isinstance(record["evidence"], list):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid sensitivity/evidence")
+    for item in record["evidence"]:
+        normalize_evidence_item(item)
+    provenance = record["provenance"]
+    if not isinstance(provenance, dict) or set(provenance) != {"source", "authority", "request_id", "run_id", "work_unit_id"}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid provenance")
+    if provenance.get("authority") != "primary":
+        fail("MEMORY_BACKEND_UNAVAILABLE: local records must be written by primary authority")
+    for key in ("source",):
+        if not isinstance(provenance.get(key), str) or not provenance[key]:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid provenance source")
+    for key in ("request_id", "run_id", "work_unit_id"):
+        if provenance.get(key) is not None and (not isinstance(provenance[key], str) or not provenance[key]):
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid provenance identifier")
+    applicability = record["applicability"]
+    if not isinstance(applicability, dict) or set(applicability) != {"repository_ref", "tool_version_range", "model"}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid applicability")
+    for key in ("repository_ref", "tool_version_range", "model"):
+        value = applicability[key]
+        if value is not None and (not isinstance(value, str) or not value):
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid applicability value")
+    if record["scope"] == INSTALLATION_SCOPE:
+        if record["sensitivity"] != "sanitized":
+            fail("MEMORY_SENSITIVITY_REJECTED: installation records must be sanitized")
+        if provenance["run_id"] is not None or provenance["work_unit_id"] is not None:
+            fail("MEMORY_BACKEND_UNAVAILABLE: installation provenance retains project metadata")
+        source = provenance["source"]
+        if source != "installation-primary":
+            if not source.startswith("project-memory:") or not ID_RE.fullmatch(source.removeprefix("project-memory:")):
+                fail("MEMORY_BACKEND_UNAVAILABLE: invalid sanitized installation provenance")
+        validate_installation_applicability(applicability)
+        validate_sanitized_installation_evidence(record["evidence"])
+    freshness = record["freshness"]
+    if not isinstance(freshness, dict) or set(freshness) != {"basis_commit_sha", "last_confirmed_at", "valid_until", "ttl_seconds", "decay"}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid freshness")
+    if freshness["basis_commit_sha"] is not None and (not isinstance(freshness["basis_commit_sha"], str) or not SHA_RE.fullmatch(freshness["basis_commit_sha"])):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid freshness SHA")
+    if freshness["ttl_seconds"] is not None and (not isinstance(freshness["ttl_seconds"], int) or freshness["ttl_seconds"] < 0):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid freshness TTL")
+    if freshness["decay"] is not None and (not isinstance(freshness["decay"], str) or not DECAY_RE.fullmatch(freshness["decay"])):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid freshness decay")
+    if record["scope"] == INSTALLATION_SCOPE and freshness["basis_commit_sha"] is not None:
+        fail("MEMORY_BACKEND_UNAVAILABLE: installation freshness retains a project commit")
+    for key in ("created_at", "updated_at"):
+        try:
+            nullable_timestamp(record[key], f"memory {key}")
+        except MemoryError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid memory timestamp: {exc}")
+    for key in ("last_confirmed_at", "valid_until"):
+        try:
+            nullable_timestamp(freshness[key], f"freshness {key}")
+        except MemoryError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid freshness timestamp: {exc}")
+    for key in ("supersedes", "superseded_by"):
+        if record[key] is not None and (not isinstance(record[key], str) or not ID_RE.fullmatch(record[key])):
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory relation")
+    if record["revoked_by"] is not None and (not isinstance(record["revoked_by"], str) or not record["revoked_by"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid revocation reference")
+    if record["refutation"] is not None:
+        refutation = record["refutation"]
+        if not isinstance(refutation, dict) or set(refutation) != {"authority", "reason", "evidence", "refuted_at", "resolution"}:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid refutation")
+        if refutation["authority"] != "primary" or refutation["resolution"] not in {"revoke", "supersede"}:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid refutation authority/resolution")
+        if not isinstance(refutation["reason"], str) or not refutation["reason"] or not isinstance(refutation["evidence"], list) or not refutation["evidence"]:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid refutation evidence")
+        for item in refutation["evidence"]:
+            normalize_evidence_item(item)
+        if record["scope"] == INSTALLATION_SCOPE:
+            validate_sanitized_installation_evidence(refutation["evidence"])
+        try:
+            nullable_timestamp(refutation["refuted_at"], "refutation timestamp")
+        except MemoryError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid refutation timestamp: {exc}")
+    if not isinstance(record["revision"], int) or record["revision"] < 0:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory revision")
+    return record
+
+
+def metric_text(value: Any, label: str, *, maximum: int = 2000, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        fail(f"{label} must be a non-empty string")
+    reject_sensitive_text(value, label)
+    return value
+
+
+def opaque_metric_handle(project: str, namespace: str, value: str) -> str:
+    """Derive a deterministic installation-local handle without raw labels."""
+    return "sha256:" + sha256_bytes((namespace + "\0" + project + "\0" + value).encode("utf-8"))
+
+
+def metric_project_identity(args: argparse.Namespace, root: Path | None) -> str:
+    supplied = getattr(args, "project_identity", None)
+    if root is not None:
+        derived = project_identity_from_root(str(root))
+        if supplied and supplied != derived:
+            fail("MEMORY_PROJECT_IDENTITY_MISMATCH: --project-identity does not match --repository-root")
+        return derived
+    if isinstance(supplied, str) and SHA256_RE.fullmatch(supplied):
+        return supplied
+    fail("--repository-root or a sha256 --project-identity is required for work-unit metrics")
+
+
+def parse_metric_verification(value: str, project: str) -> dict[str, Any]:
+    raw = parse_json(value, "--verification-json")
+    if not isinstance(raw, dict) or set(raw) != {"verdict", "request_id", "evidence"}:
+        fail("--verification-json must contain verdict, request_id, and evidence")
+    verdict = raw["verdict"]
+    if verdict not in VERIFICATION_VERDICTS:
+        fail("invalid metric verification verdict")
+    raw_request_id = nullable_string(raw["request_id"], "metric verification request_id")
+    return {
+        "verdict": verdict,
+        "request_id": None if raw_request_id is None else opaque_metric_handle(project, "verification-request", raw_request_id),
+        "evidence": normalize_evidence_list(raw["evidence"], "metric verification evidence"),
+    }
+
+
+def parse_metric_recovery(value: str) -> dict[str, Any]:
+    raw = parse_json(value, "--recovery-json")
+    if not isinstance(raw, dict) or set(raw) != {"events", "recovered"}:
+        fail("--recovery-json must contain events and recovered")
+    if not isinstance(raw["events"], list) or not isinstance(raw["recovered"], bool):
+        fail("invalid metric recovery")
+    events: list[str] = []
+    for item in raw["events"]:
+        if not isinstance(item, str) or item not in METRIC_RECOVERY_EVENTS:
+            fail("invalid metric recovery event code")
+        events.append(item)
+    return {"events": events, "recovered": raw["recovered"]}
+
+
+def parse_metric_tests(value: str) -> list[dict[str, Any]]:
+    raw = parse_json(value, "--tests-json")
+    if not isinstance(raw, list) or not raw:
+        fail("--tests-json must be a non-empty array")
+    tests: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"category", "outcome", "artifact_digest", "duration_seconds"}:
+            fail("each metric test must contain category, outcome, artifact_digest, and duration_seconds")
+        category = item["category"]
+        if category not in METRIC_TEST_CATEGORIES:
+            fail("invalid metric test category")
+        outcome = item["outcome"]
+        if outcome not in TEST_OUTCOMES:
+            fail("invalid metric test outcome")
+        artifact_digest = nullable_digest(item["artifact_digest"], "metric test artifact_digest")
+        duration = item["duration_seconds"]
+        if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0):
+            fail("metric test duration_seconds must be non-negative or null")
+        tests.append({
+            "category": category,
+            "outcome": outcome,
+            "artifact_digest": artifact_digest,
+            "duration_seconds": duration,
+        })
+    return tests
+
+
+def validate_metric(metric: Any) -> dict[str, Any]:
+    if not isinstance(metric, dict):
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric record is not an object")
+    required = {
+        "schema", "metric_id", "scope", "sensitivity", "project_identity", "work_unit_id", "outcome",
+        "corrections", "verification", "recovery", "tests", "applicability", "provenance", "created_at",
+    }
+    if set(metric) != required:
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric record has an unsupported shape")
+    if metric["schema"] != METRIC_SCHEMA or not isinstance(metric["metric_id"], str) or not METRIC_ID_RE.fullmatch(metric["metric_id"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric identity")
+    if metric["scope"] != INSTALLATION_SCOPE or metric["sensitivity"] != "sanitized":
+        fail("MEMORY_SENSITIVITY_REJECTED: metrics must be sanitized installation records")
+    if not isinstance(metric["project_identity"], str) or not SHA256_RE.fullmatch(metric["project_identity"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric project identity must be a private hash")
+    if not isinstance(metric["work_unit_id"], str) or not SHA256_RE.fullmatch(metric["work_unit_id"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric work-unit identity must be an opaque hash")
+    if metric["outcome"] not in METRIC_OUTCOMES:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric outcome")
+    corrections = metric["corrections"]
+    if not isinstance(corrections, dict) or set(corrections) != {"used", "defect_evidence"}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric corrections")
+    if not isinstance(corrections["used"], int) or corrections["used"] < 0 or not isinstance(corrections["defect_evidence"], list):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric correction values")
+    for item in corrections["defect_evidence"]:
+        normalize_evidence_item(item)
+    validate_sanitized_installation_evidence(corrections["defect_evidence"])
+    verification = metric["verification"]
+    if not isinstance(verification, dict) or set(verification) != {"verdict", "request_id", "evidence"} or verification["verdict"] not in VERIFICATION_VERDICTS:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric verification")
+    nullable_digest(verification["request_id"], "metric verification request_id")
+    if not isinstance(verification["evidence"], list):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric verification evidence")
+    for item in verification["evidence"]:
+        normalize_evidence_item(item)
+    validate_sanitized_installation_evidence(verification["evidence"])
+    recovery = metric["recovery"]
+    if not isinstance(recovery, dict) or set(recovery) != {"events", "recovered"} or not isinstance(recovery["events"], list) or not isinstance(recovery["recovered"], bool):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric recovery")
+    for item in recovery["events"]:
+        if item not in METRIC_RECOVERY_EVENTS:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric recovery event code")
+    if not isinstance(metric["tests"], list) or not metric["tests"]:
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric tests are required")
+    for test in metric["tests"]:
+        if not isinstance(test, dict) or set(test) != {"category", "outcome", "artifact_digest", "duration_seconds"}:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric test")
+        if test["category"] not in METRIC_TEST_CATEGORIES:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric test category")
+        if test["outcome"] not in TEST_OUTCOMES:
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric test outcome")
+        nullable_digest(test["artifact_digest"], "metric test artifact_digest")
+        duration = test["duration_seconds"]
+        if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0):
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric test duration")
+    applicability = metric["applicability"]
+    if not isinstance(applicability, dict) or set(applicability) != {"tool_version", "model"}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric applicability")
+    nullable_string(applicability["tool_version"], "metric tool_version")
+    nullable_string(applicability["model"], "metric model")
+    provenance = metric["provenance"]
+    if not isinstance(provenance, dict) or set(provenance) != {"authority", "request_id", "run_id"} or provenance["authority"] != "primary":
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric provenance")
+    if not isinstance(provenance["request_id"], str) or not SHA256_RE.fullmatch(provenance["request_id"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid opaque metric request_id")
+    nullable_digest(provenance["run_id"], "metric run_id")
+    try:
+        nullable_timestamp(metric["created_at"], "metric created_at")
+    except MemoryError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid metric timestamp: {exc}")
+    return metric
+
+
+def read_events(path: Path, identity: str | None, scope: str = PROJECT_SCOPE) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot read memory log: {exc}")
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: corrupt JSONL event at line {line_number}: {exc}")
+        if not isinstance(event, dict) or event.get("schema") != EVENT_SCHEMA:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid JSONL event at line {line_number}")
+        if not isinstance(event.get("event_id"), str) or not isinstance(event.get("type"), str):
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: event identity missing at line {line_number}")
+        record = validate_record(event.get("record"), identity, expected_scope=scope)
+        event["record"] = record
+        events.append(event)
+    return events
+
+
+def materialize(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for event in events:
+        record = event["record"]
+        records[record["memory_id"]] = record
+    return records
+
+
+def tokenize(value: str) -> list[str]:
+    return sorted(set(token.lower() for token in TOKEN_RE.findall(value)))
+
+
+def build_index(identity: str | None, events: list[dict[str, Any]]) -> dict[str, Any]:
+    records = materialize(events)
+    terms: dict[str, list[str]] = {}
+    for memory_id, record in records.items():
+        for token in tokenize(" ".join([record["kind"], record["claim"], record["provenance"]["source"]])):
+            terms.setdefault(token, []).append(memory_id)
+    for values in terms.values():
+        values.sort()
+    return {
+        "schema": INDEX_SCHEMA,
+        "project_identity": identity,
+        "event_count": len(events),
+        "last_event_id": events[-1]["event_id"] if events else None,
+        "records": records,
+        "terms": terms,
+    }
+
+
+def write_index(paths: dict[str, Path], identity: str | None, events: list[dict[str, Any]]) -> None:
+    atomic_write(paths["index"], build_index(identity, events))
+
+
+def read_index(paths: dict[str, Path], identity: str | None, events: list[dict[str, Any]]) -> dict[str, Any]:
+    expected = build_index(identity, events)
+    if not paths["index"].is_file():
+        return expected
+    try:
+        index = json.loads(paths["index"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return expected
+    if not isinstance(index, dict) or index.get("schema") != INDEX_SCHEMA:
+        return expected
+    if index.get("project_identity") != identity or index.get("event_count") != len(events):
+        return expected
+    if index.get("last_event_id") != expected["last_event_id"]:
+        return expected
+    if not isinstance(index.get("records"), dict) or not isinstance(index.get("terms"), dict):
+        return expected
+    # The JSONL log is authoritative. Do not trust a hand-edited/materialized
+    # index merely because its counters happen to match the log.
+    return index if index == expected else expected
+
+
+def append_events(paths: dict[str, Path], events: list[dict[str, Any]]) -> None:
+    """Atomically extend the logical append-only log as one lifecycle batch.
+
+    Supersession updates two records, so a sequence of O_APPEND writes could
+    persist only one half after interruption. Replacing a fully synced JSONL
+    image under the project lock keeps the previous log or the complete batch.
+    """
+    try:
+        existing = paths["events"].read_bytes() if paths["events"].exists() else b""
+        if existing and not existing.endswith(b"\n"):
+            fail("MEMORY_BACKEND_UNAVAILABLE: memory log has an incomplete final event")
+        payload = existing + b"".join(
+            (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            for event in events
+        )
+        atomic_write_bytes(paths["events"], payload)
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot append memory log: {exc}")
+
+
+def read_metrics(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot read metric log: {exc}")
+    metrics: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            metric = json.loads(line)
+        except json.JSONDecodeError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: corrupt metric JSONL at line {line_number}: {exc}")
+        metrics.append(validate_metric(metric))
+    return metrics
+
+
+def append_metrics(paths: dict[str, Path], metrics: list[dict[str, Any]]) -> None:
+    try:
+        metric_path = paths["metrics"]
+        existing = metric_path.read_bytes() if metric_path.exists() else b""
+        if existing and not existing.endswith(b"\n"):
+            fail("MEMORY_BACKEND_UNAVAILABLE: metric log has an incomplete final record")
+        payload = existing + b"".join(
+            (json.dumps(metric, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            for metric in metrics
+        )
+        atomic_write_bytes(metric_path, payload)
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot append metric log: {exc}")
+
+
+def make_event(event_type: str, record: dict[str, Any], request_id: str | None, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "schema": EVENT_SCHEMA,
+        "event_id": "memevt_" + secrets.token_urlsafe(12),
+        "type": event_type,
+        "timestamp": utcnow(),
+        "request_id": request_id,
+        "memory_id": record["memory_id"],
+        "record": record,
+        "details": details or {},
+    }
+
+
+def check_request_id(value: str | None, option: str, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            fail(f"{option} is required")
+        return None
+    if not isinstance(value, str) or not value or len(value) > 256:
+        fail(f"invalid {option}")
+    reject_sensitive_text(value, option)
+    return value
+
+
+def prior_request(events: list[dict[str, Any]], request_id: str | None, event_types: set[str], memory_id: str | None = None) -> dict[str, Any] | None:
+    if request_id is None:
+        return None
+    matches = [event for event in events if event.get("request_id") == request_id]
+    if not matches:
+        return None
+    if memory_id is None:
+        if any(event.get("type") not in event_types for event in matches):
+            fail("MEMORY_REQUEST_ID_REUSED: request ID was used for a different operation")
+        return matches[-1]
+    target = [event for event in matches if event.get("memory_id") == memory_id]
+    if not target:
+        fail("MEMORY_REQUEST_ID_REUSED: request ID was used for a different memory")
+    # A supersession produces a companion event for the replacement record.
+    # It is valid for the original refutation retry, but must not make a later
+    # refutation of that replacement look idempotent under the old request ID.
+    if any(event.get("type") not in event_types for event in target):
+        fail("MEMORY_REQUEST_ID_REUSED: request ID was used for a different operation")
+    return target[-1]
+
+
+def emit(value: Any) -> int:
+    print(json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_project_id(args: argparse.Namespace) -> int:
+    print(project_identity_from_root(args.repository_root))
+    return 0
+
+
+def scope_identity(args: argparse.Namespace, scope: str) -> str | None:
+    if scope == PROJECT_SCOPE:
+        return project_identity(args)
+    if scope != INSTALLATION_SCOPE:
+        fail("invalid memory scope")
+    if getattr(args, "project_identity", None):
+        fail("--project-identity is only valid for project-scoped memory")
+    return None
+
+
+@contextmanager
+def scoped_lock(scope: str, identity: str | None, *, create: bool) -> Iterator[dict[str, Path]]:
+    if scope == PROJECT_SCOPE:
+        if identity is None:
+            fail("project memory requires a project identity")
+        with store_lock(identity, create=create) as paths:
+            yield paths
+        return
+    if scope == INSTALLATION_SCOPE:
+        with installation_lock(create=create) as paths:
+            yield paths
+        return
+    fail("invalid memory scope")
+
+
+def store_not_found(scope: str) -> None:
+    fail(f"memory {scope} store not found")
+
+
+def cmd_candidate(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may create memory candidates")
+    if not KIND_RE.fullmatch(args.kind):
+        fail("invalid --kind")
+    if not args.claim.strip() or len(args.claim) > 4000:
+        fail("--claim must contain 1..4000 characters")
+    reject_sensitive_text(args.claim, "memory claim")
+    if not isinstance(args.confidence, float) or not 0 <= args.confidence <= 1:
+        fail("--confidence must be between 0 and 1")
+    if args.sensitivity not in SENSITIVITIES:
+        fail("invalid --sensitivity")
+    evidence = parse_evidence(args.evidence_json, "--evidence-json")
+    provenance = parse_provenance(args.provenance_json, request_id)
+    if scope == INSTALLATION_SCOPE:
+        # A direct installation candidate has no project provenance. Preserve
+        # only the primary/request audit handle; source-run identifiers belong
+        # in the originating project store, not the reusable lesson.
+        provenance = {
+            "source": "installation-primary",
+            "authority": "primary",
+            "request_id": request_id,
+            "run_id": None,
+            "work_unit_id": None,
+        }
+    applicability = parse_applicability(args.applicability_json)
+    freshness = parse_freshness(args.freshness_json)
+    now = utcnow()
+    with scoped_lock(scope, identity, create=True) as paths:
+        events = read_events(paths["events"], identity, scope)
+        retry = prior_request(events, request_id, {"memory.candidate_created"})
+        if retry is not None:
+            return emit({"created": False, "idempotent": True, "memory": retry["record"]})
+        record = {
+            "schema": SCHEMA,
+            "memory_id": "mem_" + secrets.token_urlsafe(12),
+            "scope": scope,
+            "status": "candidate",
+            "kind": args.kind,
+            "claim": args.claim.strip(),
+            "confidence": args.confidence,
+            "sensitivity": args.sensitivity,
+            "project_identity": identity,
+            "evidence": sanitize_installation_evidence(evidence) if scope == INSTALLATION_SCOPE else evidence,
+            "provenance": provenance,
+            "applicability": applicability,
+            "freshness": freshness,
+            "created_at": now,
+            "updated_at": now,
+            "supersedes": None,
+            "superseded_by": None,
+            "revoked_by": None,
+            "refutation": None,
+            "revision": 0,
+        }
+        validate_record(record, identity, expected_scope=scope)
+        event = make_event("memory.candidate_created", record, request_id)
+        append_events(paths, [event])
+        events.append(event)
+        write_index(paths, identity, events)
+    return emit({"created": True, "idempotent": False, "memory": record})
+
+
+def get_record(records: dict[str, dict[str, Any]], memory_id: str) -> dict[str, Any]:
+    if not ID_RE.fullmatch(memory_id):
+        fail("invalid memory ID")
+    record = records.get(memory_id)
+    if record is None:
+        fail(f"memory not found: {memory_id}")
+    return record
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    root = project_root(args)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may promote memory")
+    supplied_evidence = parse_evidence(args.evidence_json, "--evidence-json")
+    if scope == INSTALLATION_SCOPE and not supplied_evidence:
+        fail("MEMORY_EVIDENCE_REJECTED: installation promotion requires --evidence-json for sanitized proof")
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found(scope)
+        events = read_events(paths["events"], identity, scope)
+        retry = prior_request(events, request_id, {"memory.promoted"}, args.memory_id)
+        if retry is not None:
+            return emit({"promoted": False, "idempotent": True, "memory": retry["record"]})
+        records = materialize(events)
+        record = dict(get_record(records, args.memory_id))
+        if record["status"] != "candidate":
+            fail("MEMORY_PROMOTION_REJECTED: only candidate records may be promoted")
+        if record["revision"] != args.expect_revision:
+            fail(f"revision conflict: expected {args.expect_revision}, observed {record['revision']}")
+        evidence = supplied_evidence or record["evidence"]
+        validate_accessible_evidence(evidence, root)
+        now = utcnow()
+        record["evidence"] = sanitize_installation_evidence(evidence) if scope == INSTALLATION_SCOPE else evidence
+        record["status"] = "verified"
+        record["provenance"] = dict(record["provenance"], authority="primary", request_id=request_id)
+        record["freshness"] = dict(record["freshness"], last_confirmed_at=now)
+        record["updated_at"] = now
+        record["revision"] += 1
+        validate_record(record, identity, expected_scope=scope)
+        event = make_event("memory.promoted", record, request_id, {"from_status": "candidate"})
+        append_events(paths, [event])
+        events.append(event)
+        write_index(paths, identity, events)
+    return emit({"promoted": True, "idempotent": False, "memory": record})
+
+
+def cmd_installation_promote(args: argparse.Namespace) -> int:
+    source_identity = project_identity(args)
+    root = project_root(args)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may promote installation memory")
+    if root is None:
+        fail("MEMORY_EVIDENCE_REJECTED: --repository-root is required to promote installation memory")
+    if not args.sanitized_claim.strip() or len(args.sanitized_claim) > 4000:
+        fail("--sanitized-claim must contain 1..4000 characters")
+    sanitized_claim = args.sanitized_claim.strip()
+    reject_sensitive_text(sanitized_claim, "sanitized installation claim")
+    if not args.sanitization_reason.strip() or len(args.sanitization_reason) > 2000:
+        fail("--sanitization-reason must contain 1..2000 characters")
+    sanitization_reason = args.sanitization_reason.strip()
+    reject_sensitive_text(sanitization_reason, "installation sanitization reason")
+    # Never inherit an evidence payload from a project record.  The caller
+    # must deliberately supply a scrubbed, repository-local receipt for the
+    # installation lesson, rather than accidentally copying project metadata.
+    supplied_evidence = parse_evidence(args.sanitized_evidence_json, "--sanitized-evidence-json")
+    applicability = parse_applicability(args.applicability_json)
+    validate_installation_applicability(applicability)
+    freshness = parse_freshness(args.freshness_json)
+    with store_lock(source_identity, create=False) as source_paths:
+        if not source_paths["root"].is_dir():
+            store_not_found(PROJECT_SCOPE)
+        source_events = read_events(source_paths["events"], source_identity, PROJECT_SCOPE)
+        source = dict(get_record(materialize(source_events), args.source_memory_id))
+        if source["status"] != "verified":
+            fail("MEMORY_PROMOTION_REJECTED: only verified project memory may be promoted to installation scope")
+        if source["revision"] != args.source_expect_revision:
+            fail(f"source revision conflict: expected {args.source_expect_revision}, observed {source['revision']}")
+        if source["sensitivity"] == "restricted":
+            fail("MEMORY_SENSITIVITY_REJECTED: restricted project memory cannot be promoted")
+        if source["sensitivity"] == "project-private" and sanitized_claim == source["claim"]:
+            fail("MEMORY_SENSITIVITY_REJECTED: project-private memory requires a distinct sanitized claim")
+        validate_accessible_evidence(supplied_evidence, root)
+    confidence = source["confidence"] if args.confidence is None else args.confidence
+    if not isinstance(confidence, float) or not 0 <= confidence <= 1:
+        fail("--confidence must be between 0 and 1")
+    kind = args.kind or source["kind"]
+    if not KIND_RE.fullmatch(kind):
+        fail("invalid --kind")
+    now = utcnow()
+    with installation_lock(create=True) as paths:
+        events = read_events(paths["events"], None, INSTALLATION_SCOPE)
+        retry = prior_request(events, request_id, {"memory.installation_promoted"})
+        if retry is not None:
+            return emit({"promoted": False, "idempotent": True, "memory": retry["record"]})
+        record = {
+            "schema": SCHEMA,
+            "memory_id": "mem_" + secrets.token_urlsafe(12),
+            "scope": INSTALLATION_SCOPE,
+            "status": "verified",
+            "kind": kind,
+            "claim": sanitized_claim,
+            "confidence": confidence,
+            "sensitivity": "sanitized",
+            "project_identity": None,
+            "evidence": sanitize_installation_evidence(supplied_evidence),
+            "provenance": {
+                "source": "project-memory:" + source["memory_id"],
+                "authority": "primary",
+                "request_id": request_id,
+                "run_id": None,
+                "work_unit_id": None,
+            },
+            "applicability": applicability,
+            "freshness": dict(freshness, last_confirmed_at=now),
+            "created_at": now,
+            "updated_at": now,
+            "supersedes": None,
+            "superseded_by": None,
+            "revoked_by": None,
+            "refutation": None,
+            "revision": 0,
+        }
+        validate_record(record, None, expected_scope=INSTALLATION_SCOPE)
+        event = make_event(
+            "memory.installation_promoted",
+            record,
+            request_id,
+            {
+                "source_memory_id": source["memory_id"],
+                "sanitization_reason": sanitization_reason,
+                "sanitized_evidence_count": len(supplied_evidence),
+            },
+        )
+        append_events(paths, [event])
+        events.append(event)
+        write_index(paths, None, events)
+    return emit({"promoted": True, "idempotent": False, "memory": record})
+
+
+def cmd_refute(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    root = project_root(args)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may refute memory")
+    if not args.reason.strip() or len(args.reason) > 2000:
+        fail("--reason must contain 1..2000 characters")
+    reject_sensitive_text(args.reason, "refutation reason")
+    evidence = parse_evidence(args.evidence_json, "--evidence-json")
+    validate_accessible_evidence(evidence, root)
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found(scope)
+        events = read_events(paths["events"], identity, scope)
+        retry = prior_request(events, request_id, {"memory.refuted"}, args.memory_id)
+        if retry is not None:
+            return emit({"refuted": False, "idempotent": True, "memory": retry["record"]})
+        records = materialize(events)
+        record = dict(get_record(records, args.memory_id))
+        if record["status"] != "verified":
+            fail("MEMORY_REFUTATION_REJECTED: only verified records may be refuted")
+        if record["revision"] != args.expect_revision:
+            fail(f"revision conflict: expected {args.expect_revision}, observed {record['revision']}")
+        now = utcnow()
+        resolution = args.resolution
+        refutation = {
+            "authority": "primary",
+            "reason": args.reason.strip(),
+            "evidence": evidence,
+            "refuted_at": now,
+            "resolution": resolution,
+        }
+        if scope == INSTALLATION_SCOPE:
+            refutation["evidence"] = sanitize_installation_evidence(evidence)
+        record["refutation"] = refutation
+        record["updated_at"] = now
+        record["revision"] += 1
+        emitted: list[dict[str, Any]] = []
+        if resolution == "revoke":
+            record["status"] = "revoked"
+            record["revoked_by"] = request_id
+            validate_record(record, identity, expected_scope=scope)
+            emitted.append(make_event("memory.refuted", record, request_id, {"resolution": "revoke"}))
+            result: dict[str, Any] = {"refuted": True, "resolution": "revoke", "memory": record}
+        else:
+            if not args.replacement_id:
+                fail("--replacement-id is required for --resolution supersede")
+            replacement = dict(get_record(records, args.replacement_id))
+            if replacement["memory_id"] == record["memory_id"]:
+                fail("replacement memory must differ from the refuted memory")
+            if replacement["status"] != "verified":
+                fail("MEMORY_REFUTATION_REJECTED: replacement must already be verified")
+            if replacement["revision"] != args.replacement_expect_revision:
+                fail(
+                    "replacement revision conflict: "
+                    f"expected {args.replacement_expect_revision}, observed {replacement['revision']}"
+                )
+            if replacement["supersedes"] is not None:
+                fail("MEMORY_REFUTATION_REJECTED: replacement already supersedes another record")
+            record["status"] = "superseded"
+            record["superseded_by"] = replacement["memory_id"]
+            replacement["supersedes"] = record["memory_id"]
+            replacement["updated_at"] = now
+            replacement["revision"] += 1
+            validate_record(record, identity, expected_scope=scope)
+            validate_record(replacement, identity, expected_scope=scope)
+            emitted.append(make_event("memory.refuted", record, request_id, {"resolution": "supersede"}))
+            emitted.append(make_event("memory.supersession_linked", replacement, request_id, {"supersedes": record["memory_id"]}))
+            result = {"refuted": True, "resolution": "supersede", "memory": record, "replacement": replacement}
+        append_events(paths, emitted)
+        events.extend(emitted)
+        write_index(paths, identity, events)
+    return emit(result)
+
+
+def merge_evidence(existing: list[dict[str, Any]], additional: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = list(existing)
+    seen = {json.dumps(item, sort_keys=True, ensure_ascii=False) for item in existing}
+    for item in additional:
+        encoded = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if encoded not in seen:
+            merged.append(item)
+            seen.add(encoded)
+    return merged
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    root = project_root(args)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may confirm memory")
+    if not args.reason.strip() or len(args.reason) > 2000:
+        fail("--reason must contain 1..2000 characters")
+    reject_sensitive_text(args.reason, "confirmation reason")
+    if not args.usefulness.strip() or len(args.usefulness) > 2000:
+        fail("--usefulness must contain 1..2000 characters")
+    usefulness = args.usefulness.strip()
+    reject_sensitive_text(usefulness, "confirmation usefulness")
+    evidence = parse_evidence(args.evidence_json, "--evidence-json")
+    validate_accessible_evidence(evidence, root)
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found(scope)
+        events = read_events(paths["events"], identity, scope)
+        retry = prior_request(events, request_id, {"memory.confirmed"}, args.memory_id)
+        if retry is not None:
+            return emit({"confirmed": False, "idempotent": True, "memory": retry["record"]})
+        records = materialize(events)
+        record = dict(get_record(records, args.memory_id))
+        if record["status"] != "verified":
+            fail("MEMORY_CONFIRMATION_REJECTED: only verified records may be confirmed")
+        if record["revision"] != args.expect_revision:
+            fail(f"revision conflict: expected {args.expect_revision}, observed {record['revision']}")
+        now = utcnow()
+        confirmed_evidence = sanitize_installation_evidence(evidence) if scope == INSTALLATION_SCOPE else evidence
+        record["evidence"] = merge_evidence(record["evidence"], confirmed_evidence)
+        record["provenance"] = dict(record["provenance"], authority="primary", request_id=request_id)
+        record["freshness"] = dict(record["freshness"], last_confirmed_at=now)
+        record["updated_at"] = now
+        record["revision"] += 1
+        validate_record(record, identity, expected_scope=scope)
+        event = make_event(
+            "memory.confirmed",
+            record,
+            request_id,
+            {
+                "reason": args.reason.strip(),
+                "usefulness": usefulness,
+                "evidence_count": len(evidence),
+            },
+        )
+        append_events(paths, [event])
+        events.append(event)
+        write_index(paths, identity, events)
+    return emit({"confirmed": True, "idempotent": False, "memory": record})
+
+
+def freshness_metadata(record: dict[str, Any], *, now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now(dt.timezone.utc)
+    freshness = record["freshness"]
+    if record["status"] != "verified":
+        return {"status": "unverified", "age_seconds": None, "decay_factor": 1.0}
+    anchor_text = freshness.get("last_confirmed_at") or record.get("updated_at") or record.get("created_at")
+    try:
+        anchor = parse_timestamp(anchor_text) if isinstance(anchor_text, str) else now
+    except ValueError:
+        return {"status": "unknown", "age_seconds": None, "decay_factor": 0.25}
+    age_seconds = max(0, int((now - anchor).total_seconds()))
+    factor = 1.0
+    status = "fresh"
+    valid_until = freshness.get("valid_until")
+    if isinstance(valid_until, str):
+        try:
+            if parse_timestamp(valid_until) < now:
+                status = "expired"
+                factor *= 0.25
+        except ValueError:
+            return {"status": "unknown", "age_seconds": age_seconds, "decay_factor": 0.25}
+    if freshness.get("last_confirmed_at") is None:
+        status = "unconfirmed"
+        factor *= 0.75
+    ttl = freshness.get("ttl_seconds")
+    if isinstance(ttl, int) and age_seconds > ttl:
+        if status == "fresh":
+            status = "ttl-expired"
+        factor *= 0.5
+    decay = freshness.get("decay")
+    if isinstance(decay, str):
+        mode, seconds_text = decay.split(":", 1)
+        seconds = int(seconds_text)
+        if mode == "half-life":
+            factor *= 0.5 ** (age_seconds / seconds)
+        else:
+            # Do not erase history merely because it aged; surface a minimum
+            # score so a narrow installation lesson remains inspectable.
+            factor *= max(0.05, 1.0 - (age_seconds / seconds))
+        if status == "fresh" and factor < 0.999999:
+            status = "decayed"
+    return {"status": status, "age_seconds": age_seconds, "decay_factor": round(factor, 6)}
+
+
+def freshness_warning(record: dict[str, Any]) -> str:
+    return str(freshness_metadata(record)["status"])
+
+
+def applicability_metadata(
+    record: dict[str, Any],
+    *,
+    tool_version: str | None,
+    model: str | None,
+) -> dict[str, Any]:
+    applicability = record["applicability"]
+    warnings: list[str] = []
+    factor = 1.0
+    version_range = applicability.get("tool_version_range")
+    if isinstance(version_range, str):
+        matched = version_matches(version_range, tool_version)
+        if matched is False:
+            warnings.append("version-stale")
+            factor *= 0.25
+        elif matched is None:
+            warnings.append("version-unknown")
+            factor *= 0.8
+    expected_model = applicability.get("model")
+    if isinstance(expected_model, str) and expected_model != "*":
+        if model is None:
+            warnings.append("model-unknown")
+            factor *= 0.8
+        elif model != expected_model:
+            warnings.append("model-mismatch")
+            factor *= 0.25
+    return {
+        "status": "stale" if any(item in {"version-stale", "model-mismatch"} for item in warnings) else ("unknown" if warnings else "applicable"),
+        "warnings": warnings,
+        "priority_factor": round(factor, 6),
+        "tool_version_range": version_range,
+        "model": expected_model,
+    }
+
+
+def search_store(
+    *,
+    scope: str,
+    identity: str | None,
+    tokens: list[str],
+    include_candidates: bool,
+    tool_version: str | None,
+    model: str | None,
+) -> list[dict[str, Any]]:
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            return []
+        events = read_events(paths["events"], identity, scope)
+        index = read_index(paths, identity, events)
+        records = index["records"]
+        results: list[dict[str, Any]] = []
+        allowed_statuses = {"verified", "candidate"} if include_candidates else {"verified"}
+        for record in records.values():
+            if record["status"] not in allowed_statuses:
+                continue
+            searchable = set(tokenize(" ".join([record["kind"], record["claim"], record["provenance"]["source"]])))
+            matched = [token for token in tokens if token in searchable]
+            if not matched:
+                continue
+            freshness = freshness_metadata(record)
+            applicability = applicability_metadata(record, tool_version=tool_version, model=model)
+            text_score = len(matched) / len(tokens)
+            score = text_score * float(freshness["decay_factor"]) * float(applicability["priority_factor"])
+            results.append({
+                "memory": record,
+                "retrieval": {
+                    "backend": "local-jsonl",
+                    "scope": scope,
+                    "scope_rank": 0 if scope == PROJECT_SCOPE else 1,
+                    "score": round(score, 6),
+                    "text_score": round(text_score, 6),
+                    "matched_terms": matched,
+                    "staleness": freshness["status"],
+                    "freshness": freshness,
+                    "applicability": applicability,
+                    "retrieved_at": utcnow(),
+                },
+            })
+    return results
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    tokens = tokenize(args.query)
+    if not tokens:
+        fail("--query must contain searchable text")
+    scope = args.scope
+    identity: str | None = None
+    results: list[dict[str, Any]] = []
+    scopes_searched: list[str] = []
+    if scope in {PROJECT_SCOPE, "auto"}:
+        if args.project_identity or args.repository_root:
+            identity = project_identity(args)
+            results.extend(search_store(
+                scope=PROJECT_SCOPE,
+                identity=identity,
+                tokens=tokens,
+                include_candidates=args.include_candidates,
+                tool_version=args.tool_version,
+                model=args.model,
+            ))
+            scopes_searched.append(PROJECT_SCOPE)
+        elif scope == PROJECT_SCOPE:
+            fail("one of --project-identity or --repository-root is required for project search")
+    if scope in {INSTALLATION_SCOPE, "auto"}:
+        results.extend(search_store(
+            scope=INSTALLATION_SCOPE,
+            identity=None,
+            tokens=tokens,
+            include_candidates=args.include_candidates,
+            tool_version=args.tool_version,
+            model=args.model,
+        ))
+        scopes_searched.append(INSTALLATION_SCOPE)
+    results.sort(key=lambda item: (item["retrieval"]["scope_rank"], -item["retrieval"]["score"], item["memory"]["memory_id"]))
+    return emit({
+        "backend": "local-jsonl",
+        "project_identity": identity,
+        "scopes_searched": scopes_searched,
+        "records": results[:args.limit],
+    })
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found(scope)
+        events = read_events(paths["events"], identity, scope)
+        records = materialize(events)
+        record = get_record(records, args.memory_id)
+    return emit(record)
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    scope = args.scope
+    identity = scope_identity(args, scope)
+    with scoped_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found(scope)
+        events = read_events(paths["events"], identity, scope)
+        filtered = [event for event in events if event["memory_id"] == args.memory_id]
+    if not filtered:
+        fail(f"memory not found: {args.memory_id}")
+    return emit(filtered)
+
+
+def cmd_metric_record(args: argparse.Namespace) -> int:
+    root = project_root(args)
+    if root is None:
+        fail("MEMORY_EVIDENCE_REJECTED: --repository-root is required for work-unit metrics")
+    identity = metric_project_identity(args, root)
+    request_id = check_request_id(args.request_id, "--request-id", required=True)
+    if args.authority != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may record work-unit metrics")
+    raw_work_unit_id = metric_text(args.work_unit_id, "--work-unit-id", maximum=256)
+    assert isinstance(raw_work_unit_id, str)
+    work_unit_id = opaque_metric_handle(identity, "work-unit", raw_work_unit_id)
+    if args.outcome not in METRIC_OUTCOMES:
+        fail("invalid --outcome")
+    if args.corrections_used < 0:
+        fail("--corrections-used must be non-negative")
+    defect_evidence = parse_evidence(args.defect_evidence_json, "--defect-evidence-json")
+    verification = parse_metric_verification(args.verification_json, identity)
+    recovery = parse_metric_recovery(args.recovery_json)
+    tests = parse_metric_tests(args.tests_json)
+    all_evidence = defect_evidence + verification["evidence"]
+    validate_optional_accessible_evidence(all_evidence, root)
+    sanitized_defect_evidence = sanitize_installation_evidence(defect_evidence)
+    sanitized_verification = dict(verification, evidence=sanitize_installation_evidence(verification["evidence"]))
+    raw_run_id = nullable_string(args.run_id, "--run-id")
+    run_id = None if raw_run_id is None else opaque_metric_handle(identity, "run", raw_run_id)
+    tool_version = nullable_string(args.tool_version, "--tool-version")
+    model = nullable_string(args.model, "--model")
+    metric_request_id = opaque_metric_handle(identity, "metric-request", request_id)
+    with installation_lock(create=True) as paths:
+        metrics = read_metrics(paths["metrics"])
+        prior = [metric for metric in metrics if metric["provenance"]["request_id"] == metric_request_id]
+        if prior:
+            if len(prior) == 1:
+                return emit({"recorded": False, "idempotent": True, "metric": prior[0]})
+            fail("MEMORY_REQUEST_ID_REUSED: metric request ID has ambiguous history")
+        metric = {
+            "schema": METRIC_SCHEMA,
+            "metric_id": "metric_" + secrets.token_urlsafe(12),
+            "scope": INSTALLATION_SCOPE,
+            "sensitivity": "sanitized",
+            "project_identity": identity,
+            "work_unit_id": work_unit_id,
+            "outcome": args.outcome,
+            "corrections": {"used": args.corrections_used, "defect_evidence": sanitized_defect_evidence},
+            "verification": sanitized_verification,
+            "recovery": recovery,
+            "tests": tests,
+            "applicability": {"tool_version": tool_version, "model": model},
+            "provenance": {"authority": "primary", "request_id": metric_request_id, "run_id": run_id},
+            "created_at": utcnow(),
+        }
+        validate_metric(metric)
+        append_metrics(paths, [metric])
+    return emit({"recorded": True, "idempotent": False, "metric": metric})
+
+
+def cmd_metric_list(args: argparse.Namespace) -> int:
+    identity = metric_project_identity(args, project_root(args))
+    with installation_lock(create=False) as paths:
+        if not paths["root"].is_dir():
+            return emit({"backend": "local-jsonl", "project_identity": identity, "metrics": []})
+        metrics = read_metrics(paths["metrics"])
+    filtered = [metric for metric in metrics if metric["project_identity"] == identity]
+    filtered.sort(key=lambda metric: (metric["created_at"], metric["metric_id"]), reverse=True)
+    return emit({"backend": "local-jsonl", "project_identity": identity, "metrics": filtered[:args.limit]})
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = memory_home()
+    errors: list[str] = []
+    try:
+        make_directory(root)
+        test = root / ".write-test"
+        test.write_text("ok\n", encoding="utf-8")
+        test.unlink()
+    except MemoryError as exc:
+        errors.append(str(exc))
+    except OSError as exc:
+        errors.append(str(exc))
+    payload = {"ok": not errors, "backend": "local-jsonl", "memory_home": str(root), "errors": errors}
+    print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0 if not errors else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="myrmex-memory", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    project_id = sub.add_parser("project-id", help="derive a stable private identity for a repository")
+    project_id.add_argument("--repository-root", required=True)
+    project_id.set_defaults(func=cmd_project_id)
+
+    candidate = sub.add_parser("candidate", help="record an unverified project or installation-memory candidate")
+    candidate.add_argument("candidate_action", choices=["create"])
+    add_project_arguments(candidate, root_optional=True)
+    candidate.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    candidate.add_argument("--kind", required=True)
+    candidate.add_argument("--claim", required=True)
+    candidate.add_argument("--confidence", required=True, type=float)
+    candidate.add_argument("--sensitivity", choices=sorted(SENSITIVITIES), default="project-private")
+    candidate.add_argument("--evidence-json")
+    candidate.add_argument("--provenance-json")
+    candidate.add_argument("--applicability-json")
+    candidate.add_argument("--freshness-json")
+    candidate.add_argument("--authority", required=True)
+    candidate.add_argument("--request-id", required=True)
+    candidate.set_defaults(func=cmd_candidate)
+
+    promote = sub.add_parser("promote", help="promote one evidence-backed candidate under primary authority")
+    promote.add_argument("memory_id")
+    add_project_arguments(promote, root_optional=False)
+    promote.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    promote.add_argument("--authority", required=True)
+    promote.add_argument("--request-id", required=True)
+    promote.add_argument("--expect-revision", type=int, required=True)
+    promote.add_argument("--evidence-json")
+    promote.set_defaults(func=cmd_promote)
+
+    installation = sub.add_parser("installation", help="promote sanitized verified project memory into installation scope")
+    installation_sub = installation.add_subparsers(dest="installation_command", required=True)
+    installation_promote = installation_sub.add_parser("promote")
+    installation_promote.add_argument("source_memory_id")
+    add_project_arguments(installation_promote, root_optional=False)
+    installation_promote.add_argument("--source-expect-revision", type=int, required=True)
+    installation_promote.add_argument("--sanitized-claim", required=True)
+    installation_promote.add_argument("--sanitization-reason", required=True)
+    installation_promote.add_argument("--kind")
+    installation_promote.add_argument("--confidence", type=float)
+    installation_promote.add_argument("--sanitized-evidence-json", required=True)
+    installation_promote.add_argument("--applicability-json", required=True)
+    installation_promote.add_argument("--freshness-json")
+    installation_promote.add_argument("--authority", required=True)
+    installation_promote.add_argument("--request-id", required=True)
+    installation_promote.set_defaults(func=cmd_installation_promote)
+
+    refute = sub.add_parser("refute", help="revoke or supersede a verified memory without deleting history")
+    refute.add_argument("memory_id")
+    add_project_arguments(refute, root_optional=False)
+    refute.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    refute.add_argument("--authority", required=True)
+    refute.add_argument("--request-id", required=True)
+    refute.add_argument("--expect-revision", type=int, required=True)
+    refute.add_argument("--resolution", choices=["revoke", "supersede"], required=True)
+    refute.add_argument("--replacement-id")
+    refute.add_argument("--replacement-expect-revision", type=int)
+    refute.add_argument("--reason", required=True)
+    refute.add_argument("--evidence-json", required=True)
+    refute.set_defaults(func=cmd_refute)
+
+    confirm = sub.add_parser("confirm", help="confirm a verified record with fresh evidence and reset retrieval age")
+    confirm.add_argument("memory_id")
+    add_project_arguments(confirm, root_optional=False)
+    confirm.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    confirm.add_argument("--authority", required=True)
+    confirm.add_argument("--request-id", required=True)
+    confirm.add_argument("--expect-revision", type=int, required=True)
+    confirm.add_argument("--reason", required=True)
+    confirm.add_argument("--usefulness", required=True)
+    confirm.add_argument("--evidence-json", required=True)
+    confirm.set_defaults(func=cmd_confirm)
+
+    search = sub.add_parser("search", help="retrieve matching memory without mutating confidence")
+    add_project_arguments(search, root_optional=True)
+    search.add_argument("--scope", choices=["auto", PROJECT_SCOPE, INSTALLATION_SCOPE], default="auto")
+    search.add_argument("--query", required=True)
+    search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--include-candidates", action="store_true")
+    search.add_argument("--tool-version")
+    search.add_argument("--model")
+    search.set_defaults(func=cmd_search)
+
+    show = sub.add_parser("show")
+    show.add_argument("memory_id")
+    add_project_arguments(show, root_optional=True)
+    show.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    show.set_defaults(func=cmd_show)
+
+    history = sub.add_parser("history")
+    history.add_argument("memory_id")
+    add_project_arguments(history, root_optional=True)
+    history.add_argument("--scope", choices=sorted(ALL_SCOPES), default=PROJECT_SCOPE)
+    history.set_defaults(func=cmd_history)
+
+    metric = sub.add_parser("metric", help="record or inspect normalized installation work-unit metrics")
+    metric_sub = metric.add_subparsers(dest="metric_command", required=True)
+    metric_record = metric_sub.add_parser("record")
+    add_project_arguments(metric_record, root_optional=False)
+    metric_record.add_argument("--work-unit-id", required=True)
+    metric_record.add_argument("--outcome", choices=sorted(METRIC_OUTCOMES), required=True)
+    metric_record.add_argument("--corrections-used", type=int, required=True)
+    metric_record.add_argument("--defect-evidence-json")
+    metric_record.add_argument("--verification-json", required=True)
+    metric_record.add_argument("--recovery-json", required=True)
+    metric_record.add_argument("--tests-json", required=True)
+    metric_record.add_argument("--run-id")
+    metric_record.add_argument("--tool-version")
+    metric_record.add_argument("--model")
+    metric_record.add_argument("--authority", required=True)
+    metric_record.add_argument("--request-id", required=True)
+    metric_record.set_defaults(func=cmd_metric_record)
+    metric_list = metric_sub.add_parser("list")
+    add_project_arguments(metric_list, root_optional=True)
+    metric_list.add_argument("--limit", type=int, default=20)
+    metric_list.set_defaults(func=cmd_metric_list)
+
+    doctor = sub.add_parser("doctor")
+    doctor.set_defaults(func=cmd_doctor)
+    return parser
+
+
+def add_project_arguments(parser: argparse.ArgumentParser, *, root_optional: bool) -> None:
+    # Supplying both is useful for promotion: the explicit stable identity locates
+    # the store while repository_root bounds and validates evidence paths.
+    parser.add_argument("--project-identity")
+    parser.add_argument("--repository-root")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "limit", 1) < 1 or getattr(args, "limit", 1) > 100:
+        parser.error("--limit must be between 1 and 100")
+    if getattr(args, "resolution", None) == "supersede" and args.replacement_expect_revision is None:
+        parser.error("--replacement-expect-revision is required for --resolution supersede")
+    try:
+        return int(args.func(args))
+    except MemoryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

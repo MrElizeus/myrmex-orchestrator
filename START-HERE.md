@@ -38,6 +38,12 @@ cd /ruta/myrmex-orchestrator-v0.1.0-alpha.1
 
 Después reinicia OpenCode y ejecuta `/myrmex-doctor`.
 
+La instalación deja `myrmex-state` y `myrmex-memory` en el directorio de
+binarios elegido. El segundo es local/offline para recuperar o promover
+conocimiento privado de proyecto respaldado por evidencia y, tras sanitización
+explícita, lecciones locales de instalación; no reemplaza el estado del run ni
+requiere Engram.
+
 ## Primeras órdenes útiles
 
 ```text

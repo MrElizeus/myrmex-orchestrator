@@ -1,0 +1,511 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:memory:v1",
+  "title": "Myrmex Memory v1",
+  "description": "Backend-independent, evidence-backed semantic memory record. Exact run state remains in myrmex-state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "memory_id",
+    "scope",
+    "status",
+    "kind",
+    "claim",
+    "confidence",
+    "sensitivity",
+    "project_identity",
+    "evidence",
+    "provenance",
+    "applicability",
+    "freshness",
+    "created_at",
+    "updated_at",
+    "supersedes",
+    "superseded_by",
+    "revoked_by",
+    "refutation",
+    "revision"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.memory/v1"
+    },
+    "memory_id": {
+      "type": "string",
+      "pattern": "^mem_[A-Za-z0-9_-]{8,128}$"
+    },
+    "scope": {
+      "enum": [
+        "project",
+        "installation"
+      ]
+    },
+    "status": {
+      "enum": [
+        "candidate",
+        "verified",
+        "revoked",
+        "superseded"
+      ]
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "claim": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "sensitivity": {
+      "enum": [
+        "project-private",
+        "sanitized",
+        "restricted"
+      ]
+    },
+    "project_identity": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "authority",
+        "request_id",
+        "run_id",
+        "work_unit_id"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "work_unit_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_ref",
+        "tool_version_range",
+        "model"
+      ],
+      "properties": {
+        "repository_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_version_range": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "basis_commit_sha",
+        "last_confirmed_at",
+        "valid_until",
+        "ttl_seconds",
+        "decay"
+      ],
+      "properties": {
+        "basis_commit_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "last_confirmed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "valid_until": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "ttl_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "decay": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(?:half-life|linear):[1-9][0-9]*$"
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "supersedes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "superseded_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "revoked_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "refutation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "authority",
+        "reason",
+        "evidence",
+        "refuted_at",
+        "resolution"
+      ],
+      "properties": {
+        "authority": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "refuted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resolution": {
+          "enum": [
+            "revoke",
+            "supersede"
+          ]
+        }
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "digest",
+        "run_id",
+        "work_unit_id",
+        "commit_sha",
+        "verifier_request_id",
+        "frontier_request_id",
+        "artifact_digest"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "work_unit_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "verifier_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "frontier_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifact_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "sanitized_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "digest",
+        "run_id",
+        "work_unit_id",
+        "commit_sha",
+        "verifier_request_id",
+        "frontier_request_id",
+        "artifact_digest"
+      ],
+      "properties": {
+        "kind": {
+          "const": "sanitized-receipt"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^sanitized/[0-9a-f]{64}$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "run_id": {
+          "const": null
+        },
+        "work_unit_id": {
+          "const": null
+        },
+        "commit_sha": {
+          "const": null
+        },
+        "verifier_request_id": {
+          "const": null
+        },
+        "frontier_request_id": {
+          "const": null
+        },
+        "artifact_digest": {
+          "const": null
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "project"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "project_identity": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "installation"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "project_identity": {
+            "const": null
+          },
+          "sensitivity": {
+            "const": "sanitized"
+          },
+          "applicability": {
+            "allOf": [
+              {
+                "properties": {
+                  "repository_ref": {
+                    "const": null
+                  }
+                }
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "tool_version_range": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/sanitized_evidence"
+            }
+          },
+          "provenance": {
+            "properties": {
+              "source": {
+                "anyOf": [
+                  {
+                    "const": "installation-primary"
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^project-memory:mem_[A-Za-z0-9_-]{8,128}$"
+                  }
+                ]
+              },
+              "run_id": {
+                "const": null
+              },
+              "work_unit_id": {
+                "const": null
+              }
+            }
+          },
+          "freshness": {
+            "properties": {
+              "basis_commit_sha": {
+                "const": null
+              }
+            }
+          },
+          "refutation": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/sanitized_evidence"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

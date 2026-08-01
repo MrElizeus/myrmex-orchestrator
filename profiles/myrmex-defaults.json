@@ -11,7 +11,8 @@
       60
     ],
     "max_plan_iterations": 6,
-    "max_worker_corrections": 2,
+    "max_corrections_per_work_unit": 2,
+    "max_total_corrections": null,
     "max_failover_chats": 1,
     "context_soft_limit_chars": 90000,
     "evidence_soft_limit_chars": 90000

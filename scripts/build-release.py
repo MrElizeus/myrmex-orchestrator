@@ -47,7 +47,7 @@ def main():
   extracted=Path(td)/"extracted"; extracted.mkdir()
   with zipfile.ZipFile(archive) as z: z.extractall(extracted)
   unpacked=extracted/name
-  for executable in [*unpacked.glob("scripts/*.sh"), *unpacked.glob("scripts/*.py"), *unpacked.glob("tests/*.sh"), unpacked/"bin/myrmex-state"]:
+  for executable in [*unpacked.glob("scripts/*.sh"), *unpacked.glob("scripts/*.py"), *unpacked.glob("tests/*.sh"), unpacked/"bin/myrmex-state", unpacked/"bin/myrmex-memory"]:
    if executable.is_file(): executable.chmod(executable.stat().st_mode | 0o111)
   if not a.skip_tests:
    env=dict(os.environ,PYTHONDONTWRITEBYTECODE="1")

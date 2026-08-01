@@ -11,6 +11,24 @@
 
 Myrmex agents deny `.env` reads and must not transmit secrets to browser models. Redact tokens, cookies, private keys, database URLs, customer data, and sensitive logs.
 
+Native memory is private local metadata, not a source archive. Its stores use
+owner-only directories/files, and promotion/refutation/confirmation reject
+environment files, repository-escaping evidence paths, malformed digests, and
+obvious secret-bearing text. Child agents return `memory_candidates`; only the
+primary may persist a candidate or change its lifecycle.
+
+Installation scope is a stricter local privacy boundary, not a sharing channel:
+it requires a sanitized claim, null project identity/repository reference, and
+tool/model applicability. Project-private material needs an explicit rewritten
+claim, sanitization reason, and fresh proof before promotion. The raw proof is
+validated only locally; installation records retain digest-derived evidence
+handles rather than project paths, run/WU IDs, commits, or verifier/frontier
+request IDs. Metrics additionally turn work-unit/run/request IDs into opaque
+per-project handles and accept only normalized recovery codes and safe test
+categories—not commands or paths. Records are never uploaded by default,
+shared across installations, used to train a model, or allowed to modify policy
+automatically.
+
 ## Repository protection
 
 - Snapshot status and base SHA before work.

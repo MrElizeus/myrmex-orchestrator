@@ -8,7 +8,8 @@ Recomendado:
 - Python 3.10+;
 - OpenCode with global configuration in `~/.config/opencode` o `OPENCODE_CONFIG_DIR`;
 - Node.js 18+ y `npx` para Playwright MCP;
-- Engram disponible como `engram` para memoria persistente;
+- Engram opcional para continuidad semántica adicional; la memoria nativa de
+  proyecto e instalación funciona offline;
 - perfil Chrome/Chromium ya autenticado en el servicio frontier.
 
 Ejecuta:
@@ -25,7 +26,9 @@ Los warnings por capacidades opcionales no siempre son fatales. Config JSON inv�
 ./scripts/run-tests.sh
 ```
 
-La suite incluye `check-package.py` y valida agentes, skills, comandos, JSON, helper JavaScript, scripts y una prueba funcional temporal de `myrmex-state`.
+La suite incluye `check-package.py` y valida agentes, skills, comandos, JSON,
+helper JavaScript, scripts y pruebas funcionales temporales de `myrmex-state` y
+`myrmex-memory` (incluidas lecciones de instalación y métricas por WU).
 
 ## 3. Instalación segura
 
@@ -39,7 +42,9 @@ El instalador crea un backup bajo:
 ~/.config/opencode/backups/myrmex-orchestrator/<timestamp>/
 ```
 
-Instala agentes, skills, comandos, docs/contratos y `~/.local/bin/myrmex-state`. Los MCP ya existentes no se reemplazan. Si faltan, crea entradas para Engram y Playwright.
+Instala agentes, skills, comandos, docs/contratos y los ejecutables
+`~/.local/bin/myrmex-state` y `~/.local/bin/myrmex-memory`. Los MCP ya
+existentes no se reemplazan. Si faltan, crea entradas para Engram y Playwright.
 
 No cambia `default_agent` por defecto.
 
@@ -141,7 +146,22 @@ myrmex-state list
 myrmex-state show <run-id>
 ```
 
-Engram conserva conocimiento duradero, no cada heartbeat. Si Engram falla pero `myrmex-state` está sano, el flujo puede continuar con memoria semántica degradada cuando sea seguro.
+Memoria de proyecto nativa y offline:
+
+```bash
+myrmex-memory doctor
+myrmex-memory search --repository-root <repo> --query "arquitectura relevante"
+```
+
+Solo el primary promueve candidatos con evidencia local verificable. Puede
+promover una lección de proyecto a la instalación únicamente tras reescribirla
+como claim sanitizado, declarar qué se eliminó y aportar una evidencia nueva;
+la instalación conserva solo handles de digest y aplicabilidad de
+herramienta/modelo. TTL/decay baja prioridad, no borra ni refuerza por lectura;
+las métricas normalizadas por WU no sustituyen `myrmex-state`. Engram conserva
+continuidad semántica adicional, no cada heartbeat. Si Engram o la memoria
+nativa fallan pero `myrmex-state` está sano, el flujo puede continuar cuando
+sea seguro y debe informar `memory: degraded` sin inventar un recibo.
 
 ## 8. Rollback
 

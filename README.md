@@ -21,10 +21,13 @@ smoke test has been run.
 
 - Primary agent: myrmex-orchestrator, DIRECT by default.
 - Subagents: myrmex-scout, myrmex-worker, myrmex-verifier, and myrmex-frontier.
-- Skills: local delegation, frontier delegation, semantic memory policy, and
-  separate Git delivery gates.
+- Skills: local delegation, frontier delegation, governed project-memory policy,
+  and separate Git delivery gates.
 - myrmex-state: dependency-free atomic state for phases, locks, request/task
   IDs, digests, delegation ledger, correction budgets, and receipts.
+- myrmex-memory: offline JSONL/index project memory plus sanitized local
+  installation lessons, applicability/TTL/decay, confirmation, and separate
+  normalized work-unit metrics.
 - JSON contracts, prompts, recovery references, installer rollback, diagnostics,
   tests, CI, and reproducible release tooling.
 
@@ -39,6 +42,15 @@ must show concrete defect progress.
 
 FRONTIER is explicit. The browser transport is isolated and never edits the
 repository; myrmex-state remains authoritative for exact recovery.
+
+Native memory is local and evidence-backed. The primary alone promotes a
+candidate after validating accessible evidence; Engram remains optional.
+Project-private knowledge remains project-local unless the primary explicitly
+rewrites and sanitizes it for an installation-local lesson with tool/model
+applicability. TTL/decay lowers retrieval priority without auto-reinforcement;
+metrics stay separate from run state. Native memory never replaces run state,
+stores raw repository snapshots, shares across installations, or modifies policy
+automatically.
 
 ## Install
 
@@ -72,9 +84,10 @@ FAIL_INVALID_AGENT_STEPS.
 ## Security and delivery
 
 Environment files and secrets are denied by agent permissions. Pre-existing dirty
-paths are protected. Workers cannot delegate, write memory, commit, or push;
-verifiers cannot edit. Commit and push are separate authorizations. Force push,
-hard reset, destructive clean, and sudo are denied.
+paths are protected. Workers and verifiers cannot invoke the native memory
+CLI, delegate, write/promote memory, commit, or push; verifiers cannot edit.
+Commit and push are separate authorizations. Force push, hard reset,
+destructive clean, and sudo are denied.
 
 Git receipts are collected by scripts/collect-git-evidence.py and reconciled
 against Git by scripts/verify-receipt.py. Mismatches produce
@@ -87,7 +100,7 @@ changes require a complete size exception rather than removing tests or docs.
     skills/       Myrmex skills and frontier assets
     commands/     slash commands
     contracts/    canonical JSON schemas
-    bin/          myrmex-state
+    bin/          myrmex-state and myrmex-memory
     docs/         architecture, security, and operations
     scripts/      install, diagnostics, tests, evidence, and release builder
     profiles/     optional defaults and configuration examples

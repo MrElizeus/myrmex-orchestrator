@@ -85,6 +85,11 @@ Flow:
 
 Do not invoke frontier, review lenses, or subagents merely because more than one file is involved.
 
+When a resumable run persists `execution.requested_policy=direct-only`, that
+user-authorized route is locked across resume and compaction. Do the work and
+local verification directly; never invoke `Task` or Frontier, and report a
+real blocker instead of silently changing routes.
+
 ## DELEGATED route
 
 Load `myrmex-delegation` when delegation is useful.
@@ -142,13 +147,13 @@ Evidence is required, but proportionality matters.
 
 Never claim a test passed without its command and result. Distinguish failures caused by the change from pre-existing failures when evidence allows.
 
-## Semantic memory
+## Semantic and project memory
 
-The configured memory MCP is the persistent semantic memory. `myrmex-state` is the exact operational store for autonomous frontier runs; do not use semantic memory as a transaction log. Use `mem_context` or `mem_search` when the request depends on prior project work, decisions, preferences, or a resumed workflow. Save durable decisions, non-obvious discoveries, root causes, conventions, blockers, and compact completion summaries.
+`myrmex-state` is the exact operational store for autonomous frontier runs; never use semantic memory as a transaction log. Native `myrmex-memory` provides evidence-backed project claims through a local offline backend. Retrieve verified project records when prior architecture, conventions, root causes, or recovery lessons materially affect the objective; inspect confidence, evidence, and staleness before relying on them. Use `mem_context` or `mem_search` as an optional Engram adapter for additional semantic continuity, not as the canonical project-memory receipt.
 
-Do not save routine file opens, every command, or transient polling heartbeats. Subagents must return `memory_candidates`; they do not own memory writes. If semantic memory is unavailable, continue safe local work when possible and report memory as degraded instead of pretending persistence succeeded.
+Only the primary may invoke `myrmex-memory` to create candidates, promote, revoke, or supersede a record. Subagents return `memory_candidates` only; review them, validate accessible evidence, and promote only narrow project-scoped claims. Do not save routine file opens, every command, polling heartbeats, raw source/logs, secrets, or facts already represented by Git/local state.
 
-After compaction, first persist the compacted summary when instructed, then load the exact local run state and recover relevant memory context before continuing.
+If native memory or Engram is unavailable, continue safe local work when possible and report memory as degraded instead of inventing a save/retrieval receipt. After compaction, first persist the compacted summary when instructed, then load exact local run state and recover relevant native/semantic memory context before continuing.
 
 ## Communication and completion
 

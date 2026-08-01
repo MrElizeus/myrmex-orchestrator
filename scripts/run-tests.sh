@@ -10,24 +10,24 @@ cleanup_caches() {
 trap cleanup_caches EXIT
 cleanup_caches
 
-printf '%s\n' '[1/7] Package structure, contracts, and assets'
+printf '%s\n' '[1/9] Package structure, contracts, and assets'
 "$ROOT/scripts/check-package.py" --quick
 
-printf '%s\n' '[2/7] Shell and Python syntax'
+printf '%s\n' '[2/9] Shell and Python syntax'
 for script in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh; do bash -n "$script"; done
 python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys
 root=Path(sys.argv[1])
-for path in [*root.glob('scripts/*.py'), *root.glob('tests/*.py'), root/'bin/myrmex-state']:
+for path in [*root.glob('scripts/*.py'), *root.glob('tests/*.py'), root/'bin/myrmex-state', root/'bin/myrmex-memory']:
     compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 print('syntax compile: PASS')
 PY
 
-printf '%s\n' '[3/7] Config preservation and rollback patcher'
+printf '%s\n' '[3/9] Config preservation and rollback patcher'
 python3 "$ROOT/tests/test-config-patcher.py"
 
-printf '%s\n' '[4/7] Atomic state, schema validity, and exact frontier DOM parsing'
+printf '%s\n' '[4/9] Atomic state/project memory, schema validity, and exact frontier DOM parsing'
 python3 - "$ROOT" <<'PYSCHEMA'
 import json, sys
 from pathlib import Path
@@ -47,13 +47,14 @@ else:
     print(f'schema meta-validation: PASS ({checked} schemas)')
 PYSCHEMA
 python3 "$ROOT/tests/test-state-cli.py"
+python3 "$ROOT/tests/test-memory-cli.py"
 if command -v node >/dev/null 2>&1; then
   node "$ROOT/tests/test-frontier-dom.js"
 else
   echo 'Node unavailable: DOM runtime test skipped (package check already reports this warning).'
 fi
 
-printf '%s\n' '[5/7] Isolated installation, preservation, verification, and uninstall'
+printf '%s\n' '[5/9] Isolated installation, preservation, verification, and uninstall'
 "$ROOT/tests/test-isolated-install.sh"
 
 printf '%s\n' '[6/9] Evidence, size policy, and public identity'

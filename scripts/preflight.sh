@@ -84,6 +84,7 @@ command -v npx >/dev/null 2>&1 && say "npx" "$(command -v npx)" || { say "npx" "
 command -v engram >/dev/null 2>&1 && say "Engram" "$(command -v engram)" || { say "Engram" "missing from PATH"; warn=1; }
 
 [[ -x "$ROOT/bin/myrmex-state" ]] && say "Packaged myrmex-state" "executable" || { say "Packaged myrmex-state" "missing/not executable"; fatal=1; }
+[[ -x "$ROOT/bin/myrmex-memory" ]] && say "Packaged myrmex-memory" "executable" || { say "Packaged myrmex-memory" "missing/not executable"; fatal=1; }
 say "Target user bin" "$BIN_DIR"
 case ":$PATH:" in
   *":$BIN_DIR:"*) say "Target bin on PATH" "yes" ;;
@@ -106,7 +107,8 @@ for target in \
   "$CONFIG_DIR/agents/myrmex-verifier.md" \
   "$CONFIG_DIR/agents/myrmex-frontier.md" \
   "$CONFIG_DIR/skills/myrmex-frontier-delegation" \
-  "$BIN_DIR/myrmex-state"; do
+  "$BIN_DIR/myrmex-state" \
+  "$BIN_DIR/myrmex-memory"; do
   [[ -e "$target" ]] && say "Existing collision" "$target (will be backed up)"
 done
 

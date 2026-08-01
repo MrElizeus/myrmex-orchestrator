@@ -42,6 +42,7 @@ CONFIG_RECORD="$META_DIR/config-change.json"
 INSTALL_RECORD="$META_DIR/install-record.json"
 MYRMEX_CONFIG="$CONFIG_DIR/myrmex.json"
 STATE_BIN="$BIN_DIR/myrmex-state"
+MEMORY_BIN="$BIN_DIR/myrmex-memory"
 
 on_error() {
   local code=$?
@@ -74,6 +75,7 @@ Targets:
   $CONFIG_DIR/commands/myrmex-*.md
   $CONFIG_DIR/myrmex.json (created only if absent)
   $STATE_BIN
+  $MEMORY_BIN
   $META_DIR
 PLAN
   exit 0
@@ -102,6 +104,7 @@ for name in "${COMMANDS[@]}"; do backup_config_target "$CONFIG_DIR/commands/$nam
 backup_config_target "$META_DIR"
 backup_config_target "$CONFIG_FILE"
 backup_external_target "$STATE_BIN"
+backup_external_target "$MEMORY_BIN"
 
 for name in "${AGENTS[@]}"; do
   install -m 0644 "$ROOT/agents/$name" "$CONFIG_DIR/agents/$name"
@@ -117,6 +120,7 @@ for name in "${COMMANDS[@]}"; do
 done
 
 install -m 0755 "$ROOT/bin/myrmex-state" "$STATE_BIN"
+install -m 0755 "$ROOT/bin/myrmex-memory" "$MEMORY_BIN"
 
 MYRMEX_CONFIG_CREATED=0
 if [[ ! -e "$MYRMEX_CONFIG" ]]; then
@@ -135,10 +139,10 @@ patch_args=(apply --config "$CONFIG_FILE" --record "$CONFIG_RECORD")
 ((NO_MCP)) && patch_args+=(--no-mcp)
 python3 "$ROOT/scripts/patch-opencode-config.py" "${patch_args[@]}" >/dev/null
 
-python3 - "$ROOT" "$CONFIG_DIR" "$BACKUP_DIR" "$INSTALL_RECORD" "$NO_MCP" "$STATE_BIN" "$MYRMEX_CONFIG" "$MYRMEX_CONFIG_CREATED" <<'PY'
+python3 - "$ROOT" "$CONFIG_DIR" "$BACKUP_DIR" "$INSTALL_RECORD" "$NO_MCP" "$STATE_BIN" "$MEMORY_BIN" "$MYRMEX_CONFIG" "$MYRMEX_CONFIG_CREATED" <<'PY'
 import datetime, hashlib, json, pathlib, sys
 root=pathlib.Path(sys.argv[1]); config=pathlib.Path(sys.argv[2]); backup=pathlib.Path(sys.argv[3]); record=pathlib.Path(sys.argv[4])
-no_mcp=bool(int(sys.argv[5])); state_bin=pathlib.Path(sys.argv[6]); myrmex_config=pathlib.Path(sys.argv[7]); myrmex_config_created=bool(int(sys.argv[8]))
+no_mcp=bool(int(sys.argv[5])); state_bin=pathlib.Path(sys.argv[6]); memory_bin=pathlib.Path(sys.argv[7]); myrmex_config=pathlib.Path(sys.argv[8]); myrmex_config_created=bool(int(sys.argv[9]))
 paths=[]
 for n in ['myrmex-orchestrator.md','myrmex-worker.md','myrmex-verifier.md','myrmex-scout.md','myrmex-frontier.md']:
     paths.append(config/'agents'/n)
@@ -149,6 +153,7 @@ for n in ['myrmex-doctor.md','myrmex-frontier.md','myrmex-frontier-interactive.m
 meta=config/'myrmex-orchestrator'
 paths.extend(p for p in meta.rglob('*') if p.is_file() and p.name != 'install-record.json')
 paths.append(state_bin)
+paths.append(memory_bin)
 # Only remove myrmex.json on uninstall when this installation created it.
 if myrmex_config_created and myrmex_config.is_file():
     paths.append(myrmex_config)
@@ -162,6 +167,7 @@ data={
  'config_dir':str(config),
  'backup_dir':str(backup),
  'state_binary':str(state_bin),
+ 'memory_binary':str(memory_bin),
  'no_mcp':no_mcp,
  'files':files,
 }
@@ -173,7 +179,7 @@ PY
 PATH_WARNING=""
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) PATH_WARNING="WARNING: $BIN_DIR is not currently on PATH. Add it before using myrmex-state." ;;
+  *) PATH_WARNING="WARNING: $BIN_DIR is not currently on PATH. Add it before using myrmex-state or myrmex-memory." ;;
 esac
 
 cat <<DONE

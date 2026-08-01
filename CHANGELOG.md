@@ -4,6 +4,14 @@
 
 - Removed hard step ceilings from the continuous orchestrator and frontier transport while retaining bounded scout, worker, and verifier limits.
 - Removed legacy bridge files from the public baseline so Myrmex starts as an independent OpenCode project.
+- Added `myrmex.memory/v1` and the offline `myrmex-memory` project backend:
+  evidence-backed candidate promotion, retrieval metadata, revocation, and
+  supersession without replacing exact run state.
+- Added governed installation-local memory: explicit project sanitization,
+  tool/model applicability, TTL/decay ranking, usefulness-backed confirmation,
+  and auditable refutation/supersession. Added separate
+  `myrmex.work-unit-metric/v1` normalized outcome telemetry without
+  cross-installation sharing or state/policy mutation.
 
 ## 0.1.0-alpha.1
 

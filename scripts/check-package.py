@@ -49,6 +49,9 @@ REQUIRED_CONTRACTS = {
     "frontier-exchange-v1.schema.json",
     "frontier-exchange-result-v1.schema.json",
     "frontier-state-v1.schema.json",
+    "frontier-state-v2.schema.json",
+    "memory-v1.schema.json",
+    "work-unit-metric-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }
 REQUIRED_FRONTIER_REFS = {
@@ -186,11 +189,11 @@ def main() -> int:
     ], errors)
     require_text(agent_dir / "myrmex-worker.md", [
         "task: deny", '"mem_*": deny', '"playwright_*": deny',
-        '"git commit*": deny', '"git push*": deny', '"myrmex-git-delivery": deny',
+        '"git commit*": deny', '"git push*": deny', '"myrmex-memory*": deny', '"myrmex-git-delivery": deny',
     ], errors)
     require_text(agent_dir / "myrmex-verifier.md", [
         "edit: deny", "task: deny", '"mem_*": deny',
-        '"git commit*": deny', '"git push*": deny', '"myrmex-git-delivery": deny',
+        '"git commit*": deny', '"git push*": deny', '"myrmex-memory*": deny', '"myrmex-git-delivery": deny',
     ], errors)
     require_text(agent_dir / "myrmex-frontier.md", [
         '"*": deny', "edit: deny", "bash: deny", "task: deny",
@@ -244,6 +247,7 @@ def main() -> int:
         *list((ROOT / "contracts").glob("*.json")),
         *list((ROOT / "skills" / "myrmex-frontier-delegation" / "assets" / "schemas").glob("*.json")),
         *list((ROOT / "skills" / "myrmex-delegation" / "assets" / "schemas").glob("*.json")),
+        *list((ROOT / "skills" / "myrmex-memory" / "assets" / "schemas").glob("*.json")),
         *list((ROOT / "examples").glob("*.json")),
         *list((ROOT / "profiles").glob("*.json")),
     })
@@ -278,7 +282,9 @@ def main() -> int:
         "verification-result-v1.schema.json": [ROOT / "skills/myrmex-delegation/assets/schemas/verification-result-v1.schema.json"],
         "frontier-exchange-v1.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-exchange.schema.json"],
         "frontier-exchange-result-v1.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-exchange-result.schema.json"],
-        "frontier-state-v1.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json"],
+        "frontier-state-v2.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json"],
+        "memory-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/memory-v1.schema.json"],
+        "work-unit-metric-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/work-unit-metric-v1.schema.json"],
     }
     for canonical, copies in canonical_copies.items():
         source = ROOT / "contracts" / canonical
@@ -322,6 +328,22 @@ def main() -> int:
                     errors.append(f"myrmex-state test failed: {state_test.stderr.strip() or state_test.stdout.strip()}")
         except SyntaxError as exc:
             errors.append(f"myrmex-state syntax error: {exc}")
+
+    memory_bin = ROOT / "bin/myrmex-memory"
+    if not memory_bin.is_file():
+        errors.append("missing bin/myrmex-memory")
+    elif not os.access(memory_bin, os.X_OK):
+        errors.append("bin/myrmex-memory is not executable")
+    else:
+        try:
+            compile(memory_bin.read_text(encoding="utf-8"), str(memory_bin), "exec")
+            if not args.quick:
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+                memory_test = run([sys.executable, str(ROOT / "tests/test-memory-cli.py")], env=env)
+                if memory_test.returncode != 0:
+                    errors.append(f"myrmex-memory test failed: {memory_test.stderr.strip() or memory_test.stdout.strip()}")
+        except SyntaxError as exc:
+            errors.append(f"myrmex-memory syntax error: {exc}")
 
     for script in [*list((ROOT / "scripts").glob("*.py")), *list((ROOT / "tests").glob("*.py"))]:
         try:

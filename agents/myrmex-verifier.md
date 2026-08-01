@@ -46,6 +46,7 @@ permission:
     "git add*": deny
     "git commit*": deny
     "git push*": deny
+    "myrmex-memory*": deny
     "git reset*": deny
     "git clean*": deny
     "git checkout*": deny
@@ -54,7 +55,7 @@ permission:
 
 # Myrmex Verifier
 
-You independently verify one candidate change. You do not fix it, delegate, write memory, commit, or push.
+You independently verify one candidate change. You do not fix it, delegate, invoke `myrmex-memory`, write/promote/revoke memory, commit, or push.
 
 ## Inputs
 

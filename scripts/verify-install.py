@@ -129,12 +129,12 @@ def main() -> int:
         )
         require_text(
             agent_paths["myrmex-worker.md"],
-            ["task: deny", '"mem_*": deny', '"playwright_*": deny', '"git commit*": deny', '"git push*": deny', '"myrmex-git-delivery": deny'],
+            ["task: deny", '"mem_*": deny', '"playwright_*": deny', '"git commit*": deny', '"git push*": deny', '"myrmex-memory*": deny', '"myrmex-git-delivery": deny'],
             errors,
         )
         require_text(
             agent_paths["myrmex-verifier.md"],
-            ["edit: deny", "task: deny", '"mem_*": deny', '"git commit*": deny', '"git push*": deny', '"myrmex-git-delivery": deny'],
+            ["edit: deny", "task: deny", '"mem_*": deny', '"git commit*": deny', '"git push*": deny', '"myrmex-memory*": deny', '"myrmex-git-delivery": deny'],
             errors,
         )
         require_text(
@@ -213,6 +213,28 @@ def main() -> int:
         except Exception as exc:
             errors.append(f"myrmex-state doctor error: {exc}")
 
+    memory_bin = bin_dir / "myrmex-memory"
+    if not memory_bin.is_file():
+        errors.append(f"missing {memory_bin}")
+    elif not os.access(memory_bin, os.X_OK):
+        errors.append(f"memory CLI is not executable: {memory_bin}")
+    else:
+        try:
+            with tempfile.TemporaryDirectory(prefix="myrmex-memory-doctor-") as td:
+                env = os.environ.copy()
+                env["MYRMEX_MEMORY_HOME"] = td
+                proc = subprocess.run([str(memory_bin), "doctor"], capture_output=True, text=True, timeout=20, env=env)
+            if proc.returncode != 0:
+                errors.append(f"myrmex-memory doctor failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            else:
+                payload = json.loads(proc.stdout)
+                if not payload.get("ok"):
+                    errors.append("myrmex-memory doctor returned ok=false")
+                else:
+                    checks.append(f"myrmex-memory:{memory_bin}")
+        except Exception as exc:
+            errors.append(f"myrmex-memory doctor error: {exc}")
+
     resolution_script = Path(__file__).with_name("inspect-agent-resolution.py")
     if resolution_script.is_file():
         try:
@@ -236,7 +258,7 @@ def main() -> int:
 
     path_entries = [Path(item).expanduser().resolve() for item in os.environ.get("PATH", "").split(os.pathsep) if item]
     if bin_dir not in path_entries:
-        warnings.append(f"{bin_dir} is not on PATH; add it before invoking myrmex-state by name")
+        warnings.append(f"{bin_dir} is not on PATH; add it before invoking myrmex-state or myrmex-memory by name")
 
     myrmex_config = config_dir / "myrmex.json"
     if myrmex_config.is_file():
