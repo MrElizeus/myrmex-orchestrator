@@ -21,6 +21,15 @@
     "default_commit_policy": "ask",
     "default_push_policy": "deny"
   },
+  "delivery": {
+    "tracking_issue": {
+      "required": true,
+      "reuse_matching_approved": true,
+      "create_when_missing": true,
+      "approval_marker": "status:approved",
+      "ask_on_ambiguous_match": true
+    }
+  },
   "memory": {
     "engram_required": false
   },
