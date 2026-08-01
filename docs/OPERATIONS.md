@@ -54,7 +54,7 @@ myrmex-state operation <run-id> observe --operation-id op-... --effect-json '{..
 myrmex-state operation <run-id> receipt --operation-id op-... --receipt-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> confirm --operation-id op-... --status confirmed --reason "receipt verified" --expect-revision <n>
 myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{...}' --expect-revision <n>
-myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --reason "fix verifier findings" --source-request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
+myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
 myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
 

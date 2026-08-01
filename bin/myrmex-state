@@ -1418,10 +1418,204 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
     data["delegation_ledger"].append(entry)
     data["attempts"][args.role + "s"] = entry["attempt"]
     data["active_work_unit_id"] = work_unit["work_unit_id"]
+    data["worker_task_id"] = args.task_id
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "delegation.preflight_recorded", None, {
         "operation_id": operation["operation_id"], "task_id": args.task_id,
         "work_unit_id": work_unit_id, "workspace": workspace, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def find_delegation_entry(data: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+    """Return the durable delegation row for one task, if present."""
+    for entry in reversed(data.get("delegation_ledger", [])):
+        if isinstance(entry, dict) and entry.get("task_id") == task_id:
+            return entry
+    return None
+
+
+def delegation_result_identity(
+    args: argparse.Namespace, workspace: str, work_unit_id: str,
+) -> dict[str, str]:
+    if not isinstance(args.task_id, str) or not args.task_id.strip():
+        raise SystemExit("terminal delegation results require a non-empty --task-id")
+    return {
+        "task_id": args.task_id,
+        "work_unit_id": work_unit_id,
+        "workspace": workspace,
+        "agent": args.agent,
+        "role": args.role,
+    }
+
+
+def validate_delegation_result_identity(
+    operation: dict[str, Any], entry: dict[str, Any] | None, identity: dict[str, str],
+) -> None:
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        raise SystemExit("DELEGATION_RESULT_IDENTITY_CONFLICT")
+    for key, value in identity.items():
+        if intent.get(key) != value:
+            raise SystemExit("DELEGATION_RESULT_IDENTITY_CONFLICT")
+    if entry is None or entry.get("operation_id") != operation.get("operation_id"):
+        raise SystemExit("DELEGATION_RESULT_IDENTITY_CONFLICT")
+    for key, value in identity.items():
+        if entry.get(key) != value:
+            raise SystemExit("DELEGATION_RESULT_IDENTITY_CONFLICT")
+
+
+def parse_delegation_evidence(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return sanitize_evidence(json.loads(value))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid --evidence-json: {exc}") from exc
+
+
+def cmd_correction_preflight(args: argparse.Namespace) -> int:
+    """Persist one correction charge and its Task launch identity atomically."""
+    data = read_state(args.run_id)
+    require_v2(data, "correction start")
+    ensure_v2_defaults(data)
+    require_active_run(data, "correction start")
+    ensure_route_allows(data, "delegation")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    workspace = accessible_workspace(args.workspace)
+    if not isinstance(args.task_id, str) or not args.task_id.strip():
+        raise SystemExit("--task-id must be a non-empty string")
+    if not isinstance(args.source_request_id, str) or not args.source_request_id:
+        raise SystemExit("--source-request-id is required for corrections")
+    scope_digest = require_scope_digest(args.scope_digest)
+    source_candidate_sha = require_candidate_sha(args.source_candidate_sha)
+    base_intent = {
+        "task_id": args.task_id,
+        "work_unit_id": work_unit_id,
+        "workspace": workspace,
+        "agent": args.agent,
+        "role": "writer",
+        "reason": args.reason,
+    }
+
+    # An exact retry of a correction preflight is read-only.  Check this before
+    # looking at budgets so a replay cannot spend or block the correction again.
+    existing = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
+    if existing is not None:
+        intent = existing.get("intent")
+        expected = {
+            **base_intent,
+            "correction": {
+                "work_unit_id": work_unit_id,
+                "source_request_id": args.source_request_id,
+                "scope_digest": scope_digest,
+                "source_candidate_sha": source_candidate_sha,
+            },
+        }
+        if intent != expected:
+            raise SystemExit("OPERATION_IDEMPOTENCY_CONFLICT")
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    for entry in data.get("delegation_ledger", []):
+        if isinstance(entry, dict) and entry.get("task_id") == args.task_id:
+            raise SystemExit("BLOCKED_DELEGATION_TASK_ALREADY_ACTIVE")
+
+    work_unit = get_or_create_work_unit(data, work_unit_id)
+    remediation = data["remediation"]
+    total = remediation["total_corrections_used"]
+    max_total = remediation["max_total_corrections"]
+    if max_total is not None and total >= max_total:
+        block_correction(
+            data, scope="run", work_unit_id=None, code="BLOCKED_TOTAL_CORRECTION_BUDGET",
+            used=total, limit=max_total, reason="run-global correction cost ceiling exhausted",
+        )
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "correction.blocked", "run-global correction budget exhausted", data["remediation"]["blocked"])
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 1
+
+    grant: dict[str, Any] | None = None
+    if work_unit["corrections_used"] >= work_unit["base_correction_limit"]:
+        grant = matching_correction_grant(data, work_unit_id, scope_digest, source_candidate_sha)
+        if grant is None:
+            block_correction(
+                data, scope="work_unit", work_unit_id=work_unit_id, code="BLOCKED_CORRECTION_BUDGET",
+                used=work_unit["corrections_used"], limit=work_unit["base_correction_limit"],
+                reason="work-unit correction budget exhausted for the supplied scope and candidate",
+                source_request_id=args.source_request_id, scope_digest=scope_digest,
+                source_candidate_sha=source_candidate_sha,
+            )
+            saved = write_state(data, args.expect_revision)
+            append_event(args.run_id, "correction.blocked", "work-unit correction budget exhausted", data["remediation"]["blocked"])
+            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+            return 1
+
+    correction = {
+        "work_unit_id": work_unit_id,
+        "work_unit_attempt": work_unit["corrections_used"] + 1,
+        "source_request_id": args.source_request_id,
+        "scope_digest": scope_digest,
+        "source_candidate_sha": source_candidate_sha,
+        "grant_id": grant["grant_id"] if grant is not None else None,
+    }
+    intent = {**base_intent, "correction": {
+        "work_unit_id": work_unit_id,
+        "source_request_id": args.source_request_id,
+        "scope_digest": scope_digest,
+        "source_candidate_sha": source_candidate_sha,
+    }}
+    operation, created = record_operation_intent(
+        data, kind="delegation", idempotency_key=f"task:{args.task_id}", intent=intent,
+    )
+    if not created:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    for pending in nonterminal_operations(data, "delegation"):
+        pending_intent = pending.get("intent")
+        if (
+            pending.get("operation_id") != operation.get("operation_id")
+            and isinstance(pending_intent, dict)
+            and pending_intent.get("role") == "writer"
+            and pending_intent.get("work_unit_id") == work_unit_id
+        ):
+            raise SystemExit("BLOCKED_CONCURRENT_WRITER_WORK_UNIT")
+    for entry in data.get("delegation_ledger", []):
+        if (
+            isinstance(entry, dict)
+            and entry.get("status") == "started"
+            and entry.get("role") == "writer"
+            and entry.get("work_unit_id") == work_unit_id
+        ):
+            raise SystemExit("BLOCKED_CONCURRENT_WRITER_WORK_UNIT")
+
+    attempt = data["attempts"]["writers"] + 1
+    entry = {
+        "agent": args.agent, "role": "writer", "reason": args.reason,
+        "task_id": args.task_id, "work_unit_id": work_unit_id, "workspace": workspace,
+        "attempt": attempt, "started_at": args.started_at or utcnow(),
+        "completed_at": None, "status": "started", "outcome": "STARTED",
+        "operation_id": operation["operation_id"], "correction": correction,
+    }
+    data["delegation_ledger"].append(entry)
+    data["attempts"]["writers"] = attempt
+    work_unit["corrections_used"] += 1
+    work_unit["status"] = "remediating"
+    data["active_work_unit_id"] = work_unit_id
+    data["worker_task_id"] = args.task_id
+    data["remediation"]["total_corrections_used"] += 1
+    data["attempts"]["corrections"] += 1
+    if grant is not None:
+        grant["consumed_attempts"] += 1
+        if grant["consumed_attempts"] == grant["granted_attempts"]:
+            grant["status"] = "consumed"
+            grant["closed_at"] = utcnow()
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "correction.preflight_recorded", None, {
+        "operation_id": operation["operation_id"], "task_id": args.task_id,
+        "work_unit_id": work_unit_id, "workspace": workspace,
+        "attempt": attempt, "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
@@ -1578,138 +1772,77 @@ def block_correction(
         data["work_units"][work_unit_id]["status"] = "blocked"
 
 
-def cmd_delegation(args: argparse.Namespace) -> int:
+def cmd_delegation_terminal(args: argparse.Namespace) -> int:
+    """Resolve exactly one persisted preflight without charging a second attempt."""
     data = read_state(args.run_id)
     require_v2(data, "delegation")
-    require_active_run(data, "delegation")
-    if args.status == "started" or args.correction:
-        ensure_route_allows(data, "delegation")
-    if args.status == "started" and (not isinstance(args.task_id, str) or not args.task_id.strip()):
-        raise SystemExit("delegation --status started requires a non-empty --task-id")
-    role = args.role
-    if role not in {"scout", "writer", "verifier"}:
+    if args.role not in {"scout", "writer", "verifier"}:
         raise SystemExit("invalid delegation role")
-    if args.correction and role != "writer":
-        raise SystemExit("corrections can only target the writer")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    workspace = accessible_workspace(args.workspace)
+    identity = delegation_result_identity(args, workspace, work_unit_id)
+    operation = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
+    if operation is None:
+        require_active_run(data, "delegation")
+        raise SystemExit("DELEGATION_RESULT_REQUIRES_PREFLIGHT")
+    entry = find_delegation_entry(data, args.task_id)
+    validate_delegation_result_identity(operation, entry, identity)
+    assert entry is not None
 
-    correction: dict[str, Any] | None = None
-    work_unit: dict[str, Any] | None = None
-    grant: dict[str, Any] | None = None
-    if args.correction:
-        if args.expect_revision is None:
-            raise SystemExit("--expect-revision is required for corrections")
-        if data["status"] != "active":
-            raise SystemExit("correction requires an active run; use correction authorize for an exhausted work-unit budget")
-        work_unit_id = require_work_unit_id(args.work_unit_id)
-        if not isinstance(args.source_request_id, str) or not args.source_request_id:
-            raise SystemExit("--source-request-id is required for corrections")
-        scope_digest = require_scope_digest(args.scope_digest)
-        source_candidate_sha = require_candidate_sha(args.source_candidate_sha)
-        work_unit = get_or_create_work_unit(data, work_unit_id)
-        remediation = data["remediation"]
-        total = remediation["total_corrections_used"]
-        max_total = remediation["max_total_corrections"]
-        if max_total is not None and total >= max_total:
-            block_correction(
-                data, scope="run", work_unit_id=None, code="BLOCKED_TOTAL_CORRECTION_BUDGET",
-                used=total, limit=max_total, reason="run-global correction cost ceiling exhausted",
-            )
-            saved = write_state(data, args.expect_revision)
-            append_event(args.run_id, "correction.blocked", "run-global correction budget exhausted", data["remediation"]["blocked"])
-            print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
-            return 1
-        if work_unit["corrections_used"] >= work_unit["base_correction_limit"]:
-            grant = matching_correction_grant(data, work_unit_id, scope_digest, source_candidate_sha)
-            if grant is None:
-                block_correction(
-                    data, scope="work_unit", work_unit_id=work_unit_id, code="BLOCKED_CORRECTION_BUDGET",
-                    used=work_unit["corrections_used"], limit=work_unit["base_correction_limit"],
-                    reason="work-unit correction budget exhausted for the supplied scope and candidate",
-                    source_request_id=args.source_request_id, scope_digest=scope_digest,
-                    source_candidate_sha=source_candidate_sha,
-                )
-                saved = write_state(data, args.expect_revision)
-                append_event(args.run_id, "correction.blocked", "work-unit correction budget exhausted", data["remediation"]["blocked"])
-                print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
-                return 1
-        correction = {
-            "work_unit_id": work_unit_id,
-            "work_unit_attempt": work_unit["corrections_used"] + 1,
-            "source_request_id": args.source_request_id,
-            "scope_digest": scope_digest,
-            "source_candidate_sha": source_candidate_sha,
-            "grant_id": grant["grant_id"] if grant is not None else None,
-        }
-
-    attempt = data["attempts"][role + "s"] + 1
-    entry: dict[str, Any] = {
-        "agent": args.agent, "role": role, "reason": args.reason,
-        "task_id": args.task_id, "work_unit_id": args.work_unit_id,
-        "attempt": attempt, "started_at": args.started_at or utcnow(),
-        "completed_at": args.completed_at, "status": args.status,
-        "outcome": args.outcome or {"success": "SUCCESS", "failed": "FAILED", "blocked": "BLOCKED", "cancelled": "CANCELLED", "started": "STARTED"}[args.status],
+    outcome = args.outcome or {
+        "success": "SUCCESS", "failed": "FAILED", "blocked": "BLOCKED", "cancelled": "CANCELLED",
+    }[args.status]
+    evidence = parse_delegation_evidence(args.evidence_json)
+    effect = {"task_id": args.task_id, "status": args.status, "outcome": outcome}
+    receipt = {
+        "task_id": args.task_id, "status": args.status, "outcome": outcome, "evidence": evidence,
     }
-    if correction is not None:
-        entry["correction"] = correction
-    if args.evidence_json:
-        try:
-            entry["evidence"] = sanitize_evidence(json.loads(args.evidence_json))
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"invalid --evidence-json: {exc}") from exc
-    if entry["outcome"] in {"AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED"}:
+    if operation.get("status") in TERMINAL_OPERATION_STATUSES:
+        if operation.get("effect") == effect and operation.get("receipt") == receipt:
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+    if operation.get("effect") is not None and operation["effect"] != effect:
+        raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+    if operation.get("receipt") is not None and operation["receipt"] != receipt:
+        raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+    if entry.get("status") != "started":
+        raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
+
+    # Update the preflight row in place.  A second ledger row would make the
+    # task look like it started twice and would make replay accounting unsafe.
+    entry["status"] = args.status
+    entry["outcome"] = outcome
+    entry["completed_at"] = args.completed_at or utcnow()
+    if evidence is not None:
+        entry["evidence"] = evidence
+    now = utcnow()
+    operation["effect"] = effect
+    operation["receipt"] = receipt
+    operation["status"] = "confirmed" if args.status == "success" else "failed"
+    operation["terminal_reason"] = None if args.status == "success" else f"delegation task ended {args.status}"
+    operation["confirmed_at"] = now
+    operation["updated_at"] = now
+    if data.get("status") == "active" and outcome in {"AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED"}:
         data["phase"] = "blocked"
         data["status"] = "blocked"
-        data["blocker"] = entry["outcome"]
-    data["delegation_ledger"].append(entry)
-    # `delegation-preflight` persists the launch intent before Task is
-    # invoked.  When its terminal result is recorded through this established
-    # compatibility command, close the matching typed operation atomically so
-    # resume/complete do not mistake an already-returned child for live work.
-    if not args.correction and args.status in TERMINAL_TASK_STATUSES and isinstance(args.task_id, str) and args.task_id:
-        operation = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
-        if operation is not None:
-            effect = {
-                "task_id": args.task_id,
-                "status": args.status,
-                "outcome": entry["outcome"],
-            }
-            receipt = {
-                "task_id": args.task_id,
-                "status": args.status,
-                "outcome": entry["outcome"],
-                "evidence": entry.get("evidence"),
-            }
-            if operation.get("status") in TERMINAL_OPERATION_STATUSES:
-                if operation.get("effect") != effect or operation.get("receipt") != receipt:
-                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
-            else:
-                if operation.get("effect") is not None and operation["effect"] != effect:
-                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
-                if operation.get("receipt") is not None and operation["receipt"] != receipt:
-                    raise SystemExit("DELEGATION_RESULT_OPERATION_CONFLICT")
-                now = utcnow()
-                operation["effect"] = effect
-                operation["receipt"] = receipt
-                operation["status"] = "confirmed" if args.status == "success" else "failed"
-                operation["terminal_reason"] = None if args.status == "success" else f"delegation task ended {args.status}"
-                operation["confirmed_at"] = now
-                operation["updated_at"] = now
-    data["attempts"][role + "s"] = attempt
-    if correction is not None and work_unit is not None:
-        work_unit["corrections_used"] += 1
-        work_unit["status"] = "remediating"
-        data["active_work_unit_id"] = correction["work_unit_id"]
-        data["remediation"]["total_corrections_used"] += 1
-        data["attempts"]["corrections"] += 1
-        if grant is not None:
-            grant["consumed_attempts"] += 1
-            if grant["consumed_attempts"] == grant["granted_attempts"]:
-                grant["status"] = "consumed"
-                grant["closed_at"] = utcnow()
+        data["blocker"] = outcome
+    if data.get("worker_task_id") == args.task_id:
+        data["worker_task_id"] = None
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "delegation.recorded", None, entry)
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def cmd_delegation(args: argparse.Namespace) -> int:
+    if args.status == "started":
+        if args.correction:
+            return cmd_correction_preflight(args)
+        return cmd_delegation_preflight(args)
+    if args.correction and args.role != "writer":
+        raise SystemExit("corrections can only target the writer")
+    return cmd_delegation_terminal(args)
 
 
 def cmd_correction_authorize(args: argparse.Namespace) -> int:
@@ -2726,6 +2859,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegation.add_argument("--reason", required=True)
     delegation.add_argument("--task-id")
     delegation.add_argument("--work-unit-id")
+    delegation.add_argument("--workspace")
     delegation.add_argument("--started-at")
     delegation.add_argument("--completed-at")
     delegation.add_argument("--status", choices=["started", "success", "failed", "blocked", "cancelled"], default="started")
@@ -2746,6 +2880,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_correction.add_argument("--reason", required=True)
     start_correction.add_argument("--task-id", required=True)
     start_correction.add_argument("--work-unit-id", required=True)
+    start_correction.add_argument("--workspace", required=True)
     start_correction.add_argument("--started-at")
     start_correction.add_argument("--source-request-id", required=True)
     start_correction.add_argument("--scope-digest", required=True)

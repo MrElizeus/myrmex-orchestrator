@@ -20,6 +20,28 @@ def run(*args: str, env: dict[str, str], ok: bool = True) -> subprocess.Complete
     return result
 
 
+def finish_correction(
+    run_id: str, *, env: dict[str, str], revision: int, task_id: str, work_unit_id: str,
+    reason: str, request_id: str, scope_digest: str, candidate_sha: str,
+    status: str = "success", evidence_json: str | None = None,
+) -> dict:
+    run(
+        "correction", "start", run_id, "--reason", reason, "--task-id", task_id,
+        "--work-unit-id", work_unit_id, "--workspace", str(Path(env["MYRMEX_STATE_HOME"]).parent),
+        "--source-request-id", request_id, "--scope-digest", scope_digest,
+        "--source-candidate-sha", candidate_sha, "--expect-revision", str(revision), env=env,
+    )
+    terminal = [
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer", "--reason", reason,
+        "--task-id", task_id, "--work-unit-id", work_unit_id,
+        "--workspace", str(Path(env["MYRMEX_STATE_HOME"]).parent), "--status", status,
+        "--expect-revision", str(revision + 1),
+    ]
+    if evidence_json is not None:
+        terminal.extend(["--evidence-json", evidence_json])
+    return json.loads(run(*terminal, env=env).stdout)
+
+
 with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     env = dict(os.environ, MYRMEX_STATE_HOME=str(Path(td) / "state"), PYTHONDONTWRITEBYTECODE="1")
     init = run(
@@ -91,7 +113,8 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     ).stdout.strip()
     run(
         "delegation", pending, "--agent", "myrmex-worker", "--role", "writer", "--reason", "pending child",
-        "--task-id", "task-pending", "--status", "started", "--expect-revision", "0", env=env,
+        "--task-id", "task-pending", "--work-unit-id", "WU-pending", "--workspace", td,
+        "--status", "started", "--expect-revision", "0", env=env,
     )
     run(
         "route", pending, "set", "--policy", "direct-only", "--authority", "user",
@@ -122,110 +145,142 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     run("lock", run_id, "--owner", "other-owner", env=env, ok=False)
     run("lock", run_id, "--owner", "test-owner", env=env)
 
+    run(
+        "delegation-preflight", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "bounded implementation", "--task-id", "task-1", "--work-unit-id", "unit-1",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
     recorded = json.loads(run(
         "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
         "--reason", "bounded implementation", "--task-id", "task-1",
-        "--work-unit-id", "unit-1", "--status", "success", "--expect-revision", "0", env=env,
+        "--work-unit-id", "unit-1", "--workspace", td, "--status", "success", "--expect-revision", "1", env=env,
     ).stdout)
-    assert recorded["revision"] == 1
+    assert recorded["revision"] == 2
     assert recorded["attempts"]["writers"] == 1
     assert recorded["delegation_ledger"][0]["work_unit_id"] == "unit-1"
+    assert recorded["delegation_ledger"][0]["attempt"] == 1
+    replayed = json.loads(run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "retry is harmless", "--task-id", "task-1", "--work-unit-id", "unit-1",
+        "--workspace", td, "--status", "success", "--expect-revision", "99", env=env,
+    ).stdout)
+    assert replayed["revision"] == 2 and len(replayed["delegation_ledger"]) == 1
+    run(
+        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer", "--reason", "conflict",
+        "--task-id", "task-1", "--work-unit-id", "unit-1", "--workspace", td, "--status", "failed",
+        "--expect-revision", "2", env=env, ok=False,
+    )
 
     defects = json.loads(run(
         "defects", run_id, "--work-unit-id", "WU-02", "--verification-request-id", "req-verify-wu02-1",
         "--candidate-sha", "a" * 40, "--scope-digest", "a" * 64,
-        "--defects-json", '["missing assertion", "missing test"]', "--expect-revision", "1", env=env,
+        "--defects-json", '["missing assertion", "missing test"]', "--expect-revision", "2", env=env,
     ).stdout)
-    assert defects["revision"] == 2
+    assert defects["revision"] == 3
     assert defects["defect_history"][0]["remaining"] == ["missing assertion", "missing test"]
 
     progress = json.loads(run(
         "defects", run_id, "--work-unit-id", "WU-02", "--verification-request-id", "req-verify-wu02-2",
         "--candidate-sha", "b" * 40, "--scope-digest", "b" * 64,
         "--corrected-json", '["missing assertion"]', "--remaining-json", '["missing test"]', "--new-json", "[]",
-        "--expect-revision", "2", env=env,
+        "--expect-revision", "3", env=env,
     ).stdout)
-    assert progress["revision"] == 3
+    assert progress["revision"] == 4
     assert progress["no_progress_cycles"] == 0
     assert progress["defect_history"][-1]["progress"] == "reduced"
 
     run(
-        "patch", run_id, "--expect-revision", "3", "--set", "phase=collecting-context",
+        "patch", run_id, "--expect-revision", "4", "--set", "phase=collecting-context",
         env=env, ok=False,
     )
     run(
-        "patch", run_id, "--expect-revision", "3", "--set", "budgets.max_corrections_per_work_unit=99",
+        "patch", run_id, "--expect-revision", "4", "--set", "budgets.max_corrections_per_work_unit=99",
         env=env, ok=False,
     )
     transitioned = json.loads(run(
-        "transition", run_id, "--expect-revision", "3", "--to-phase", "collecting-context",
+        "transition", run_id, "--expect-revision", "4", "--to-phase", "collecting-context",
         "--reason", "context collection is the next safe step",
         env=env,
     ).stdout)
-    assert transitioned["revision"] == 4 and transitioned["phase"] == "collecting-context"
+    assert transitioned["revision"] == 5 and transitioned["phase"] == "collecting-context"
     run(
-        "transition", run_id, "--expect-revision", "3", "--to-phase", "requesting-plan",
+        "transition", run_id, "--expect-revision", "4", "--to-phase", "requesting-plan",
         "--reason", "stale revision must fail", env=env, ok=False,
     )
     run(
-        "transition", run_id, "--expect-revision", "4", "--to-phase", "pushing",
+        "transition", run_id, "--expect-revision", "5", "--to-phase", "pushing",
         "--reason", "phase skips must fail", env=env, ok=False,
     )
     # External receipts are now owned by the typed operation lifecycle; the
     # generic compatibility patch remains available only for non-critical
     # metadata and cannot bypass completion/recovery gates.
     run(
-        "patch", run_id, "--expect-revision", "4",
+        "patch", run_id, "--expect-revision", "5",
         "--json-patch", '{"receipts.github_pr":{"number":1,"url":"https://example.test/pr/1}}',
         env=env, ok=False,
     )
     metadata = json.loads(run(
-        "patch", run_id, "--expect-revision", "4",
+        "patch", run_id, "--expect-revision", "5",
         "--json-patch", '{"notes":"non-critical metadata"}',
         env=env,
     ).stdout)
-    assert metadata["revision"] == 5 and metadata["notes"] == "non-critical metadata"
+    assert metadata["revision"] == 6 and metadata["notes"] == "non-critical metadata"
 
-    # Correction capacity is scoped to a WU.  Two WU-02 corrections do not
-    # consume WU-03's first correction; only a third WU-02 attempt blocks it.
-    correction_one = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "fix verified defects", "--work-unit-id", "WU-02",
-        "--status", "success", "--correction", "--source-request-id", "req-verify-wu02-2",
-        "--scope-digest", "b" * 64, "--source-candidate-sha", "b" * 40,
-        "--expect-revision", "5", env=env,
+    # Correction capacity is scoped to a WU.  Every correction is charged by
+    # its preflight, while its terminal result only closes that same attempt.
+    correction_args = {
+        "run_id": run_id, "env": env, "task_id": "task-correction-1", "work_unit_id": "WU-02",
+        "reason": "fix verified defects", "request_id": "req-verify-wu02-2",
+        "scope_digest": "b" * 64, "candidate_sha": "b" * 40,
+    }
+    first_start = run(
+        "correction", "start", run_id, "--reason", correction_args["reason"], "--task-id", correction_args["task_id"],
+        "--work-unit-id", correction_args["work_unit_id"], "--workspace", td,
+        "--source-request-id", correction_args["request_id"], "--scope-digest", correction_args["scope_digest"],
+        "--source-candidate-sha", correction_args["candidate_sha"], "--expect-revision", "6", env=env,
+    ).stdout
+    first_start_state = json.loads(first_start)
+    replay_start = json.loads(run(
+        "correction", "start", run_id, "--reason", correction_args["reason"], "--task-id", correction_args["task_id"],
+        "--work-unit-id", correction_args["work_unit_id"], "--workspace", td,
+        "--source-request-id", correction_args["request_id"], "--scope-digest", correction_args["scope_digest"],
+        "--source-candidate-sha", correction_args["candidate_sha"], "--expect-revision", "99", env=env,
     ).stdout)
+    assert first_start_state["revision"] == replay_start["revision"] == 7
+    assert first_start_state["attempts"]["writers"] == 2
+    assert first_start_state["attempts"]["corrections"] == 1
+    assert first_start_state["pending_operations"][-1]["intent"]["correction"]["work_unit_id"] == "WU-02"
+    assert first_start_state["delegation_ledger"][-1]["operation_id"] == first_start_state["pending_operations"][-1]["operation_id"]
+    correction_one = finish_correction(**correction_args, revision=6)
     assert correction_one["work_units"]["WU-02"]["corrections_used"] == 1
-    correction_two = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "fix remaining verified defects", "--work-unit-id", "WU-02",
-        "--status", "success", "--correction", "--source-request-id", "req-verify-wu02-3",
-        "--scope-digest", "c" * 64, "--source-candidate-sha", "c" * 40,
-        "--expect-revision", "6", env=env,
-    ).stdout)
+    assert correction_one["attempts"]["writers"] == 2 and correction_one["attempts"]["corrections"] == 1
+    assert correction_one["delegation_ledger"][-1]["attempt"] == 2
+    correction_two = finish_correction(
+        run_id, env=env, revision=8, task_id="task-correction-2", work_unit_id="WU-02",
+        reason="fix remaining verified defects", request_id="req-verify-wu02-3",
+        scope_digest="c" * 64, candidate_sha="c" * 40,
+    )
     assert correction_two["attempts"]["corrections"] == 2
-    wu03_first = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "first independent WU-03 correction", "--work-unit-id", "WU-03",
-        "--status", "success", "--correction", "--source-request-id", "req-verify-wu03-1",
-        "--scope-digest", "d" * 64, "--source-candidate-sha", "d" * 40,
-        "--expect-revision", "7", env=env,
-    ).stdout)
+    wu03_first = finish_correction(
+        run_id, env=env, revision=10, task_id="task-correction-3", work_unit_id="WU-03",
+        reason="first independent WU-03 correction", request_id="req-verify-wu03-1",
+        scope_digest="d" * 64, candidate_sha="d" * 40,
+    )
     assert wu03_first["work_units"]["WU-03"]["corrections_used"] == 1
     assert wu03_first["remediation"]["total_corrections_used"] == 3
 
     blocked = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "third WU-02 correction must stop", "--work-unit-id", "WU-02",
-        "--status", "blocked", "--correction", "--source-request-id", "req-verify-wu02-4",
-        "--scope-digest", "e" * 64, "--source-candidate-sha", "e" * 40,
-        "--expect-revision", "8", env=env, ok=False,
+        "correction", "start", run_id, "--reason", "third WU-02 correction must stop",
+        "--task-id", "task-correction-4", "--work-unit-id", "WU-02", "--workspace", td,
+        "--source-request-id", "req-verify-wu02-4", "--scope-digest", "e" * 64,
+        "--source-candidate-sha", "e" * 40, "--expect-revision", "12", env=env, ok=False,
     ).stdout)
+    assert blocked["revision"] == 13
     assert blocked["status"] == "blocked" and blocked["blocker"] == "BLOCKED_CORRECTION_BUDGET"
     assert blocked["remediation"]["blocked"]["work_unit_id"] == "WU-02"
     run("patch", run_id, "--set", "status=active", env=env, ok=False)
     run(
-        "transition", run_id, "--expect-revision", "9", "--to-phase", "implementing",
+        "transition", run_id, "--expect-revision", "13", "--to-phase", "implementing",
         "--reason", "generic transitions cannot clear a correction blocker", env=env, ok=False,
     )
     # An authorization cannot clear WU-02 with WU-03 scope, but the matching
@@ -234,34 +289,33 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "correction", "authorize", run_id, "--work-unit-id", "WU-03", "--authority", "frontier",
         "--request-id", "req-frontier-wu03", "--scope-digest", "d" * 64,
         "--source-candidate-sha", "d" * 40, "--max-additional-attempts", "1",
-        "--expect-revision", "9", env=env, ok=False,
+        "--expect-revision", "13", env=env, ok=False,
     )
     run(
         "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
         "--request-id", "req-frontier-wu02", "--scope-digest", "e" * 64,
         "--source-candidate-sha", "e" * 40, "--max-additional-attempts", "1",
-        "--expect-revision", "8", env=env, ok=False,
+        "--expect-revision", "12", env=env, ok=False,
     )
     authorized = json.loads(run(
         "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
         "--request-id", "req-frontier-wu02", "--scope-digest", "e" * 64,
         "--source-candidate-sha", "e" * 40, "--max-additional-attempts", "1",
-        "--expect-revision", "9", env=env,
+        "--expect-revision", "13", env=env,
     ).stdout)
     assert authorized["status"] == "active" and authorized["remediation"]["grants"][0]["granted_attempts"] == 1
     replay = json.loads(run(
         "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
         "--request-id", "req-frontier-wu02", "--scope-digest", "e" * 64,
         "--source-candidate-sha", "e" * 40, "--max-additional-attempts", "1",
-        "--expect-revision", "10", env=env,
+        "--expect-revision", "14", env=env,
     ).stdout)
-    assert replay["revision"] == 10 and len(replay["remediation"]["grants"]) == 1
+    assert replay["revision"] == 14 and len(replay["remediation"]["grants"]) == 1
     stale_scope = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "stale candidate and changed defect scope cannot consume grant", "--work-unit-id", "WU-02",
-        "--status", "success", "--correction", "--source-request-id", "req-verify-wu02-stale",
-        "--scope-digest", "f" * 64, "--source-candidate-sha", "f" * 40,
-        "--expect-revision", "10", env=env, ok=False,
+        "correction", "start", run_id, "--reason", "stale candidate and changed defect scope cannot consume grant",
+        "--task-id", "task-correction-stale", "--work-unit-id", "WU-02", "--workspace", td,
+        "--source-request-id", "req-verify-wu02-stale", "--scope-digest", "f" * 64, "--source-candidate-sha", "f" * 40,
+        "--expect-revision", "14", env=env, ok=False,
     ).stdout)
     assert stale_scope["blocker"] == "BLOCKED_CORRECTION_BUDGET"
     assert stale_scope["remediation"]["grants"][0]["consumed_attempts"] == 0
@@ -269,24 +323,21 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
         "--request-id", "req-frontier-wu02", "--scope-digest", "e" * 64,
         "--source-candidate-sha", "e" * 40, "--max-additional-attempts", "1",
-        "--expect-revision", "11", env=env,
+        "--expect-revision", "15", env=env,
     ).stdout)
-    assert reactivated["revision"] == 12 and reactivated["status"] == "active"
-    grant_attempt = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "one authorized WU-02 correction", "--work-unit-id", "WU-02",
-        "--status", "success", "--correction", "--source-request-id", "req-verify-wu02-4",
-        "--scope-digest", "e" * 64, "--source-candidate-sha", "e" * 40,
-        "--expect-revision", "12", env=env,
-    ).stdout)
+    assert reactivated["revision"] == 16 and reactivated["status"] == "active"
+    grant_attempt = finish_correction(
+        run_id, env=env, revision=16, task_id="task-correction-5", work_unit_id="WU-02",
+        reason="one authorized WU-02 correction", request_id="req-verify-wu02-4",
+        scope_digest="e" * 64, candidate_sha="e" * 40,
+    )
     assert grant_attempt["work_units"]["WU-02"]["corrections_used"] == 3
     assert grant_attempt["remediation"]["grants"][0]["consumed_attempts"] == 1
     extra_blocked = json.loads(run(
-        "delegation", run_id, "--agent", "myrmex-worker", "--role", "writer",
-        "--reason", "grant cannot be reused", "--work-unit-id", "WU-02",
-        "--status", "blocked", "--correction", "--source-request-id", "req-verify-wu02-5",
+        "correction", "start", run_id, "--reason", "grant cannot be reused", "--task-id", "task-correction-6",
+        "--work-unit-id", "WU-02", "--workspace", td, "--source-request-id", "req-verify-wu02-5",
         "--scope-digest", "f" * 64, "--source-candidate-sha", "f" * 40,
-        "--expect-revision", "13", env=env, ok=False,
+        "--expect-revision", "18", env=env, ok=False,
     ).stdout)
     assert extra_blocked["blocker"] == "BLOCKED_CORRECTION_BUDGET"
 
@@ -331,12 +382,12 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     ).stdout.strip()
     run(
         "correction", "start", capped, "--reason", "WU one", "--task-id", "task-cap-1",
-        "--work-unit-id", "WU-01", "--source-request-id", "req-cap-1",
+        "--work-unit-id", "WU-01", "--workspace", td, "--source-request-id", "req-cap-1",
         "--scope-digest", "4" * 64, "--source-candidate-sha", "4" * 40, "--expect-revision", "0", env=env,
     )
     global_blocked = json.loads(run(
-        "delegation", capped, "--agent", "myrmex-worker", "--role", "writer", "--reason", "WU two",
-        "--work-unit-id", "WU-02", "--status", "success", "--correction", "--source-request-id", "req-cap-2",
+        "correction", "start", capped, "--reason", "WU two", "--task-id", "task-cap-2",
+        "--work-unit-id", "WU-02", "--workspace", td, "--source-request-id", "req-cap-2",
         "--scope-digest", "5" * 64, "--source-candidate-sha", "5" * 40, "--expect-revision", "1", env=env, ok=False,
     ).stdout)
     assert global_blocked["blocker"] == "BLOCKED_TOTAL_CORRECTION_BUDGET"
@@ -353,20 +404,32 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "init", "--run-id", "myrmex-provider-outcomes", "--objective", "Provider outcomes",
         "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
     ).stdout.strip()
+    run(
+        "delegation-preflight", provider, "--agent", "myrmex-scout", "--role", "scout", "--reason", "configured routing",
+        "--task-id", "credential-hidden", "--work-unit-id", "WU-provider", "--workspace", td,
+        "--expect-revision", "0", env=env,
+    )
     informational = json.loads(run(
         "delegation", provider, "--agent", "myrmex-scout", "--role", "scout", "--reason", "configured routing",
-        "--task-id", "credential-hidden", "--status", "success", "--outcome", "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR", "--expect-revision", "0", env=env,
+        "--task-id", "credential-hidden", "--work-unit-id", "WU-provider", "--workspace", td,
+        "--status", "success", "--outcome", "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR", "--expect-revision", "1", env=env,
     ).stdout)
     assert informational["status"] == "active"
+    run(
+        "delegation-preflight", provider, "--agent", "myrmex-scout", "--role", "scout", "--reason", "Task returned provider error",
+        "--task-id", "provider-error", "--work-unit-id", "WU-provider-error", "--workspace", td,
+        "--expect-revision", "2", env=env,
+    )
     failed_provider = json.loads(run(
         "delegation", provider, "--agent", "myrmex-scout", "--role", "scout", "--reason", "Task returned provider error",
-        "--task-id", "provider-error", "--status", "failed", "--outcome", "PROVIDER_INVOCATION_FAILED",
-        "--evidence-json", '{"message":"Bearer abcdefghijklmnopqrstuvwxyz","api_key":"must-not-persist"}', "--expect-revision", "1", env=env,
+        "--task-id", "provider-error", "--work-unit-id", "WU-provider-error", "--workspace", td,
+        "--status", "failed", "--outcome", "PROVIDER_INVOCATION_FAILED",
+        "--evidence-json", '{"message":"Bearer abcdefghijklmnopqrstuvwxyz","api_key":"must-not-persist"}', "--expect-revision", "3", env=env,
     ).stdout)
     evidence = failed_provider["delegation_ledger"][-1]["evidence"]
     assert evidence["api_key"] == "[REDACTED]" and "Bearer" not in evidence["message"]
     explicitly_blocked = json.loads(run(
-        "transition", provider, "--expect-revision", "2", "--to-phase", "blocked",
+        "transition", provider, "--expect-revision", "4", "--to-phase", "blocked",
         "--blocker", "HUMAN_DECISION_REQUIRED", "--reason", "an explicit human decision is required", env=env,
     ).stdout)
     assert explicitly_blocked["status"] == "blocked" and explicitly_blocked["blocker"] == "HUMAN_DECISION_REQUIRED"
@@ -375,10 +438,77 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "--mode", "autonomous", "--scope", "narrow", env=env,
     ).stdout.strip()
     blocked_agent = json.loads(run(
+        "delegation-preflight", unresolved, "--agent", "myrmex-worker", "--role", "writer", "--reason", "resolver blocked",
+        "--task-id", "unresolved-task", "--work-unit-id", "WU-unresolved", "--workspace", td, "--expect-revision", "0", env=env,
+    ).stdout)
+    blocked_agent = json.loads(run(
         "delegation", unresolved, "--agent", "myrmex-worker", "--role", "writer", "--reason", "resolver blocked",
-        "--status", "blocked", "--outcome", "AGENT_MODEL_UNRESOLVED", "--expect-revision", "0", env=env,
+        "--task-id", "unresolved-task", "--work-unit-id", "WU-unresolved", "--workspace", td,
+        "--status", "blocked", "--outcome", "AGENT_MODEL_UNRESOLVED", "--expect-revision", "1", env=env,
     ).stdout)
     assert blocked_agent["status"] == "blocked" and blocked_agent["blocker"] == "AGENT_MODEL_UNRESOLVED"
+
+    blocked_result = run(
+        "init", "--run-id", "myrmex-blocked-terminal-result", "--objective", "Blocked terminal result",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+    ).stdout.strip()
+    run(
+        "delegation-preflight", blocked_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "result arrives after blocker", "--task-id", "blocked-task", "--work-unit-id", "WU-blocked",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
+    run(
+        "transition", blocked_result, "--expect-revision", "1", "--to-phase", "blocked",
+        "--blocker", "HUMAN_DECISION_REQUIRED", "--reason", "block before child returns", env=env,
+    )
+    blocked_terminal = json.loads(run(
+        "delegation", blocked_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "child returned", "--task-id", "blocked-task", "--work-unit-id", "WU-blocked",
+        "--workspace", td, "--status", "success", "--expect-revision", "2", env=env,
+    ).stdout)
+    assert blocked_terminal["revision"] == 3 and blocked_terminal["status"] == "blocked"
+    assert blocked_terminal["pending_operations"][0]["status"] == "confirmed"
+    blocked_state_path = Path(td) / "state" / "runs" / blocked_result / "state.json"
+    blocked_events_path = blocked_state_path.parent / "events.jsonl"
+    blocked_state_before_replay = blocked_state_path.read_bytes()
+    blocked_events_before_replay = blocked_events_path.read_bytes()
+    blocked_replay = json.loads(run(
+        "delegation", blocked_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "replay after blocker", "--task-id", "blocked-task", "--work-unit-id", "WU-blocked",
+        "--workspace", td, "--status", "success", "--expect-revision", "99", env=env,
+    ).stdout)
+    assert blocked_replay["revision"] == 3
+    assert blocked_state_path.read_bytes() == blocked_state_before_replay
+    assert blocked_events_path.read_bytes() == blocked_events_before_replay
+
+    terminal_result = run(
+        "init", "--run-id", "myrmex-cancelled-terminal-result", "--objective", "Cancelled terminal result",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+    ).stdout.strip()
+    run(
+        "delegation-preflight", terminal_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "result arrives after cancellation", "--task-id", "cancelled-task", "--work-unit-id", "WU-cancelled",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
+    run("cancel", terminal_result, "--reason", "parent cancelled", "--expect-revision", "1", env=env)
+    cancelled_terminal = json.loads(run(
+        "delegation", terminal_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "child returned after cancellation", "--task-id", "cancelled-task", "--work-unit-id", "WU-cancelled",
+        "--workspace", td, "--status", "success", "--expect-revision", "2", env=env,
+    ).stdout)
+    assert cancelled_terminal["revision"] == 3 and cancelled_terminal["status"] == "cancelled"
+    terminal_state_path = Path(td) / "state" / "runs" / terminal_result / "state.json"
+    terminal_events_path = terminal_state_path.parent / "events.jsonl"
+    terminal_state_before_replay = terminal_state_path.read_bytes()
+    terminal_events_before_replay = terminal_events_path.read_bytes()
+    cancelled_replay = json.loads(run(
+        "delegation", terminal_result, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "replay after cancellation", "--task-id", "cancelled-task", "--work-unit-id", "WU-cancelled",
+        "--workspace", td, "--status", "success", "--expect-revision", "99", env=env,
+    ).stdout)
+    assert cancelled_replay["revision"] == 3
+    assert terminal_state_path.read_bytes() == terminal_state_before_replay
+    assert terminal_events_path.read_bytes() == terminal_events_before_replay
 
     # Join records every task before launch, accepts terminal results in any
     # order, consolidates once, and cannot advance the next gate twice.
@@ -508,6 +638,27 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # A Task launch persists work-unit, task, workspace, and operation identity
     # first.  A normal terminal delegation report then closes that operation so
     # recovery and complete cannot redispatch the same child.
+    no_preflight = run(
+        "init", "--run-id", "myrmex-no-preflight", "--objective", "No preflight", "--repository-root", td,
+        "--mode", "autonomous", "--scope", "narrow", env=env,
+    ).stdout.strip()
+    run(
+        "delegation", no_preflight, "--agent", "myrmex-worker", "--role", "writer", "--reason", "must reject",
+        "--task-id", "no-preflight-task", "--work-unit-id", "WU-no-preflight", "--workspace", td,
+        "--status", "success", "--expect-revision", "0", env=env, ok=False,
+    )
+    no_preflight_state = json.loads(run("show", no_preflight, env=env).stdout)
+    assert no_preflight_state["revision"] == 0 and no_preflight_state["delegation_ledger"] == []
+    missing_correction_workspace = run(
+        "init", "--run-id", "myrmex-correction-workspace", "--objective", "Correction workspace", "--repository-root", td,
+        "--mode", "autonomous", "--scope", "narrow", env=env,
+    ).stdout.strip()
+    run(
+        "correction", "start", missing_correction_workspace, "--reason", "missing workspace", "--task-id", "missing-workspace",
+        "--work-unit-id", "WU-missing-workspace", "--source-request-id", "req-missing-workspace",
+        "--scope-digest", "a" * 64, "--source-candidate-sha", "a" * 40, "--expect-revision", "0", env=env, ok=False,
+    )
+    assert json.loads(run("show", missing_correction_workspace, env=env).stdout)["revision"] == 0
     preflight_run = run(
         "init", "--run-id", "myrmex-delegation-preflight", "--objective", "Delegation preflight",
         "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
@@ -544,10 +695,11 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     run("complete", preflight_run, "--message", "must reject open work", "--expect-revision", "1", env=env, ok=False)
     task_result = json.loads(run(
         "delegation", preflight_run, "--agent", "myrmex-worker", "--role", "writer", "--reason", "Task returned",
-        "--task-id", "task-preflight-1", "--work-unit-id", "WU-preflight", "--status", "success",
+        "--task-id", "task-preflight-1", "--work-unit-id", "WU-preflight", "--workspace", td, "--status", "success",
         "--evidence-json", '{"tests":"passed"}', "--expect-revision", "1", env=env,
     ).stdout)
     assert task_result["pending_operations"][0]["status"] == "confirmed"
+    assert json.loads(run("reconcile", preflight_run, env=env).stdout)["action"] != "COLLECT_DELEGATIONS"
     closed_wu = json.loads(run(
         "work-unit", preflight_run, "complete", "--work-unit-id", "WU-preflight",
         "--evidence-json", '{"verification":"passed"}', "--expect-revision", "2", env=env,
@@ -664,7 +816,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert "patch requires an active run" in invalid_pair.stderr
 
     doctor = json.loads(run("doctor", env=env).stdout)
-    assert doctor["ok"] is True and doctor["runs"] == 18
+    assert doctor["ok"] is True and doctor["runs"] == 22
 
     schema = json.loads((ROOT / "contracts" / "frontier-state-v2.schema.json").read_text())
     missing = sorted(set(schema["required"]) - set(extra_blocked))
