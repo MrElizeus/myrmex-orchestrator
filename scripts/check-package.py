@@ -363,7 +363,7 @@ def main() -> int:
     for name in required_root:
         if not (ROOT / name).is_file():
             errors.append(f"missing root file: {name}")
-    for name in ["build-release.py", "collect-git-evidence.py", "inspect-agent-resolution.py", "validate-diff-size.py", "verify-receipt.py"]:
+    for name in ["build-release.py", "collect-git-evidence.py", "inspect-agent-resolution.py", "validate-diff-size.py", "verify-receipt.py", "myrmex-git-local.py"]:
         if not (ROOT / "scripts" / name).is_file():
             errors.append(f"missing release/control script: scripts/{name}")
     if (ROOT / ".github").exists() and not (ROOT / ".github" / "workflows" / "ci.yml").is_file():

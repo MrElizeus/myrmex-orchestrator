@@ -45,7 +45,8 @@
     "no_progress_cycles",
     "active_work_unit_id",
     "work_units",
-    "remediation"
+    "remediation",
+    "authorizations"
   ],
   "properties": {
     "schema": {
@@ -880,6 +881,51 @@
       },
       "additionalProperties": false
     },
+    "authorizations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization_id",
+          "kind",
+          "authority",
+          "request_id",
+          "repository_root",
+          "branch",
+          "expected_head",
+          "allowed_paths",
+          "scope_digest",
+          "commit_message",
+          "commit_message_digest",
+          "max_uses",
+          "consumed_uses",
+          "expires_at",
+          "status",
+          "authorized_at",
+          "consumed_at"
+        ],
+        "properties": {
+          "authorization_id": {"type": "string", "pattern": "^auth-[0-9a-f]{24}$"},
+          "kind": {"const": "local_commit"},
+          "authority": {"enum": ["user", "frontier"]},
+          "request_id": {"type": "string", "minLength": 1},
+          "repository_root": {"type": "string", "minLength": 1},
+          "branch": {"type": "string", "minLength": 1},
+          "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+          "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "commit_message": {"type": "string", "minLength": 1},
+          "commit_message_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "max_uses": {"const": 1},
+          "consumed_uses": {"type": "integer", "minimum": 0},
+          "expires_at": {"type": ["string", "null"], "format": "date-time"},
+          "status": {"enum": ["open", "consumed", "expired", "revoked"]},
+          "authorized_at": {"type": "string", "format": "date-time"},
+          "consumed_at": {"type": ["string", "null"], "format": "date-time"}
+        }
+      }
+    },
     "pending_operations": {
       "type": "array",
       "items": {
@@ -912,7 +958,8 @@
               "ci",
               "local_verification",
               "parent_gate",
-              "git_delivery"
+              "git_delivery",
+              "local_commit"
             ]
           },
           "idempotency_key": {

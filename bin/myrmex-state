@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -90,15 +91,18 @@ WORK_UNIT_STATUSES = {"active", "remediating", "complete", "blocked", "cancelled
 CORRECTION_AUTHORITIES = {"frontier", "verifier", "user"}
 OPERATION_KINDS = {
     "frontier_exchange", "delegation", "tracking_issue", "pull_request",
-    "ci", "local_verification", "parent_gate", "git_delivery",
+    "ci", "local_verification", "parent_gate", "git_delivery", "local_commit",
 }
 OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirmed", "failed", "abandoned"}
 TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
 PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+AUTHORIZATION_ID_RE = re.compile(r"auth-[0-9a-f]{24}")
 WORK_UNIT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 OPERATION_ID_RE = re.compile(r"op-[0-9a-f]{24}")
+AUTHORIZATION_AUTHORITIES = {"user", "frontier"}
+AUTHORIZATION_STATUSES = {"open", "consumed", "expired", "revoked"}
 # `patch` is retained only for non-critical metadata while the state-machine
 # commands are introduced incrementally. These prefixes are intentionally
 # checked before applying a dotted key so a caller cannot bypass a domain
@@ -218,7 +222,7 @@ def require_v2(data: dict[str, Any], command: str) -> None:
 
 def sanitize_evidence(value: Any) -> Any:
     """Keep failure evidence useful without storing credentials or bearer tokens."""
-    sensitive = re.compile(r"(?:api[_-]?key|token|secret|password|authorization|cookie)", re.I)
+    sensitive = re.compile(r"(?:api[_-]?key|token|secret|password|authorization(?!_id)|cookie)", re.I)
     token = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)", re.I)
     if isinstance(value, dict):
         return {str(key): "[REDACTED]" if sensitive.search(str(key)) else sanitize_evidence(item)
@@ -277,6 +281,152 @@ def ensure_v2_defaults(data: dict[str, Any]) -> None:
     """
     if state_is_v2(data) and "pending_operations" not in data:
         data["pending_operations"] = []
+    if state_is_v2(data) and "authorizations" not in data:
+        data["authorizations"] = []
+
+
+def parse_authorization_expiry(value: Any) -> dt.datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise SystemExit("authorization expires_at must be an ISO-8601 timestamp or null")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SystemExit("authorization expires_at must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise SystemExit("authorization expires_at must include a timezone")
+    return parsed
+
+
+def normalize_repository_path(value: str, option: str = "repository root") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{option} must be a non-empty path")
+    return str(Path(value).expanduser().resolve())
+
+
+def normalize_allowed_paths(values: list[str] | None) -> list[str]:
+    if not values:
+        raise SystemExit("local_commit authorization requires at least one allowed path")
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise SystemExit("allowed paths must be non-empty POSIX-relative paths")
+        path = Path(value)
+        if path.is_absolute() or value.endswith("/") or any(part in {"", ".", ".."} for part in path.parts):
+            raise SystemExit(f"invalid allowed path: {value!r}")
+        candidate = path.as_posix()
+        if candidate != value:
+            raise SystemExit(f"allowed path is not normalized: {value!r}")
+        if candidate == ".git" or candidate.startswith(".git/"):
+            raise SystemExit("allowed paths cannot enter .git")
+        name = path.name
+        if name == ".env" or (name.startswith(".env.") and name != ".env.example"):
+            raise SystemExit("allowed paths cannot include environment files")
+        normalized.append(candidate)
+    if len(set(normalized)) != len(normalized):
+        raise SystemExit("allowed paths must be unique")
+    return sorted(normalized)
+
+
+def authorization_scope_digest(
+    repository_root: str, branch: str, expected_head: str, allowed_paths: list[str], message: str,
+) -> str:
+    payload = {
+        "repository_root": repository_root,
+        "branch": branch,
+        "expected_head": expected_head,
+        "allowed_paths": allowed_paths,
+        "commit_message": message,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def authorization_id(authority: str, request_id: str, scope_digest: str) -> str:
+    return "auth-" + hashlib.sha256((authority + "\0" + request_id + "\0" + scope_digest).encode()).hexdigest()[:24]
+
+
+def validate_authorizations(data: dict[str, Any], *, required: bool) -> None:
+    authorizations = data.get("authorizations")
+    if authorizations is None and not required:
+        return
+    if not isinstance(authorizations, list):
+        raise SystemExit("authorizations must be an array")
+    seen: set[str] = set()
+    requests: set[tuple[str, str]] = set()
+    for authorization in authorizations:
+        if not isinstance(authorization, dict):
+            raise SystemExit("authorization must be an object")
+        authorization_id_value = authorization.get("authorization_id")
+        if not isinstance(authorization_id_value, str) or not AUTHORIZATION_ID_RE.fullmatch(authorization_id_value):
+            raise SystemExit("authorization has an invalid authorization_id")
+        if authorization_id_value in seen:
+            raise SystemExit("authorization IDs must be unique")
+        seen.add(authorization_id_value)
+        if authorization.get("kind") != "local_commit":
+            raise SystemExit("authorization kind must be local_commit")
+        if authorization.get("authority") not in AUTHORIZATION_AUTHORITIES:
+            raise SystemExit("invalid authorization authority")
+        request_id = authorization.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise SystemExit("authorization request_id is required")
+        request_identity = (authorization["kind"], request_id)
+        if request_identity in requests:
+            raise SystemExit("authorization kind/request_id must be unique")
+        requests.add(request_identity)
+        repository_root = authorization.get("repository_root")
+        if not isinstance(repository_root, str) or not Path(repository_root).is_absolute():
+            raise SystemExit("authorization repository_root must be absolute")
+        if repository_root != str(Path(repository_root).resolve()):
+            raise SystemExit("authorization repository_root must be normalized")
+        if not isinstance(authorization.get("branch"), str) or not authorization["branch"]:
+            raise SystemExit("authorization branch is required")
+        if not isinstance(authorization.get("expected_head"), str) or not GIT_SHA_RE.fullmatch(authorization["expected_head"]):
+            raise SystemExit("authorization expected_head is invalid")
+        allowed_paths = authorization.get("allowed_paths")
+        if not isinstance(allowed_paths, list) or not allowed_paths:
+            raise SystemExit("authorization allowed_paths must be a non-empty array")
+        if allowed_paths != sorted(allowed_paths) or len(set(allowed_paths)) != len(allowed_paths):
+            raise SystemExit("authorization allowed_paths must be sorted and unique")
+        normalize_allowed_paths(allowed_paths)
+        message = authorization.get("commit_message")
+        if not isinstance(message, str) or not message:
+            raise SystemExit("authorization commit_message is required")
+        message_digest = authorization.get("commit_message_digest")
+        if not isinstance(message_digest, str) or not SHA256_RE.fullmatch(message_digest):
+            raise SystemExit("authorization commit_message_digest is invalid")
+        if message_digest != hashlib.sha256(message.encode()).hexdigest():
+            raise SystemExit("authorization commit_message_digest does not match commit_message")
+        scope_digest = authorization.get("scope_digest")
+        if not isinstance(scope_digest, str) or not SHA256_RE.fullmatch(scope_digest):
+            raise SystemExit("authorization scope_digest is invalid")
+        expected_scope = authorization_scope_digest(repository_root, authorization["branch"], authorization["expected_head"], allowed_paths, message)
+        if scope_digest != expected_scope:
+            raise SystemExit("authorization scope_digest does not match authorization scope")
+        for key in ("max_uses", "consumed_uses"):
+            if not isinstance(authorization.get(key), int) or authorization[key] < 0:
+                raise SystemExit(f"authorization {key} must be non-negative")
+        if authorization["max_uses"] != 1 or authorization["consumed_uses"] > authorization["max_uses"]:
+            raise SystemExit("authorization use counts are invalid")
+        if authorization.get("status") not in AUTHORIZATION_STATUSES:
+            raise SystemExit("authorization has an invalid status")
+        if authorization["status"] == "open" and authorization["consumed_uses"] >= authorization["max_uses"]:
+            raise SystemExit("open authorization has no remaining use")
+        if authorization["status"] == "consumed" and authorization["consumed_uses"] != authorization["max_uses"]:
+            raise SystemExit("consumed authorization must have exhausted its uses")
+        parse_authorization_expiry(authorization.get("expires_at"))
+        for key in ("authorized_at",):
+            if not isinstance(authorization.get(key), str) or not authorization[key]:
+                raise SystemExit(f"authorization {key} is required")
+            parse_authorization_expiry(authorization[key])
+        consumed_at = authorization.get("consumed_at")
+        if consumed_at is not None:
+            parse_authorization_expiry(consumed_at)
+        if authorization["status"] == "open" and consumed_at is not None:
+            raise SystemExit("open authorization cannot have consumed_at")
+        if authorization["status"] in {"consumed", "expired", "revoked"} and consumed_at is None:
+            raise SystemExit("closed authorization requires consumed_at")
 
 
 def write_state(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
@@ -475,6 +625,7 @@ def validate_state(data: dict[str, Any]) -> None:
     is_v2 = state_is_v2(data)
     validate_execution(data, required=is_v2)
     validate_pending_operations(data, required=False)
+    validate_authorizations(data, required=False)
     if not isinstance(data.get("budgets"), dict):
         raise SystemExit("budgets must be an object")
 
@@ -786,6 +937,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         },
         "receipts": {},
         "pending_operations": [],
+        "authorizations": [],
         "delegation_ledger": [],
         "delegation_batches": [],
         "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
@@ -1189,6 +1341,7 @@ def cmd_operation(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
     require_v2(data, "operation")
     ensure_v2_defaults(data)
+    validate_state(data)
     action = args.operation_action
     if action == "intent":
         require_active_run(data, "operation intent")
@@ -1200,8 +1353,26 @@ def cmd_operation(args: argparse.Namespace) -> int:
             raise SystemExit("delegation intent must use delegation-preflight")
         if args.kind == "frontier_exchange":
             raise SystemExit("Frontier exchange intent must use frontier start")
+        if args.kind == "local_commit":
+            if args.authorization_id is None:
+                raise SystemExit("local_commit intent requires --authorization-id")
+            authorization = find_authorization(data, args.authorization_id)
+            expected_key = f"local-commit:{args.authorization_id}:{authorization.get('authority')}:{authorization.get('request_id')}"
+            if args.idempotency_key != expected_key:
+                raise SystemExit("LOCAL_COMMIT_OPERATION_IDENTITY_MISMATCH")
+            if data.get("commit_policy") != "authorized" or authorization.get("status") != "open":
+                raise SystemExit("local_commit intent requires an open authorized commit policy")
+            if authorization_is_expired(authorization):
+                raise SystemExit("AUTHORIZATION_EXPIRED")
         require_operation_route(data, args.kind)
         intent = parse_object_json(args.intent_json, "--intent-json")
+        if args.kind == "local_commit":
+            candidate_operation = {
+                "kind": "local_commit", "intent": intent, "idempotency_key": args.idempotency_key,
+                "operation_id": operation_id(args.kind, args.idempotency_key),
+            }
+            if not authorization_operation_matches(authorization, candidate_operation):
+                raise SystemExit("AUTHORIZATION_OPERATION_IDENTITY_MISMATCH")
         operation, created = record_operation_intent(
             data, kind=args.kind, idempotency_key=args.idempotency_key, intent=intent,
         )
@@ -1296,6 +1467,244 @@ def cmd_operation(args: argparse.Namespace) -> int:
     append_event(args.run_id, "operation.confirmed", reason, {
         "operation_id": operation["operation_id"], "kind": operation["kind"],
         "status": terminal_status, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def find_authorization(data: dict[str, Any], authorization_id_value: str) -> dict[str, Any]:
+    if not isinstance(authorization_id_value, str) or not AUTHORIZATION_ID_RE.fullmatch(authorization_id_value):
+        raise SystemExit("--authorization-id must be a valid authorization ID")
+    for authorization in data.get("authorizations", []):
+        if isinstance(authorization, dict) and authorization.get("authorization_id") == authorization_id_value:
+            return authorization
+    raise SystemExit(f"authorization not found: {authorization_id_value}")
+
+
+def authorization_is_expired(authorization: dict[str, Any]) -> bool:
+    expires_at = parse_authorization_expiry(authorization.get("expires_at"))
+    return expires_at is not None and expires_at <= dt.datetime.now(dt.timezone.utc)
+
+
+def authorization_operation_matches(authorization: dict[str, Any], operation: dict[str, Any]) -> bool:
+    intent = operation.get("intent")
+    if operation.get("kind") != "local_commit" or not isinstance(intent, dict):
+        return False
+    expected = {
+        "authorization_id": authorization["authorization_id"],
+        "authority": authorization["authority"],
+        "request_id": authorization["request_id"],
+        "repository_root": authorization["repository_root"],
+        "branch": authorization["branch"],
+        "expected_head": authorization["expected_head"],
+        "allowed_paths": authorization["allowed_paths"],
+        "scope_digest": authorization["scope_digest"],
+        "commit_message": authorization["commit_message"],
+        "commit_message_digest": authorization["commit_message_digest"],
+    }
+    expected_key = f"local-commit:{authorization['authorization_id']}:{authorization['authority']}:{authorization['request_id']}"
+    if operation.get("idempotency_key") != expected_key or operation.get("operation_id") != operation_id("local_commit", expected_key):
+        return False
+    baseline = intent.get("pre_effect")
+    baseline_keys = {"branch", "head_symbolic", "expected_head", "config_digest", "tags_digest", "remotes_digest", "refs"}
+    if not isinstance(baseline, dict) or set(baseline) != baseline_keys:
+        return False
+    if baseline.get("branch") != authorization["branch"]:
+        return False
+    if baseline.get("head_symbolic") != f"refs/heads/{authorization['branch']}" or baseline.get("expected_head") != authorization["expected_head"]:
+        return False
+    if not all(isinstance(baseline.get(key), str) and SHA256_RE.fullmatch(baseline[key]) for key in ("config_digest", "tags_digest", "remotes_digest")):
+        return False
+    refs = baseline.get("refs")
+    if not isinstance(refs, dict) or not all(
+        isinstance(name, str) and isinstance(value, list) and len(value) == 2
+        and isinstance(value[0], str) and GIT_SHA_RE.fullmatch(value[0])
+        and isinstance(value[1], str)
+        for name, value in refs.items()
+    ):
+        return False
+    return all(intent.get(key) == value for key, value in expected.items())
+
+
+def local_commit_git_output(repository_root: str, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", repository_root, *args], capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("AUTHORIZATION_COMMIT_NOT_FOUND") from exc
+    if result.returncode != 0:
+        raise SystemExit("AUTHORIZATION_COMMIT_NOT_FOUND")
+    return result.stdout
+
+
+def validate_local_commit_receipt(authorization: dict[str, Any], operation: dict[str, Any], commit_sha: str) -> None:
+    receipt = operation.get("receipt")
+    effect = operation.get("effect")
+    if not isinstance(receipt, dict) or not isinstance(effect, dict):
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    if receipt.get("status") not in {"SUCCESS", "CONFIRMED"}:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    for source in (receipt, effect):
+        if source.get("authorization_id") != authorization["authorization_id"]:
+            raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+        if source.get("authority") != authorization["authority"] or source.get("request_id") != authorization["request_id"]:
+            raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+        if source.get("commit_sha") != commit_sha:
+            raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    if receipt.get("branch") != authorization["branch"] or receipt.get("paths") != authorization["allowed_paths"]:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    if receipt.get("message") != authorization["commit_message"]:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    if (
+        effect.get("parent_sha") != authorization["expected_head"]
+        or effect.get("branch") != authorization["branch"]
+        or effect.get("paths") != authorization["allowed_paths"]
+    ):
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    if not GIT_SHA_RE.fullmatch(commit_sha):
+        raise SystemExit("AUTHORIZATION_COMMIT_NOT_FOUND")
+    branch_head = local_commit_git_output(authorization["repository_root"], "rev-parse", f"refs/heads/{authorization['branch']}").strip()
+    if branch_head != commit_sha:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    parents = local_commit_git_output(authorization["repository_root"], "show", "-s", "--format=%P", commit_sha).strip().split()
+    if parents != [authorization["expected_head"]]:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    message = local_commit_git_output(authorization["repository_root"], "show", "-s", "--format=%B", commit_sha).rstrip("\n")
+    if message != authorization["commit_message"]:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    tree_sha = local_commit_git_output(authorization["repository_root"], "show", "-s", "--format=%T", commit_sha).strip()
+    for source in (receipt, effect):
+        if source.get("tree_sha") != tree_sha:
+            raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    paths = sorted(set(local_commit_git_output(
+        authorization["repository_root"], "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit_sha,
+    ).split("\0")) - {""})
+    if paths != authorization["allowed_paths"]:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+
+
+def cmd_authorization(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "authorization")
+    ensure_v2_defaults(data)
+    validate_state(data)
+    if args.authorization_action == "create":
+        require_active_run(data, "authorization create")
+        if data.get("commit_policy") != "authorized":
+            raise SystemExit("local_commit authorization requires commit_policy=authorized")
+        repository_root = normalize_repository_path(args.repository_root)
+        if repository_root != normalize_repository_path(data["repository_root"]):
+            raise SystemExit("AUTHORIZATION_REPOSITORY_IDENTITY_MISMATCH")
+        if not isinstance(args.branch, str) or not args.branch:
+            raise SystemExit("--branch is required")
+        if data.get("branch") is not None and data["branch"] != args.branch:
+            raise SystemExit("AUTHORIZATION_BRANCH_IDENTITY_MISMATCH")
+        if args.authority not in AUTHORIZATION_AUTHORITIES:
+            raise SystemExit("--authority is required")
+        if not isinstance(args.request_id, str) or not args.request_id:
+            raise SystemExit("--request-id is required")
+        if args.max_uses != 1:
+            raise SystemExit("local_commit authorization requires --max-uses 1")
+        expected_head = require_candidate_sha(args.expected_head, "--expected-head")
+        paths = normalize_allowed_paths(args.allowed_path or [])
+        message = args.commit_message
+        if not isinstance(message, str) or not message:
+            raise SystemExit("--message is required")
+        expires_at = args.expires_at
+        parse_authorization_expiry(expires_at)
+        scope_digest = authorization_scope_digest(repository_root, args.branch, expected_head, paths, message)
+        if args.scope_digest is not None and args.scope_digest != scope_digest:
+            raise SystemExit("AUTHORIZATION_SCOPE_DIGEST_MISMATCH")
+        auth_id = authorization_id(args.authority, args.request_id, scope_digest)
+        expected = {
+            "authorization_id": auth_id,
+            "kind": "local_commit",
+            "authority": args.authority,
+            "request_id": args.request_id,
+            "repository_root": repository_root,
+            "branch": args.branch,
+            "expected_head": expected_head,
+            "allowed_paths": paths,
+            "scope_digest": scope_digest,
+            "commit_message": message,
+            "commit_message_digest": hashlib.sha256(message.encode()).hexdigest(),
+            "max_uses": args.max_uses,
+            "expires_at": expires_at,
+        }
+        existing = next(
+            (item for item in data["authorizations"]
+             if isinstance(item, dict) and item.get("kind") == "local_commit" and item.get("request_id") == args.request_id),
+            None,
+        )
+        if existing is not None:
+            if any(existing.get(key) != value for key, value in expected.items() if key != "authorization_id"):
+                raise SystemExit("AUTHORIZATION_IDEMPOTENCY_CONFLICT")
+            if existing.get("authorization_id") != auth_id:
+                raise SystemExit("AUTHORIZATION_IDEMPOTENCY_CONFLICT")
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        authorization = {
+            **expected,
+            "consumed_uses": 0,
+            "status": "open",
+            "authorized_at": utcnow(),
+            "consumed_at": None,
+        }
+        data["authorizations"].append(authorization)
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "authorization.created", "bounded local_commit authorization created", {
+            "authorization_id": auth_id, "kind": "local_commit", "authority": args.authority,
+            "request_id": args.request_id, "scope_digest": scope_digest, "revision": saved["revision"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    require_nonterminal_run(data, "authorization consume")
+    authorization = find_authorization(data, args.authorization_id)
+    if authorization.get("status") == "consumed" and authorization.get("consumed_uses", 0) >= authorization.get("max_uses", 0):
+        operation = find_operation(data, args.operation_id)
+        if (
+            authorization_operation_matches(authorization, operation)
+            and operation.get("status") == "confirmed"
+            and isinstance(operation.get("receipt"), dict)
+            and operation["receipt"].get("commit_sha") == args.commit_sha
+        ):
+            validate_local_commit_receipt(authorization, operation, args.commit_sha)
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("AUTHORIZATION_REPLAY")
+    if authorization.get("status") != "open":
+        raise SystemExit("AUTHORIZATION_NOT_CONSUMABLE")
+    if authorization_is_expired(authorization):
+        authorization["status"] = "expired"
+        authorization["consumed_at"] = utcnow()
+        saved = write_state(data, args.expect_revision)
+        append_event(args.run_id, "authorization.expired", "local_commit authorization expired", {
+            "authorization_id": authorization["authorization_id"], "revision": saved["revision"],
+        })
+        print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+        return 1
+    operation = find_operation(data, args.operation_id)
+    if not authorization_operation_matches(authorization, operation):
+        raise SystemExit("AUTHORIZATION_OPERATION_IDENTITY_MISMATCH")
+    if operation.get("status") != "confirmed":
+        raise SystemExit("authorization consume requires a confirmed local_commit operation")
+    receipt = operation.get("receipt")
+    if not isinstance(args.commit_sha, str) or not isinstance(receipt, dict) or receipt.get("commit_sha") != args.commit_sha:
+        raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+    validate_local_commit_receipt(authorization, operation, args.commit_sha)
+    if authorization["consumed_uses"] >= authorization["max_uses"]:
+        raise SystemExit("AUTHORIZATION_REPLAY")
+    authorization["consumed_uses"] += 1
+    if authorization["consumed_uses"] == authorization["max_uses"]:
+        authorization["status"] = "consumed"
+    authorization["consumed_at"] = utcnow()
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "authorization.consumed", "local_commit authorization consumed", {
+        "authorization_id": authorization["authorization_id"], "operation_id": operation["operation_id"],
+        "commit_sha": args.commit_sha, "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
@@ -2325,7 +2734,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
-REQUIRED_RECEIPT_KINDS = {"tracking_issue", "pull_request", "ci", "local_verification", "parent_gate"}
+REQUIRED_RECEIPT_KINDS = {"tracking_issue", "pull_request", "ci", "local_verification", "parent_gate", "local_commit"}
 RECEIPT_ALIASES = {
     "tracking_issue": ("tracking_issue", "github_tracking_issue", "github_issue"),
     "pull_request": ("pull_request", "github_pr", "github_pull_request"),
@@ -2339,6 +2748,7 @@ RECEIPT_SUCCESS = {
     "ci": {"SUCCESS", "PASSED", "CI_PASSED", "CONFIRMED", "COMPLETED"},
     "local_verification": {"SUCCESS", "PASSED", "VERIFIED", "CONFIRMED", "COMPLETED"},
     "parent_gate": {"SUCCESS", "PASSED", "APPROVED", "CONFIRMED", "COMPLETED", "PARENT_GATE_PASSED"},
+    "local_commit": {"SUCCESS", "CONFIRMED"},
 }
 
 
@@ -2531,6 +2941,8 @@ def operation_reconcile_action(operation: dict[str, Any]) -> tuple[str, str]:
         return "RECONCILE_TRACKING_ISSUE", f"tracking issue operation {operation_id_value} is {status}"
     if kind in {"pull_request", "git_delivery"}:
         return "RECONCILE_PULL_REQUEST", f"delivery operation {operation_id_value} is {status}"
+    if kind == "local_commit":
+        return "RECONCILE_LOCAL_COMMIT", f"local commit operation {operation_id_value} is {status}"
     if kind in {"ci", "local_verification"}:
         return "RUN_LOCAL_VERIFICATION", f"verification operation {operation_id_value} is {status}"
     if kind == "parent_gate":
@@ -2802,6 +3214,7 @@ def build_parser() -> argparse.ArgumentParser:
     operation.add_argument("operation_action", choices=["intent", "observe", "receipt", "confirm"])
     operation.add_argument("--kind", choices=sorted(OPERATION_KINDS))
     operation.add_argument("--idempotency-key")
+    operation.add_argument("--authorization-id")
     operation.add_argument("--intent-json")
     operation.add_argument("--operation-id")
     operation.add_argument("--effect-json")
@@ -2810,6 +3223,25 @@ def build_parser() -> argparse.ArgumentParser:
     operation.add_argument("--reason")
     operation.add_argument("--expect-revision", type=int, required=True)
     operation.set_defaults(func=cmd_operation)
+
+    authorization = sub.add_parser("authorization", help="create or consume bounded local operation authorization")
+    authorization.add_argument("run_id")
+    authorization.add_argument("authorization_action", choices=["create", "consume"])
+    authorization.add_argument("--authority", choices=sorted(AUTHORIZATION_AUTHORITIES))
+    authorization.add_argument("--request-id")
+    authorization.add_argument("--repository-root")
+    authorization.add_argument("--branch")
+    authorization.add_argument("--expected-head")
+    authorization.add_argument("--allowed-path", action="append")
+    authorization.add_argument("--scope-digest")
+    authorization.add_argument("--message", "--commit-message", dest="commit_message")
+    authorization.add_argument("--max-uses", type=int, default=1)
+    authorization.add_argument("--expires-at")
+    authorization.add_argument("--authorization-id")
+    authorization.add_argument("--operation-id")
+    authorization.add_argument("--commit-sha")
+    authorization.add_argument("--expect-revision", type=int, required=True)
+    authorization.set_defaults(func=cmd_authorization)
 
     frontier = sub.add_parser("frontier", help="record a Frontier exchange intent before browser transport")
     frontier.add_argument("run_id")

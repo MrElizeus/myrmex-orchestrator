@@ -41,6 +41,13 @@ automatically.
 ## Delivery
 
 OpenCode asks before commit/push by default. Force push is denied. Direct pushes to protected branches require explicit, branch-specific authorization.
+The bounded `local_commit` helper is narrower than that global gate: it requires
+a persisted single-use authorization tied to one repository, branch, expected
+HEAD, exact path set, and message, and it never includes push or remote mutation.
+Hooks, filters, editors, signing, and transport are never invoked: the helper
+uses private-index plumbing and compare-and-swap ref updates. Post-effect
+snapshots still reject branch, tag, remote, ref, HEAD, or raw configuration
+changes before consumption.
 
 ## Browser
 

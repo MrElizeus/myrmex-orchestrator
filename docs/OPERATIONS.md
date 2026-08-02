@@ -58,6 +58,39 @@ myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> 
 myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
 
+### Bounded local commit
+
+An autonomous local commit is not a global Git permission. The primary first
+creates a `local_commit` authorization while the persisted run has
+`commit_policy=authorized`; the authorization records the authority, stable
+request ID, repository/branch/expected HEAD, exact normalized paths, commit
+message digest, expiry, and a one-use budget:
+
+```bash
+myrmex-state authorization <run-id> create --authority frontier \
+  --request-id <request-id> --repository-root <repo> --branch <branch> \
+  --expected-head <sha> --allowed-path path/to/file --message "<message>" \
+  --expires-at <iso-timestamp> --expect-revision <n>
+scripts/myrmex-git-local.py commit --run-id <run-id> \
+  --authorization-id <auth-id> --repository-root <repo>
+```
+
+The helper stages only the listed paths, rejects any pre-existing index state
+(including intent-to-add), any dirty `.atl/` or `.playwright-mcp/` path, other
+protected paths, unrelated dirty paths, merge/amend/push behavior, and
+interactive commit input. It never invokes hooks, filters, editors, signing,
+or transport: a private index plus `hash-object --no-filters`, `write-tree`,
+`commit-tree`, and compare-and-swap `update-ref` are used instead. Raw branch,
+tag, remote, ref-namespace, HEAD, and configuration snapshots are checked
+before authorization consumption. The
+authorization is intentionally single-use (`max_uses=1`). It persists
+`local_commit` intent before invoking Git, then
+records observed commit, receipt, terminal confirmation, and authorization
+consumption. On retry it searches for the one matching child of the expected
+HEAD before attempting Git again; this is the crash boundary that prevents a
+duplicate commit. Direct `git commit` remains subject to the normal permission
+gate, and this authorization never permits push or remote mutation.
+
 `myrmex-state reconcile` is the mandatory first resume step: it is pure and
 returns one safe action before any external retry. Persist every external
 effect as `intent → observed effect → receipt → terminal confirmation` with
