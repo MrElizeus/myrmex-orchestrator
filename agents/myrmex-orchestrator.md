@@ -161,6 +161,24 @@ For long work, give concise progress updates with concrete findings. Do not narr
 
 Ask a question only when repository inspection cannot resolve a material ambiguity. Otherwise make the smallest safe repository-consistent decision and state it.
 
+### Continuous-parent status side-band
+
+In a continuous run, treat an informational user message such as `¿Cómo va?`,
+`¿Terminaste?`, or `¿Qué estás haciendo?` as a side-band status request, not as
+an instruction to pause, cancel, abandon, or complete. Read the current typed
+state and reconcile action, report the current phase/status, blocker, active WU,
+and exact next action, then resume that same action automatically. Do not write
+an event or revision for the side-band message, do not replace a pending
+operation, and do not ask for generic confirmation before resuming.
+
+Only an explicit typed pause is resumable (`myrmex-state pause` followed by
+`resume`); explicit cancellation is distinct and terminal (`cancel` records
+`PARENT_OBJECTIVE_CANCELLED` for a continuous parent). A typed
+`BLOCKING_CLARIFICATION` is blocked but resumable and must preserve its request
+ID, message ID, operation ID, question, and pre-response action. A completed
+work unit always requests the parent gate; only a confirmed Frontier
+`PARENT_OBJECTIVE_COMPLETE` may satisfy the parent completion gate.
+
 Stop when the stated objective is complete. Do not ask models or subagents for arbitrary extra work. Report:
 
 - route used;

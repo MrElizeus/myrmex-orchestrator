@@ -7,6 +7,7 @@ semantic-memory layer.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -97,6 +98,15 @@ OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirme
 TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
 PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
 FRONTIER_DECISIONS = {"ACCEPT", "REMEDIATE", "BLOCKED"}
+FRONTIER_RESPONSE_TYPES = {
+    "plan", "blocking_clarification", "objective_complete", "sub_objective_complete",
+    "parent_objective_complete", "already_complete", "unknown",
+}
+PARENT_GATE_TERMINAL_RESPONSE = "parent_objective_complete"
+PARENT_CANCELLATION_TYPE = "PARENT_OBJECTIVE_CANCELLED"
+RUN_CANCELLATION_TYPE = "RUN_CANCELLED"
+PAUSE_BLOCKER = "EXPLICIT_PAUSE"
+CLARIFICATION_BLOCKER = "BLOCKING_CLARIFICATION"
 FRONTIER_TRANSPORT_STATUSES = {
     "success", "transport_error", "timeout", "malformed", "request_mismatch",
     "response_identity_mismatch",
@@ -159,6 +169,14 @@ PROTECTED_PATCH_PATHS = {
     "effective_outcome",
     "delegation_ledger",
     "delegation_batches",
+    "parent_objective",
+    "scope",
+    "parent_gate",
+    "parent_gate_history",
+    "next_work_unit",
+    "clarification",
+    "pause",
+    "cancellation",
 }
 
 
@@ -305,6 +323,18 @@ def ensure_v2_defaults(data: dict[str, Any]) -> None:
         data["pending_operations"] = []
     if state_is_v2(data) and "authorizations" not in data:
         data["authorizations"] = []
+    if state_is_v2(data) and "parent_gate" not in data:
+        data["parent_gate"] = None
+    if state_is_v2(data) and "parent_gate_history" not in data:
+        data["parent_gate_history"] = []
+    if state_is_v2(data) and "next_work_unit" not in data:
+        data["next_work_unit"] = None
+    if state_is_v2(data) and "clarification" not in data:
+        data["clarification"] = None
+    if state_is_v2(data) and "pause" not in data:
+        data["pause"] = None
+    if state_is_v2(data) and "cancellation" not in data:
+        data["cancellation"] = None
 
 
 def parse_authorization_expiry(value: Any) -> dt.datetime | None:
@@ -533,6 +563,17 @@ def normalize_frontier_decision(value: Any, *, allow_none: bool = False) -> str 
     return normalized
 
 
+def normalize_frontier_response_type(value: Any, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("Frontier response_type is required")
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized not in FRONTIER_RESPONSE_TYPES:
+        raise SystemExit(f"invalid Frontier response_type: {value!r}")
+    return normalized
+
+
 def frontier_message_id(source: Any) -> str | None:
     if not isinstance(source, dict):
         return None
@@ -578,6 +619,11 @@ def validate_frontier_typed_fields(operation: dict[str, Any]) -> None:
     for field in ("frontier_decision", "effective_frontier_decision"):
         if field in operation and operation[field] is not None:
             normalize_frontier_decision(operation[field])
+    for field in ("response_type", "effective_response_type"):
+        if field in operation and operation[field] is not None:
+            normalize_frontier_response_type(operation[field])
+    if operation.get("proposed_plan") is not None and not isinstance(operation.get("proposed_plan"), dict):
+        raise SystemExit("Frontier proposed_plan must be an object")
     effective_status = operation.get("effective_status")
     if effective_status is not None and effective_status not in TERMINAL_OPERATION_STATUSES:
         raise SystemExit("Frontier effective_status must be a terminal operation status")
@@ -686,6 +732,96 @@ def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None
         validate_frontier_typed_fields(operation)
 
 
+def validate_continuity_state(data: dict[str, Any]) -> None:
+    """Validate additive continuous-parent evidence without rewriting old v2 runs."""
+    gate = data.get("parent_gate")
+    if gate is not None:
+        if not isinstance(gate, dict):
+            raise SystemExit("parent_gate must be an object or null")
+        if gate.get("status") not in {"required", "requested", "confirmed", "blocked"}:
+            raise SystemExit("parent_gate has an invalid status")
+        completed = gate.get("completed_work_unit_id")
+        if completed is not None:
+            require_work_unit_id(completed)
+        response_type = gate.get("response_type")
+        if response_type is not None:
+            normalize_frontier_response_type(response_type)
+        for key in ("operation_id", "request_id", "message_id"):
+            if gate.get(key) is not None and (not isinstance(gate[key], str) or not gate[key]):
+                raise SystemExit(f"parent_gate {key} must be a non-empty string or null")
+        for key in ("effect", "receipt"):
+            if gate.get(key) is not None and not isinstance(gate[key], dict):
+                raise SystemExit(f"parent_gate {key} must be an object or null")
+        if gate.get("status") == "confirmed" and response_type is None:
+            raise SystemExit("confirmed parent_gate requires an explicit response_type")
+        if gate.get("status") == "required" and response_type is not None:
+            raise SystemExit("required parent_gate cannot have a response_type")
+
+    history = data.get("parent_gate_history", [])
+    if not isinstance(history, list):
+        raise SystemExit("parent_gate_history must be an array")
+    for historic_gate in history:
+        if not isinstance(historic_gate, dict):
+            raise SystemExit("parent_gate_history entries must be objects")
+
+    next_work_unit = data.get("next_work_unit")
+    if next_work_unit is not None:
+        if not isinstance(next_work_unit, dict):
+            raise SystemExit("next_work_unit must be an object or null")
+        work_unit_id = next_work_unit.get("work_unit_id")
+        require_work_unit_id(work_unit_id)
+        if next_work_unit.get("status") not in {"approved", "active", "complete"}:
+            raise SystemExit("next_work_unit has an invalid status")
+        if not isinstance(next_work_unit.get("intent"), dict):
+            raise SystemExit("next_work_unit intent must be an object")
+        provenance = next_work_unit.get("provenance")
+        if not isinstance(provenance, dict):
+            raise SystemExit("next_work_unit requires Frontier provenance")
+        for key in ("operation_id", "request_id", "message_id"):
+            if not isinstance(provenance.get(key), str) or not provenance[key]:
+                raise SystemExit(f"next_work_unit provenance requires {key}")
+        if next_work_unit.get("status") in {"approved", "active"}:
+            if not isinstance(gate, dict) or gate.get("status") != "confirmed" or gate.get("response_type") != "plan":
+                raise SystemExit("approved next_work_unit requires a confirmed Frontier plan gate")
+
+    clarification = data.get("clarification")
+    if clarification is not None:
+        if not isinstance(clarification, dict):
+            raise SystemExit("clarification must be an object or null")
+        if clarification.get("status") not in {"blocked", "resumed"}:
+            raise SystemExit("clarification has an invalid status")
+        if not isinstance(clarification.get("resume_phase"), str) or clarification["resume_phase"] not in PHASES:
+            raise SystemExit("clarification requires a valid resume_phase")
+        if not isinstance(clarification.get("action"), dict):
+            raise SystemExit("clarification requires a preserved action")
+
+    pause = data.get("pause")
+    if pause is not None:
+        if not isinstance(pause, dict) or pause.get("status") not in {"paused", "resumed"}:
+            raise SystemExit("pause must be a paused or resumed object")
+        if not isinstance(pause.get("resume_phase"), str) or pause["resume_phase"] not in PHASES:
+            raise SystemExit("pause requires a valid resume_phase")
+        if not isinstance(pause.get("action"), dict):
+            raise SystemExit("pause requires a preserved action")
+
+    cancellation = data.get("cancellation")
+    if cancellation is not None:
+        if not isinstance(cancellation, dict):
+            raise SystemExit("cancellation must be an object or null")
+        if cancellation.get("type") not in {PARENT_CANCELLATION_TYPE, RUN_CANCELLATION_TYPE}:
+            raise SystemExit("cancellation has an invalid type")
+
+    if data.get("scope") == "continuous" and data.get("parent_objective"):
+        live_units = [
+            work_unit_id for work_unit_id, work_unit in data.get("work_units", {}).items()
+            if isinstance(work_unit, dict) and work_unit.get("status") in {"active", "remediating"}
+        ]
+        if len(live_units) > 1:
+            raise SystemExit("continuous parent may have at most one active work unit")
+        if live_units and data.get("active_work_unit_id") != live_units[0]:
+            raise SystemExit("active_work_unit_id must identify the only active continuous work unit")
+
+
 def validate_common_state(data: dict[str, Any]) -> None:
     required = [
         "schema", "schema_version", "run_id", "objective_id", "objective", "scope",
@@ -760,6 +896,7 @@ def validate_state(data: dict[str, Any]) -> None:
     validate_authorizations(data, required=False)
     if not isinstance(data.get("budgets"), dict):
         raise SystemExit("budgets must be an object")
+    validate_continuity_state(data)
 
     if not is_v2:
         for key in ["max_wait_seconds", "max_plan_iterations", "max_worker_corrections", "max_failover_chats"]:
@@ -1083,6 +1220,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             "grants": [],
             "blocked": None,
         },
+        "parent_gate": None,
+        "parent_gate_history": [],
+        "next_work_unit": None,
+        "clarification": None,
+        "pause": None,
+        "cancellation": None,
         "revision": -1,
         "created_at": now,
         "updated_at": now,
@@ -1392,6 +1535,53 @@ def parse_object_json(value: str | None, option: str, *, default: dict[str, Any]
     return sanitize_evidence(parsed)
 
 
+def response_type_from_sources(*sources: Any) -> str | None:
+    values: list[str] = []
+    for source in sources:
+        if isinstance(source, str):
+            values.append(normalize_frontier_response_type(source))
+            continue
+        if not isinstance(source, dict):
+            continue
+        candidate = source.get("response_type")
+        if candidate is None and isinstance(source.get("type"), str):
+            candidate = source["type"]
+        if candidate is None and isinstance(source.get("status"), str):
+            status_candidate = source["status"].strip().lower().replace("-", "_").replace(" ", "_")
+            if status_candidate in FRONTIER_RESPONSE_TYPES or status_candidate.upper() in {
+                value.upper() for value in FRONTIER_RESPONSE_TYPES
+            }:
+                candidate = status_candidate
+        if candidate is None and isinstance(source.get("proposed_plan") or source.get("plan"), dict):
+            candidate = "plan"
+        if candidate is not None:
+            values.append(normalize_frontier_response_type(candidate))  # type: ignore[arg-type]
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise SystemExit("Frontier response_type mismatch")
+    return values[0]
+
+
+def proposed_plan_from_sources(*sources: Any) -> dict[str, Any] | None:
+    plans: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        candidate = source.get("proposed_plan")
+        if candidate is None:
+            candidate = source.get("plan")
+        if candidate is not None:
+            if not isinstance(candidate, dict):
+                raise SystemExit("Frontier proposed_plan must be an object")
+            plans.append(sanitize_evidence(candidate))
+    if not plans:
+        return None
+    if any(plan != plans[0] for plan in plans[1:]):
+        raise SystemExit("Frontier proposed_plan mismatch")
+    return plans[0]
+
+
 def operation_id(kind: str, idempotency_key: str) -> str:
     return "op-" + hashlib.sha256((kind + "\0" + idempotency_key).encode()).hexdigest()[:24]
 
@@ -1589,6 +1779,9 @@ def cmd_operation(args: argparse.Namespace) -> int:
         frontier_outcome = frontier_typed_lifecycle_outcome(operation)
         if frontier_outcome is None:
             raise SystemExit("FRONTIER_TYPED_CONFIRMATION_REQUIRED")
+    typed_parent_response = parent_gate_response_type(operation) if is_parent_gate_operation(operation) else None
+    if is_parent_gate_operation(operation) and terminal_status == "confirmed" and typed_parent_response is None:
+        raise SystemExit("PARENT_GATE_RESPONSE_TYPE_REQUIRED")
     if frontier_outcome is not None:
         frontier_status, frontier_decision, frontier_errors = frontier_outcome
         if frontier_status == "success" and not frontier_errors:
@@ -1611,9 +1804,16 @@ def cmd_operation(args: argparse.Namespace) -> int:
     if terminal_status == "confirmed" and (operation.get("effect") is None or operation.get("receipt") is None):
         raise SystemExit("confirmed operation requires an observed effect and recorded receipt")
     operation["status"] = terminal_status
+    if typed_parent_response is not None:
+        operation["response_type"] = typed_parent_response
     operation["terminal_reason"] = reason
     operation["confirmed_at"] = utcnow()
     operation["updated_at"] = operation["confirmed_at"]
+    if terminal_status == "confirmed" and typed_parent_response is not None:
+        apply_parent_gate_response(
+            data, operation, response_type=typed_parent_response,
+            effect=operation["effect"], receipt=operation["receipt"],
+        )
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "operation.confirmed", reason, {
         "operation_id": operation["operation_id"], "kind": operation["kind"],
@@ -1885,7 +2085,17 @@ def cmd_frontier(args: argparse.Namespace) -> int:
         intent["scope"] = args.scope
     if args.chat_url is not None:
         intent["chat_url"] = args.chat_url
+    parent_gate = data.get("parent_gate")
+    starting_parent_gate = parent_gate_needs_request(data)
+    if starting_parent_gate:
+        intent["parent_gate"] = True
+        intent["purpose"] = "parent_gate"
+        intent["completed_work_unit_id"] = parent_gate.get("completed_work_unit_id")
     key = args.idempotency_key or f"frontier:{args.request_id}"
+    if is_continuous_parent(data) and isinstance(parent_gate, dict) and parent_gate.get("status") == "requested":
+        expected_operation_id = operation_id("frontier_exchange", key)
+        if parent_gate.get("operation_id") != expected_operation_id:
+            raise SystemExit("PARENT_GATE_ALREADY_REQUESTED")
     operation, created = record_operation_intent(
         data, kind="frontier_exchange", idempotency_key=key, intent=intent,
     )
@@ -1896,6 +2106,14 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     data["frontier_task_id"] = args.task_id
     if args.chat_url is not None:
         data["frontier_chat_url"] = args.chat_url
+    if starting_parent_gate:
+        if isinstance(parent_gate, dict) and parent_gate.get("status") == "confirmed":
+            data.setdefault("parent_gate_history", []).append(copy.deepcopy(parent_gate))
+        data["parent_gate"] = {
+            **parent_gate,
+            "status": "requested", "operation_id": operation["operation_id"],
+            "request_id": args.request_id, "message_id": args.message_id,
+        }
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "frontier.intent_recorded", None, {
         "operation_id": operation["operation_id"], "request_id": args.request_id,
@@ -1954,6 +2172,21 @@ def build_frontier_response(
     requested_status = normalize_frontier_transport_status(args.transport_status)
     requested_decision = normalize_frontier_decision(args.frontier_decision, allow_none=True)
     effect_raw, receipt_raw = frontier_response_objects(args, recovery=recovery)
+    response_type = response_type_from_sources(args.response_type, effect_raw, receipt_raw)
+    if getattr(args, "plan_json", None) is not None:
+        plan = parse_object_json(args.plan_json, "--plan-json")
+        for source in (effect_raw, receipt_raw):
+            if source.get("proposed_plan") is not None and source["proposed_plan"] != plan:
+                raise SystemExit("Frontier proposed_plan conflicts with --plan-json")
+            source["proposed_plan"] = plan
+        if response_type is None:
+            response_type = "plan"
+    if getattr(args, "clarification_json", None) is not None:
+        clarification = parse_object_json(args.clarification_json, "--clarification-json")
+        for source in (effect_raw, receipt_raw):
+            if source.get("clarification") is not None and source["clarification"] != clarification:
+                raise SystemExit("Frontier clarification conflicts with --clarification-json")
+            source["clarification"] = clarification
     request_id = args.request_id
     message_id = args.message_id or frontier_message_id(effect_raw) or frontier_message_id(receipt_raw)
     task_id = args.task_id
@@ -1986,8 +2219,11 @@ def build_frontier_response(
                 source, request_id=request_id, message_id=message_id, task_id=task_id,
                 scope=scope, transport_status=requested_status, decision=requested_decision, label=label,
             ))
-    if requested_status == "success" and (args.effect_json is None or args.receipt_json is None):
+    plan_supplied = getattr(args, "plan_json", None) is not None
+    if requested_status == "success" and ((args.effect_json is None and not plan_supplied) or (args.receipt_json is None and not plan_supplied)):
         errors.append("successful Frontier transport requires effect and receipt")
+    if response_type is not None and response_type_from_sources(effect_raw, receipt_raw) not in {None, response_type}:
+        errors.append("effect and receipt response_type mismatch")
     if requested_status == "success" and effect_raw != {} and receipt_raw != {}:
         effect_message = frontier_message_id(effect_raw)
         receipt_message = frontier_message_id(receipt_raw)
@@ -2014,12 +2250,16 @@ def build_frontier_response(
             "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
             "response": effect_raw,
         }
+        if response_type is not None:
+            effect["response_type"] = response_type
         receipt = {
             "transport_status": status, "frontier_decision": None,
             "request_id": request_id, "message_id": message_id,
             "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
             "response": receipt_raw,
         }
+        if response_type is not None:
+            receipt["response_type"] = response_type
     else:
         def complete(source: dict[str, Any]) -> dict[str, Any]:
             result = dict(source)
@@ -2027,6 +2267,8 @@ def build_frontier_response(
                 "transport_status": status, "frontier_decision": decision,
                 "request_id": request_id, "message_id": message_id,
             })
+            if response_type is not None:
+                result["response_type"] = response_type
             if task_id is not None:
                 result["task_id"] = task_id
             if scope is not None:
@@ -2118,6 +2360,203 @@ def frontier_typed_lifecycle_outcome(operation: dict[str, Any]) -> tuple[str, st
     return status, decision if status == "success" and not errors else None, errors
 
 
+def is_continuous_parent(data: dict[str, Any]) -> bool:
+    return data.get("scope") == "continuous" and bool(data.get("parent_objective"))
+
+
+def parent_gate_needs_request(data: dict[str, Any]) -> bool:
+    if not is_continuous_parent(data):
+        return False
+    gate = data.get("parent_gate")
+    if not isinstance(gate, dict):
+        return False
+    if gate.get("status") in {"required", "blocked"}:
+        return True
+    return (
+        gate.get("status") == "confirmed"
+        and gate.get("response_type") != PARENT_GATE_TERMINAL_RESPONSE
+        and not isinstance(data.get("next_work_unit"), dict)
+    )
+
+
+def is_parent_gate_operation(operation: dict[str, Any]) -> bool:
+    intent = operation.get("intent")
+    return (
+        operation.get("kind") == "parent_gate"
+        or (isinstance(intent, dict) and (intent.get("parent_gate") is True or intent.get("purpose") == "parent_gate"))
+    )
+
+
+def parent_gate_response_type(operation: dict[str, Any]) -> str | None:
+    return normalize_frontier_response_type(
+        operation.get("response_type")
+        or response_type_from_sources(operation.get("effect"), operation.get("receipt")),
+        allow_none=True,
+    )
+
+
+def next_work_unit_id_from_plan(
+    plan: dict[str, Any], operation: dict[str, Any], explicit_id: str | None = None,
+) -> str:
+    candidate = explicit_id
+    if candidate is None:
+        for key in ("work_unit_id", "next_work_unit_id"):
+            if isinstance(plan.get(key), str):
+                candidate = plan[key]
+                break
+    if candidate is None:
+        intent = operation.get("intent")
+        if isinstance(intent, dict) and isinstance(intent.get("next_work_unit_id"), str):
+            candidate = intent["next_work_unit_id"]
+    return require_work_unit_id(candidate)
+
+
+def apply_parent_gate_response(
+    data: dict[str, Any], operation: dict[str, Any], *, response_type: str,
+    effect: dict[str, Any], receipt: dict[str, Any], next_work_unit_id: str | None = None,
+) -> None:
+    """Apply one confirmed typed parent gate and its optional plan handoff."""
+    if not is_continuous_parent(data):
+        return
+    response_type = normalize_frontier_response_type(response_type)  # type: ignore[assignment]
+    if not is_parent_gate_operation(operation):
+        return
+    request_id = effect.get("request_id") or receipt.get("request_id")
+    message_id = frontier_message_id(effect) or frontier_message_id(receipt)
+    if not isinstance(request_id, str) or not request_id or not isinstance(message_id, str) or not message_id:
+        raise SystemExit("PARENT_GATE_IDENTITY_REQUIRED")
+    if operation.get("status") not in {"confirmed", "failed"} and operation.get("effective_status") != "confirmed":
+        raise SystemExit("PARENT_GATE_REQUIRES_CONFIRMED_FRONTIER_EVIDENCE")
+    gate = data.get("parent_gate")
+    completed_work_unit_id = gate.get("completed_work_unit_id") if isinstance(gate, dict) else None
+    intent = operation.get("intent")
+    if completed_work_unit_id is None and isinstance(intent, dict):
+        completed_work_unit_id = intent.get("completed_work_unit_id")
+    if completed_work_unit_id is not None:
+        completed_work_unit_id = require_work_unit_id(completed_work_unit_id)
+
+    plan = proposed_plan_from_sources(effect, receipt)
+    if response_type == "plan":
+        if plan is None:
+            raise SystemExit("PARENT_GATE_PLAN_REQUIRED")
+        work_unit_id = next_work_unit_id_from_plan(plan, operation, next_work_unit_id)
+        existing = data.get("next_work_unit")
+        provenance = {
+            "operation_id": operation["operation_id"],
+            "request_id": request_id,
+            "message_id": message_id,
+            "frontier_decision": operation.get("frontier_decision") or effect.get("frontier_decision"),
+            "effect": copy.deepcopy(effect),
+            "receipt": copy.deepcopy(receipt),
+        }
+        candidate = {
+            "status": "approved",
+            "work_unit_id": work_unit_id,
+            "intent": copy.deepcopy(plan),
+            "provenance": provenance,
+            "approved_at": utcnow(),
+        }
+        if isinstance(existing, dict):
+            if (
+                existing.get("work_unit_id") == work_unit_id
+                and existing.get("intent") == plan
+                and existing.get("provenance", {}).get("operation_id") == operation.get("operation_id")
+            ):
+                return
+            if existing.get("status") in {"approved", "active"}:
+                raise SystemExit("NEXT_WORK_UNIT_HANDOFF_CONFLICT")
+        previous_gate = data.get("parent_gate")
+        if isinstance(previous_gate, dict) and previous_gate.get("status") not in {None, "required"} \
+                and previous_gate.get("operation_id") != operation.get("operation_id"):
+            data.setdefault("parent_gate_history", []).append(copy.deepcopy(previous_gate))
+        data["parent_gate"] = {
+            "status": "confirmed", "completed_work_unit_id": completed_work_unit_id,
+            "operation_id": operation["operation_id"], "request_id": request_id,
+            "message_id": message_id, "response_type": response_type,
+            "frontier_decision": operation.get("frontier_decision") or effect.get("frontier_decision"),
+            "effect": copy.deepcopy(effect), "receipt": copy.deepcopy(receipt),
+            "next_work_unit_id": work_unit_id, "recorded_at": utcnow(),
+        }
+        data["next_work_unit"] = candidate
+        data["phase"] = "reviewing-plan"
+        data["status"] = "active"
+        data["blocker"] = None
+        return
+
+    if response_type == "blocking_clarification":
+        clarification_payload = receipt.get("clarification") or effect.get("clarification")
+        if clarification_payload is None:
+            clarification_payload = {
+                key: receipt[key] for key in ("question", "options", "recommended_default") if key in receipt
+            }
+        if not isinstance(clarification_payload, dict):
+            raise SystemExit("BLOCKING_CLARIFICATION_EVIDENCE_REQUIRED")
+        action = {
+            "action": "RESUME_BLOCKING_CLARIFICATION",
+            "operation_ids": [operation["operation_id"]],
+            "phase": data.get("phase"),
+        }
+        data["clarification"] = {
+            "status": "blocked", "response_type": response_type,
+            "operation_id": operation["operation_id"], "request_id": request_id,
+            "message_id": message_id, "question": copy.deepcopy(clarification_payload),
+            "resume_phase": "parent-gate" if is_parent_gate_operation(operation) else data.get("phase"),
+            "action": action, "recorded_at": utcnow(),
+        }
+        if is_parent_gate_operation(operation):
+            data["parent_gate"] = {
+                "status": "blocked", "completed_work_unit_id": completed_work_unit_id,
+                "operation_id": operation["operation_id"], "request_id": request_id,
+                "message_id": message_id, "response_type": response_type,
+                "effect": copy.deepcopy(effect), "receipt": copy.deepcopy(receipt),
+                "recorded_at": utcnow(),
+            }
+        data["phase"] = "blocked"
+        data["status"] = "blocked"
+        data["blocker"] = CLARIFICATION_BLOCKER
+        return
+
+    previous_gate = data.get("parent_gate")
+    if isinstance(previous_gate, dict) and previous_gate.get("status") not in {None, "required"} \
+            and previous_gate.get("operation_id") != operation.get("operation_id"):
+        data.setdefault("parent_gate_history", []).append(copy.deepcopy(previous_gate))
+    data["parent_gate"] = {
+        "status": "confirmed", "completed_work_unit_id": completed_work_unit_id,
+        "operation_id": operation["operation_id"], "request_id": request_id,
+        "message_id": message_id, "response_type": response_type,
+        "frontier_decision": operation.get("frontier_decision") or effect.get("frontier_decision"),
+        "effect": copy.deepcopy(effect), "receipt": copy.deepcopy(receipt), "recorded_at": utcnow(),
+    }
+
+
+def apply_blocking_clarification(
+    data: dict[str, Any], operation: dict[str, Any], effect: dict[str, Any], receipt: dict[str, Any],
+) -> None:
+    payload = receipt.get("clarification") or effect.get("clarification")
+    if payload is None:
+        payload = {key: receipt[key] for key in ("question", "options", "recommended_default") if key in receipt}
+    if not isinstance(payload, dict):
+        raise SystemExit("BLOCKING_CLARIFICATION_EVIDENCE_REQUIRED")
+    request_id = effect.get("request_id") or receipt.get("request_id")
+    message_id = frontier_message_id(effect) or frontier_message_id(receipt)
+    if not isinstance(request_id, str) or not request_id or not isinstance(message_id, str) or not message_id:
+        raise SystemExit("BLOCKING_CLARIFICATION_IDENTITY_REQUIRED")
+    data["clarification"] = {
+        "status": "blocked", "response_type": "blocking_clarification",
+        "operation_id": operation["operation_id"], "request_id": request_id,
+        "message_id": message_id, "question": copy.deepcopy(payload),
+        "resume_phase": data.get("phase"),
+        "action": {
+            "action": "RESUME_BLOCKING_CLARIFICATION",
+            "operation_ids": [operation["operation_id"]], "phase": data.get("phase"),
+        },
+        "recorded_at": utcnow(),
+    }
+    data["phase"] = "blocked"
+    data["status"] = "blocked"
+    data["blocker"] = CLARIFICATION_BLOCKER
+
+
 def cmd_frontier_result(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
     require_v2(data, "frontier result")
@@ -2126,7 +2565,7 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     if not args.operation_id:
         raise SystemExit("Frontier result requires --operation-id")
     operation = find_operation(data, args.operation_id)
-    if operation.get("kind") != "frontier_exchange":
+    if operation.get("kind") != "frontier_exchange" and not is_parent_gate_operation(operation):
         raise SystemExit("FRONTIER_OPERATION_KIND_MISMATCH")
     status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
         data, operation, args, recovery=False,
@@ -2135,6 +2574,9 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     reason = None if terminal_status == "confirmed" else "Frontier transport " + status
     if errors:
         reason += ": " + "; ".join(sorted(set(errors)))
+    response_type = response_type_from_sources(args.response_type, effect, receipt)
+    if is_parent_gate_operation(operation) and terminal_status == "confirmed" and response_type is None:
+        raise SystemExit("PARENT_GATE_RESPONSE_TYPE_REQUIRED")
     if operation.get("status") in TERMINAL_OPERATION_STATUSES:
         if (
             operation.get("status") == terminal_status
@@ -2155,10 +2597,23 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     operation["receipt"] = receipt
     operation["transport_status"] = status
     operation["frontier_decision"] = decision
+    if response_type is not None:
+        operation["response_type"] = response_type
+        proposed_plan = proposed_plan_from_sources(effect, receipt)
+        if proposed_plan is not None:
+            operation["proposed_plan"] = proposed_plan
     operation["status"] = terminal_status
     operation["terminal_reason"] = reason
     operation["confirmed_at"] = now
     operation["updated_at"] = now
+    if terminal_status == "confirmed" and response_type is not None:
+        if is_parent_gate_operation(operation):
+            apply_parent_gate_response(
+                data, operation, response_type=response_type, effect=effect, receipt=receipt,
+                next_work_unit_id=args.next_work_unit_id,
+            )
+        elif response_type == "blocking_clarification":
+            apply_blocking_clarification(data, operation, effect, receipt)
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "frontier.result_recorded", reason, {
         "operation_id": operation["operation_id"], "transport_status": status,
@@ -2200,10 +2655,15 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
         raise SystemExit("FRONTIER_RECOVERY_EVIDENCE_INVALID: " + "; ".join(sorted(set(errors or ["transport is not successful"]))))
     task_id = args.task_id or identity["task_id"]
     scope = args.scope or identity["scope"]
+    response_type = response_type_from_sources(args.response_type, effect, receipt)
+    if is_parent_gate_operation(operation) and response_type is None:
+        raise SystemExit("PARENT_GATE_RESPONSE_TYPE_REQUIRED")
     entry = frontier_recovery_entry(
         operation, status=status, decision=decision, request_id=request_id, message_id=message_id,
         task_id=task_id, scope=scope, effect=effect, receipt=receipt,
     )
+    if response_type is not None:
+        entry["response_type"] = response_type
     history = operation.setdefault("recovery_history", [])
     if history:
         existing = history[-1]
@@ -2220,6 +2680,18 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
         "request_id": request_id, "message_id": message_id,
         "effect": effect, "receipt": receipt,
     }
+    if response_type is not None:
+        operation["effective_response_type"] = response_type
+        proposed_plan = proposed_plan_from_sources(effect, receipt)
+        if proposed_plan is not None:
+            operation["proposed_plan"] = proposed_plan
+        if is_parent_gate_operation(operation):
+            apply_parent_gate_response(
+                data, operation, response_type=response_type, effect=effect, receipt=receipt,
+                next_work_unit_id=args.next_work_unit_id,
+            )
+        elif response_type == "blocking_clarification":
+            apply_blocking_clarification(data, operation, effect, receipt)
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "frontier.operation_recovered", "legacy failed Frontier operation recovered", {
         "operation_id": operation["operation_id"], "recovery_id": entry["recovery_id"],
@@ -2240,6 +2712,30 @@ def accessible_workspace(value: str | None) -> str:
     if not workspace.is_dir() or not os.access(workspace, os.R_OK | os.X_OK):
         raise SystemExit(f"workspace is not an accessible directory: {workspace}")
     return str(workspace)
+
+
+def require_continuous_work_unit_provenance(data: dict[str, Any], work_unit_id: str) -> None:
+    if not is_continuous_parent(data):
+        return
+    next_work_unit = data.get("next_work_unit")
+    completed_units = [
+        existing_id for existing_id, work_unit in data.get("work_units", {}).items()
+        if isinstance(work_unit, dict) and work_unit.get("status") == "complete"
+    ]
+    if isinstance(next_work_unit, dict) and next_work_unit.get("status") in {"approved", "active"}:
+        if next_work_unit.get("work_unit_id") != work_unit_id:
+            raise SystemExit("BLOCKED_NEXT_WORK_UNIT_PROVENANCE_REQUIRED")
+        provenance = next_work_unit.get("provenance")
+        if not isinstance(provenance, dict) or not all(provenance.get(key) for key in ("operation_id", "request_id", "message_id")):
+            raise SystemExit("BLOCKED_NEXT_WORK_UNIT_PROVENANCE_REQUIRED")
+    elif completed_units:
+        raise SystemExit("BLOCKED_NEXT_WORK_UNIT_PROVENANCE_REQUIRED")
+    live_units = [
+        live_id for live_id, work_unit in data.get("work_units", {}).items()
+        if isinstance(work_unit, dict) and work_unit.get("status") in {"active", "remediating"}
+    ]
+    if live_units and work_unit_id not in live_units:
+        raise SystemExit("BLOCKED_CONCURRENT_ACTIVE_WORK_UNIT")
 
 
 def cmd_delegation_preflight(args: argparse.Namespace) -> int:
@@ -2264,6 +2760,7 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
         "reason": args.reason,
     }
     existing = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
+    require_continuous_work_unit_provenance(data, work_unit_id)
     # A stale/legacy started row cannot be silently claimed by a new preflight.
     # The only retry allowed is the exact same operation that previously wrote
     # this task identity atomically with its ledger row.
@@ -2313,6 +2810,10 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
     data["attempts"][args.role + "s"] = entry["attempt"]
     data["active_work_unit_id"] = work_unit["work_unit_id"]
     data["worker_task_id"] = args.task_id
+    if is_continuous_parent(data) and isinstance(data.get("next_work_unit"), dict) \
+            and data["next_work_unit"].get("work_unit_id") == work_unit_id:
+        data["next_work_unit"]["status"] = "active"
+        data["phase"] = "implementing"
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "delegation.preflight_recorded", None, {
         "operation_id": operation["operation_id"], "task_id": args.task_id,
@@ -2377,6 +2878,7 @@ def cmd_correction_preflight(args: argparse.Namespace) -> int:
     require_active_run(data, "correction start")
     ensure_route_allows(data, "delegation")
     work_unit_id = require_work_unit_id(args.work_unit_id)
+    require_continuous_work_unit_provenance(data, work_unit_id)
     workspace = accessible_workspace(args.workspace)
     if not isinstance(args.task_id, str) or not args.task_id.strip():
         raise SystemExit("--task-id must be a non-empty string")
@@ -2556,6 +3058,22 @@ def cmd_work_unit(args: argparse.Namespace) -> int:
     work_unit["completion_evidence"] = evidence
     if data.get("active_work_unit_id") == work_unit_id:
         data["active_work_unit_id"] = None
+    if is_continuous_parent(data):
+        next_work_unit = data.get("next_work_unit")
+        if isinstance(next_work_unit, dict) and next_work_unit.get("work_unit_id") != work_unit_id:
+            raise SystemExit("continuous work unit completion does not match the approved next work unit")
+        previous_gate = data.get("parent_gate")
+        if isinstance(previous_gate, dict) and previous_gate.get("status") not in {None, "required"}:
+            data.setdefault("parent_gate_history", []).append(copy.deepcopy(previous_gate))
+        data["parent_gate"] = {
+            "status": "required", "completed_work_unit_id": work_unit_id,
+            "operation_id": None, "request_id": None, "message_id": None,
+            "response_type": None, "effect": None, "receipt": None,
+        }
+        data["next_work_unit"] = None
+        data["phase"] = "parent-gate"
+        data["status"] = "active"
+        data["blocker"] = None
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "work_unit.completed", None, {
         "work_unit_id": work_unit_id, "revision": saved["revision"],
@@ -3232,7 +3750,7 @@ RECEIPT_SUCCESS = {
     "pull_request": {"PR_CREATED", "SUCCESS", "CONFIRMED"},
     "ci": {"SUCCESS", "PASSED", "CI_PASSED", "CONFIRMED", "COMPLETED"},
     "local_verification": {"SUCCESS", "PASSED", "VERIFIED", "CONFIRMED", "COMPLETED"},
-    "parent_gate": {"SUCCESS", "PASSED", "APPROVED", "CONFIRMED", "COMPLETED", "PARENT_GATE_PASSED"},
+    "parent_gate": {"PARENT_OBJECTIVE_COMPLETE"},
     "local_commit": {"SUCCESS", "CONFIRMED"},
 }
 
@@ -3328,6 +3846,8 @@ def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
                 continue
             if kind not in REQUIRED_RECEIPT_KINDS:
                 continue
+            if kind == "parent_gate" and parent_gate_response_type(operation) in FRONTIER_RESPONSE_TYPES:
+                continue
             outcome = receipt_status(operation.get("receipt"))
             if outcome not in RECEIPT_SUCCESS[kind]:
                 blockers.append(
@@ -3350,23 +3870,32 @@ def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
 
 
 def parent_gate_evaluated(data: dict[str, Any]) -> bool:
-    """A continuous parent objective needs one explicit, successful gate."""
+    """A continuous parent objective needs an explicit parent-complete response."""
     if not data.get("parent_objective"):
+        return True
+    gate = data.get("parent_gate")
+    if isinstance(gate, dict) and (
+        gate.get("status") == "confirmed"
+        and gate.get("response_type") == PARENT_GATE_TERMINAL_RESPONSE
+        and isinstance(gate.get("operation_id"), str)
+        and isinstance(gate.get("request_id"), str)
+        and isinstance(gate.get("message_id"), str)
+    ):
         return True
     for operation in data.get("pending_operations", []):
         if (
             isinstance(operation, dict)
-            and operation.get("kind") == "parent_gate"
+            and is_parent_gate_operation(operation)
             and operation.get("status") == "confirmed"
-            and receipt_status(operation.get("receipt")) in RECEIPT_SUCCESS["parent_gate"]
+            and parent_gate_response_type(operation) == PARENT_GATE_TERMINAL_RESPONSE
         ):
             return True
     receipts = data.get("receipts", {})
     if isinstance(receipts, dict):
         return any(
-            receipt_status(receipts.get(alias)) in RECEIPT_SUCCESS["parent_gate"]
-            for alias in RECEIPT_ALIASES["parent_gate"]
-            if alias in receipts
+            receipt_status(receipts.get(alias)) == "PARENT_OBJECTIVE_COMPLETE"
+            or (isinstance(receipts.get(alias), dict) and receipts[alias].get("response_type") == PARENT_GATE_TERMINAL_RESPONSE)
+            for alias in RECEIPT_ALIASES["parent_gate"] if alias in receipts
         )
     return False
 
@@ -3450,6 +3979,16 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
 
     if data.get("status") == "blocked":
         blocker = data.get("blocker")
+        if blocker == PAUSE_BLOCKER:
+            pause = data.get("pause") or {}
+            action = pause.get("action") if isinstance(pause, dict) else None
+            return "RESUME_PAUSED_RUN", "run is explicitly paused", [json.dumps(action, sort_keys=True)]
+        if blocker == CLARIFICATION_BLOCKER:
+            clarification = data.get("clarification") or {}
+            operation_id_value = clarification.get("operation_id") if isinstance(clarification, dict) else None
+            return "RESUME_BLOCKING_CLARIFICATION", "a typed Frontier clarification requires an answer", [
+                str(operation_id_value or "<unnamed-operation>")
+            ]
         if blocker == "BLOCKED_MISSING_DELEGATION_RESULT":
             return "RECOVER_MISSING_RESULT", "a delegation result is missing", []
         if blocker in {"BLOCKED_CORRECTION_BUDGET", "BLOCKED_TOTAL_CORRECTION_BUDGET", "BLOCKED_NO_PROGRESS"}:
@@ -3492,6 +4031,15 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     if batches:
         return "COLLECT_DELEGATIONS", "a delegation batch is incomplete", batches
 
+    gate = data.get("parent_gate")
+    if parent_gate_needs_request(data):
+        return "REQUEST_PARENT_GATE", "completed work unit requires exactly one parent gate", []
+    next_work_unit = data.get("next_work_unit")
+    if is_continuous_parent(data) and isinstance(next_work_unit, dict) and next_work_unit.get("status") == "approved":
+        return "BEGIN_NEXT_WORK_UNIT", "a confirmed Frontier proposed_plan approved the next work unit", [
+            str(next_work_unit["work_unit_id"])
+        ]
+
     phase = data.get("phase")
     if phase == "waiting-for-frontier":
         if data.get("frontier_task_id") or data.get("last_request_id"):
@@ -3500,6 +4048,13 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     if phase == "verifying":
         return "RUN_LOCAL_VERIFICATION", "run is at the verification phase", []
     if phase == "parent-gate":
+        if parent_gate_needs_request(data):
+            return "REQUEST_PARENT_GATE", "completed work unit requires exactly one parent gate", []
+        if is_continuous_parent(data) and parent_gate_evaluated(data):
+            blockers = completion_blockers(data)
+            if blockers:
+                return "BLOCKED_STATE_INCOMPLETE", blockers[0], []
+            return "COMPLETE_RUN", "explicit PARENT_OBJECTIVE_COMPLETE passed all terminal gates", []
         return "RUN_PARENT_GATE", "run is at the parent gate", []
     if phase in {"reporting", "committing", "pushing", "proceeding-to-next-gate"}:
         blockers = completion_blockers(data)
@@ -3620,15 +4175,74 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pause(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "pause")
+    require_active_run(data, "pause")
+    action, reason, identifiers = derive_reconcile_action(data)
+    data["pause"] = {
+        "status": "paused", "reason": args.reason, "resume_phase": data["phase"],
+        "action": {"action": action, "reason": reason, "identifiers": identifiers},
+        "paused_at": utcnow(),
+    }
+    data["phase"] = "blocked"
+    data["status"] = "blocked"
+    data["blocker"] = PAUSE_BLOCKER
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "run.paused", args.reason, {
+        "action": action, "identifiers": identifiers, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "resume")
+    require_nonterminal_run(data, "resume")
+    if data.get("status") != "blocked" or data.get("blocker") not in {PAUSE_BLOCKER, CLARIFICATION_BLOCKER}:
+        raise SystemExit("resume requires an explicit pause or blocking clarification")
+    pause = data.get("pause") if data.get("blocker") == PAUSE_BLOCKER else data.get("clarification")
+    if not isinstance(pause, dict) or not isinstance(pause.get("resume_phase"), str):
+        raise SystemExit("resumable state is missing its typed resume evidence")
+    resume_phase = pause["resume_phase"]
+    if resume_phase not in PHASES or PHASE_STATUS[resume_phase] != "active":
+        raise SystemExit("resumable state has an invalid active phase")
+    pause["status"] = "resumed"
+    pause["resumed_at"] = utcnow()
+    data["phase"] = resume_phase
+    data["status"] = "active"
+    data["blocker"] = None
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "run.resumed", args.reason, {
+        "from_blocker": args.reason, "phase": resume_phase, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
     require_v2(data, "cancel")
     require_nonterminal_run(data, "cancel")
+    cancellation_type = args.cancellation_type or (
+        PARENT_CANCELLATION_TYPE if is_continuous_parent(data) else RUN_CANCELLATION_TYPE
+    )
+    if cancellation_type not in {PARENT_CANCELLATION_TYPE, RUN_CANCELLATION_TYPE}:
+        raise SystemExit("invalid cancellation type")
+    evidence = parse_object_json(args.evidence_json, "--evidence-json") if args.evidence_json else {}
+    data["cancellation"] = {
+        "type": cancellation_type, "reason": args.reason,
+        "request_id": args.request_id, "message_id": args.message_id,
+        "evidence": evidence, "cancelled_at": utcnow(),
+    }
     data["phase"] = "cancelled"
     data["status"] = "cancelled"
     data["blocker"] = args.reason
     saved = write_state(data, args.expect_revision)
-    append_event(args.run_id, "run.cancelled", args.reason, None)
+    append_event(args.run_id, "run.cancelled", args.reason, {
+        "type": cancellation_type, "request_id": args.request_id, "message_id": args.message_id,
+    })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -3764,6 +4378,10 @@ def build_parser() -> argparse.ArgumentParser:
     frontier.add_argument("--operation-id")
     frontier.add_argument("--transport-status")
     frontier.add_argument("--frontier-decision")
+    frontier.add_argument("--response-type")
+    frontier.add_argument("--plan-json")
+    frontier.add_argument("--next-work-unit-id")
+    frontier.add_argument("--clarification-json")
     frontier.add_argument("--effect-json")
     frontier.add_argument("--receipt-json")
     frontier.add_argument("--scope")
@@ -3889,9 +4507,25 @@ def build_parser() -> argparse.ArgumentParser:
     unlock.add_argument("--force", action="store_true")
     unlock.set_defaults(func=cmd_unlock)
 
+    pause = sub.add_parser("pause", help="pause a run with typed, resumable evidence")
+    pause.add_argument("run_id")
+    pause.add_argument("--reason", required=True)
+    pause.add_argument("--expect-revision", type=int, required=True)
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser("resume", help="resume an explicit pause or blocking clarification")
+    resume.add_argument("run_id")
+    resume.add_argument("--reason", default="typed resume")
+    resume.add_argument("--expect-revision", type=int, required=True)
+    resume.set_defaults(func=cmd_resume)
+
     cancel = sub.add_parser("cancel")
     cancel.add_argument("run_id")
     cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--cancellation-type", choices=[PARENT_CANCELLATION_TYPE, RUN_CANCELLATION_TYPE])
+    cancel.add_argument("--request-id")
+    cancel.add_argument("--message-id")
+    cancel.add_argument("--evidence-json")
     cancel.add_argument("--expect-revision", type=int, required=True)
     cancel.set_defaults(func=cmd_cancel)
 

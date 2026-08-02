@@ -50,6 +50,8 @@ myrmex-state reconcile <run-id>
 myrmex-state frontier <run-id> start --request-id <request-id> --task-id <task-id> --expect-revision <n>
 myrmex-state frontier <run-id> result --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
   --transport-status success --frontier-decision ACCEPT --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
+myrmex-state frontier <run-id> result --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
+  --transport-status success --frontier-decision ACCEPT --response-type plan --plan-json '{"work_unit_id":"WU-next"}' --expect-revision <n>
 myrmex-state frontier <run-id> recover --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
   --transport-status success --frontier-decision REMEDIATE --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
 myrmex-state delegation-preflight <run-id> --agent myrmex-worker --role writer --reason "bounded work" --task-id <task-id> --work-unit-id WU-03 --workspace <repo> --expect-revision <n>
@@ -58,6 +60,9 @@ myrmex-state operation <run-id> observe --operation-id op-... --effect-json '{..
 myrmex-state operation <run-id> receipt --operation-id op-... --receipt-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> confirm --operation-id op-... --status confirmed --reason "receipt verified" --expect-revision <n>
 myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{...}' --expect-revision <n>
+myrmex-state pause <run-id> --reason "pause requested" --expect-revision <n>
+myrmex-state resume <run-id> --expect-revision <n>
+myrmex-state cancel <run-id> --reason "parent cancelled" --cancellation-type PARENT_OBJECTIVE_CANCELLED --expect-revision <n>
 myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
 myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
@@ -154,6 +159,17 @@ cancelled, unknown, or partial. New runs use `myrmex.frontier-state/v2`. `myrmex
 <run-id> --expect-revision <n>` explicitly upgrades a v1 run after writing an
 exact `state.v1.r<n>.json` backup. Historic run-global correction counts remain
 under `work_units.__legacy__`; migration never invents a work-unit assignment.
+
+For `scope=continuous`, `work-unit complete` keeps the parent active and
+creates a typed `REQUEST_PARENT_GATE` reconcile action. A confirmed Frontier
+gate with one `<proposed_plan>` stores the exact next-WU intent and its request,
+message, effect, and receipt provenance; it derives `BEGIN_NEXT_WORK_UNIT` and
+does not permit a second active WU. Only the exact typed response
+`PARENT_OBJECTIVE_COMPLETE` satisfies the parent gate. `SUB_OBJECTIVE_COMPLETE`,
+generic success receipts, and `OBJECTIVE_COMPLETE` do not terminate the
+parent. `BLOCKING_CLARIFICATION` and explicit pause preserve a typed resume
+phase/action. Informational status messages are side-band and do not mutate
+the state or interrupt the reconciled action.
 
 ## Project and installation memory
 

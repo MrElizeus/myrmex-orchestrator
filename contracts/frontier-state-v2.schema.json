@@ -674,6 +674,138 @@
       },
       "additionalProperties": true
     },
+    "parent_gate": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["required", "requested", "confirmed", "blocked"]
+        },
+        "completed_work_unit_id": {
+          "type": ["string", "null"]
+        },
+        "operation_id": {
+          "type": ["string", "null"]
+        },
+        "request_id": {
+          "type": ["string", "null"]
+        },
+        "message_id": {
+          "type": ["string", "null"]
+        },
+        "response_type": {
+          "enum": [
+            "plan",
+            "blocking_clarification",
+            "objective_complete",
+            "sub_objective_complete",
+            "parent_objective_complete",
+            "already_complete",
+            "unknown",
+            null
+          ]
+        },
+        "frontier_decision": {
+          "enum": ["ACCEPT", "REMEDIATE", "BLOCKED", null]
+        },
+        "effect": {
+          "type": ["object", "null"]
+        },
+        "receipt": {
+          "type": ["object", "null"]
+        },
+        "next_work_unit_id": {
+          "type": ["string", "null"]
+        },
+        "recorded_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "parent_gate_history": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "next_work_unit": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": ["status", "work_unit_id", "intent", "provenance"],
+      "properties": {
+        "status": {
+          "enum": ["approved", "active", "complete"]
+        },
+        "work_unit_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intent": {
+          "type": "object"
+        },
+        "provenance": {
+          "type": "object",
+          "required": ["operation_id", "request_id", "message_id"],
+          "properties": {
+            "operation_id": {"type": "string"},
+            "request_id": {"type": "string"},
+            "message_id": {"type": "string"},
+            "frontier_decision": {"type": ["string", "null"]},
+            "effect": {"type": "object"},
+            "receipt": {"type": "object"}
+          },
+          "additionalProperties": true
+        },
+        "approved_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "clarification": {
+      "type": ["object", "null"],
+      "properties": {
+        "status": {"enum": ["blocked", "resumed"]},
+        "response_type": {"const": "blocking_clarification"},
+        "operation_id": {"type": "string"},
+        "request_id": {"type": "string"},
+        "message_id": {"type": "string"},
+        "question": {},
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "recorded_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "pause": {
+      "type": ["object", "null"],
+      "properties": {
+        "status": {"enum": ["paused", "resumed"]},
+        "reason": {"type": "string"},
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "paused_at": {"type": "string"},
+        "resumed_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "cancellation": {
+      "type": ["object", "null"],
+      "properties": {
+        "type": {"enum": ["PARENT_OBJECTIVE_CANCELLED", "RUN_CANCELLED"]},
+        "reason": {"type": "string"},
+        "request_id": {"type": ["string", "null"]},
+        "message_id": {"type": ["string", "null"]},
+        "evidence": {"type": "object"},
+        "cancelled_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
     "active_work_unit_id": {
       "type": [
         "string",
@@ -1034,6 +1166,21 @@
               null
             ]
           },
+          "response_type": {
+            "enum": [
+              "plan",
+              "blocking_clarification",
+              "objective_complete",
+              "sub_objective_complete",
+              "parent_objective_complete",
+              "already_complete",
+              "unknown",
+              null
+            ]
+          },
+          "proposed_plan": {
+            "type": ["object", "null"]
+          },
           "effective_status": {
             "enum": [
               "confirmed",
@@ -1056,6 +1203,18 @@
               "ACCEPT",
               "REMEDIATE",
               "BLOCKED"
+            ]
+          },
+          "effective_response_type": {
+            "enum": [
+              "plan",
+              "blocking_clarification",
+              "objective_complete",
+              "sub_objective_complete",
+              "parent_objective_complete",
+              "already_complete",
+              "unknown",
+              null
             ]
           },
           "effective_outcome": {

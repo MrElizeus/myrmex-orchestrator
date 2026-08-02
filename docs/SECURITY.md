@@ -43,6 +43,16 @@ automatically.
   not transport failures. Recovery of a legacy failed exchange is typed,
   revision-checked, identity-bound, append-only, and cannot rewrite its
   original terminal evidence.
+- Continuous-parent lifecycle is typed: a completed WU cannot complete its
+  parent, a next-WU handoff requires confirmed Frontier `proposed_plan`
+  provenance, and only `PARENT_OBJECTIVE_COMPLETE` or the explicit
+  `PARENT_OBJECTIVE_CANCELLED` command is terminal for the parent. Generic
+  patches cannot modify parent identity, scope, gate evidence, handoffs,
+  clarification, pause, or cancellation state.
+- Informational status messages are a non-mutating side-band. They may expose
+  the current state and exact reconcile action, but must not create a pause,
+  cancel, abandonment, or replacement operation. Explicit pause and typed
+  clarification retain a resumable action; cancellation remains terminal.
 
 ## Delivery
 
