@@ -70,20 +70,51 @@ myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority fron
 
 ### Bounded local commit
 
-An autonomous local commit is not a global Git permission. The primary first
-creates a `local_commit` authorization while the persisted run has
-`commit_policy=authorized`; the authorization records the authority, stable
-request ID, repository/branch/expected HEAD, exact normalized paths, commit
-message digest, expiry, and a one-use budget:
+An autonomous local commit is not a global Git permission. A continuous parent
+first records a standing human authorization from an accepted Frontier work
+unit. The typed command changes the effective policy to `governed`; it does not
+create a commit grant:
 
 ```bash
-myrmex-state authorization <run-id> create --authority frontier \
-  --request-id <request-id> --repository-root <repo> --branch <branch> \
-  --expected-head <sha> --allowed-path path/to/file --message "<message>" \
+myrmex-state commit-policy authorize <parent-run-id> --authority user \
+  --source-request-id <frontier-request-id> --source-operation-id <op-id> \
+  --work-unit-id <accepted-wu> --expect-revision <n>
+```
+
+The accepted evidence must be a persisted, confirmed Frontier
+`SUB_OBJECTIVE_COMPLETE`/`ACCEPT` (or an exact equivalent accepted-WU record);
+an accepted `plan` response alone is insufficient. The
+standing record retains the human authority, source request, parent scope,
+creation timestamp, accepted WU identity, and append-only audit history.
+
+Only then may the primary create one exact `local_commit` grant. The grant is
+bound to the parent run, accepted WU, target workspace/repository, target
+branch, expected HEAD, candidate diff SHA-256, exact normalized paths, exact
+message, and `max_uses=1`:
+
+```bash
+myrmex-state authorization <parent-run-id> create --authority user \
+  --request-id <grant-request-id> --source-request-id <frontier-request-id> \
+  --source-operation-id <op-id> --work-unit-id <accepted-wu> \
+  --repository-root <target-wu-workspace> --branch <target-branch> \
+  --expected-head <sha> --candidate-diff-sha <sha256> \
+  --allowed-path path/to/file --message "<message>" \
   --expires-at <iso-timestamp> --expect-revision <n>
 scripts/myrmex-git-local.py commit --run-id <run-id> \
-  --authorization-id <auth-id> --repository-root <repo>
+  --authorization-id <grant-id> --repository-root <target-wu-workspace>
 ```
+
+`deny` rejects ordinary local-commit authorization. Governed mode alone cannot
+commit without the exact accepted-WU grant. The parent repository root and
+branch are never rewritten; the target WU workspace may differ only when its
+persisted accepted identity matches the grant. Parent cancellation or
+completion revokes future grant creation. Replaying the same standing
+authorization or grant request is a byte-stable no-op; conflicting identity
+fails before mutation. Generic `patch` cannot change standing authority, grant
+identity, or consumption.
+The accepted source effect and receipt must also carry the exact target root,
+branch, expected HEAD, candidate digest, allowed paths, and commit message;
+any source-scope mismatch rejects the grant before it is persisted.
 
 The helper stages only the listed paths, rejects any pre-existing index state
 (including intent-to-add), any dirty `.atl/` or `.playwright-mcp/` path, other
@@ -93,7 +124,7 @@ or transport: a private index plus `hash-object --no-filters`, `write-tree`,
 `commit-tree`, and compare-and-swap `update-ref` are used instead. Raw branch,
 tag, remote, ref-namespace, HEAD, and configuration snapshots are checked
 before authorization consumption. The
-authorization is intentionally single-use (`max_uses=1`). It persists
+grant is intentionally single-use (`max_uses=1`). It persists
 `local_commit` intent before invoking Git, then
 records observed commit, receipt, terminal confirmation, and authorization
 consumption. On retry it searches for the one matching child of the expected

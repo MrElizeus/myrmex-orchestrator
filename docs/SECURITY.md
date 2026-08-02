@@ -61,9 +61,22 @@ automatically.
 ## Delivery
 
 OpenCode asks before commit/push by default. Force push is denied. Direct pushes to protected branches require explicit, branch-specific authorization.
-The bounded `local_commit` helper is narrower than that global gate: it requires
-a persisted single-use authorization tied to one repository, branch, expected
-HEAD, exact path set, and message, and it never includes push or remote mutation.
+The governed `local_commit` helper is narrower than that global gate: a standing
+human authorization is accepted only from matching Frontier
+`SUB_OBJECTIVE_COMPLETE`/`ACCEPT` work-unit evidence; a `plan` response alone
+is insufficient. Each persisted
+single-use grant is tied to the parent run, accepted WU, target repository,
+branch, expected HEAD, candidate diff digest, exact path set, and message. The
+standing authorization is not itself a local-commit grant, and governed mode
+alone cannot commit.
+Parent root/branch identity is immutable, target WU workspaces are accepted
+only from persisted WU identity, and cancellation/completion disables future
+grants. Replays are idempotent; conflicting authority, source, or grant
+identity fails before state mutation. Generic patches cannot alter standing
+authority or grant consumption, and push remains denied.
+The accepted source effect and receipt are bound to the exact target root,
+branch, expected HEAD, candidate digest, allowed paths, and commit message;
+source-scope tampering is rejected both before intent and inside the helper.
 Hooks, filters, editors, signing, and transport are never invoked: the helper
 uses private-index plumbing and compare-and-swap ref updates. Post-effect
 snapshots still reject branch, tag, remote, ref, HEAD, or raw configuration

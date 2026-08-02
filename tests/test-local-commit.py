@@ -37,12 +37,17 @@ def state(env: dict[str, str], *args: str, ok: bool = True) -> dict:
         return result.stdout.strip()
 
 
-def helper(env: dict[str, str], run_id: str, auth_id: str, repo: Path, message: str | None = None, ok: bool = True) -> dict:
+def helper(
+    env: dict[str, str], run_id: str, auth_id: str, repo: Path,
+    message: str | None = None, candidate_diff_sha: str | None = None, ok: bool = True,
+) -> dict:
     args = [str(HELPER), "commit", "--run-id", run_id, "--authorization-id", auth_id, "--repository-root", str(repo)]
     if message is not None:
         args.extend(["--message", message])
+    if candidate_diff_sha is not None:
+        args.extend(["--candidate-diff-sha", candidate_diff_sha])
     result = command(args, env=env, ok=ok)
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+    return json.loads(result.stdout) if result.stdout.strip() else result.stderr.strip()
 
 
 def setup_repo(td: str) -> tuple[Path, dict[str, str], str, str]:
@@ -88,6 +93,82 @@ def baseline(repo: Path, expected_head: str | None = None) -> dict:
         "remotes_digest": digest("remote", "-v"),
         "refs": refs,
     }
+
+
+def candidate_digest(repo: Path, expected_head: str, *paths: str) -> str:
+    result = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-color", expected_head, "--", *paths)
+    return hashlib.sha256(result.stdout.encode()).hexdigest()
+
+
+def create_governed_parent(env: dict[str, str], repo: Path, run_id: str) -> tuple[str, str, str, str, str, str]:
+    branch = git(repo, "branch", "--show-current").stdout.strip()
+    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "base.txt").write_text("governed\n", encoding="utf-8")
+    planned_candidate_digest = candidate_digest(repo, base, "base.txt")
+    parent = state(
+        env, "init", "--run-id", run_id, "--objective", "governed parent", "--parent-objective", "standing parent",
+        "--repository-root", str(repo), "--branch", branch, "--base-sha", base,
+        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "authorized", "--push-policy", "deny",
+    )
+    legacy = state(
+        env, "authorization", parent, "create", "--authority", "user", "--request-id", "legacy-before-governed",
+        "--repository-root", str(repo), "--branch", branch, "--expected-head", base,
+        "--allowed-path", "legacy.txt", "--message", "feat: legacy", "--expect-revision", "0",
+    )["authorizations"][0]["authorization_id"]
+    state(
+        env, "delegation-preflight", parent, "--agent", "myrmex-worker", "--role", "writer", "--reason", "accepted WU",
+        "--task-id", "task-governed", "--work-unit-id", "WU-governed", "--workspace", str(repo), "--expect-revision", "1",
+    )
+    state(
+        env, "delegation", parent, "--agent", "myrmex-worker", "--role", "writer", "--reason", "accepted WU",
+        "--task-id", "task-governed", "--work-unit-id", "WU-governed", "--workspace", str(repo), "--status", "success",
+        "--expect-revision", "2",
+    )
+    started = state(
+        env, "frontier", parent, "start", "--request-id", "accepted-wu-request", "--task-id", "accepted-wu-task",
+        "--message-id", "accepted-wu-message", "--expect-revision", "3",
+    )
+    operation_id = started["pending_operations"][-1]["operation_id"]
+    evidence = json.dumps({
+        "request_id": "accepted-wu-request", "message_id": "accepted-wu-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "sub_objective_complete", "work_unit_id": "WU-governed",
+        "repository_root": str(repo.resolve()), "branch": branch, "expected_head": base,
+        "candidate_diff_sha": planned_candidate_digest, "allowed_paths": ["base.txt"],
+        "commit_message": "feat: governed",
+    })
+    state(
+        env, "frontier", parent, "result", "--operation-id", operation_id, "--request-id", "accepted-wu-request",
+        "--message-id", "accepted-wu-message", "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "sub_objective_complete", "--effect-json", evidence, "--receipt-json", evidence,
+        "--expect-revision", "4",
+    )
+    standing = state(
+        env, "commit-policy", "authorize", parent, "--authority", "user", "--source-request-id", "accepted-wu-request",
+        "--source-operation-id", operation_id, "--work-unit-id", "WU-governed", "--expect-revision", "5",
+    )
+    assert standing["revision"] == 6 and standing["commit_policy"] == "governed"
+    state(env, "work-unit", parent, "complete", "--work-unit-id", "WU-governed", "--evidence-json", '{"verification":"passed"}', "--expect-revision", "6")
+    assert standing["authorizations"][0]["authorization_id"] == legacy
+    assert standing["authorizations"][0]["status"] == "revoked"
+    return parent, branch, base, operation_id, legacy, planned_candidate_digest
+
+
+def create_governed_grant(
+    env: dict[str, str], run_id: str, repo: Path, branch: str, expected_head: str,
+    operation_id: str, request_id: str, path: str, message: str, candidate_sha: str,
+    revision: int, work_unit_id: str = "WU-governed", ok: bool = True,
+    repository_root: str | None = None, branch_override: str | None = None,
+    expected_head_override: str | None = None,
+) -> dict:
+    return state(
+        env, "authorization", run_id, "create", "--authority", "user", "--request-id", request_id,
+        "--repository-root", repository_root or str(repo), "--branch", branch_override or branch,
+        "--expected-head", expected_head_override or expected_head,
+        "--allowed-path", path, "--message", message, "--work-unit-id", work_unit_id,
+        "--candidate-diff-sha", candidate_sha, "--source-operation-id", operation_id,
+        "--source-request-id", "accepted-wu-request", "--expect-revision", str(revision), ok=ok,
+    )
 
 
 with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
@@ -425,5 +506,196 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     ], env=clean_env, ok=False)
     assert "LOCAL_COMMIT_OPERATION_IDENTITY_MISMATCH" in incompatible_result.stderr
     assert "Traceback" not in incompatible_result.stderr
+
+    # Governed commits require the standing parent authorization plus an exact
+    # accepted-WU grant.  The target WU identity is persisted, one grant is
+    # consumed once, and replay is byte-stable.
+    governed_fixture = Path(td) / "governed-fixture"
+    governed_fixture.mkdir()
+    governed_repo, governed_env, governed_branch, governed_base = setup_repo(str(governed_fixture))
+    governed_run, governed_branch, governed_base, accepted_operation, legacy_governed_auth, governed_digest = create_governed_parent(
+        governed_env, governed_repo, "governed-local-commit",
+    )
+    legacy_execution = helper(
+        governed_env, governed_run, legacy_governed_auth, governed_repo, ok=False,
+    )
+    assert "GOVERNED_LOCAL_COMMIT_GRANT_REQUIRED" in legacy_execution
+    no_grant = helper(
+        governed_env, governed_run, "auth-000000000000000000000000", governed_repo, ok=False,
+    )
+    assert git(governed_repo, "rev-parse", "HEAD").stdout.strip() == governed_base
+    tampered_grant = create_governed_grant(
+        governed_env, governed_run, governed_repo, governed_branch, governed_base,
+        accepted_operation, "tampered-source", "base.txt", "feat: governed", governed_digest, 7,
+    )
+    governed_grant_auth = tampered_grant["authorizations"][-1]
+    assert governed_grant_auth["source_scope"] == {
+        "repository_root": str(governed_repo.resolve()), "branch": governed_branch,
+        "expected_head": governed_base, "candidate_diff_sha": governed_digest,
+        "allowed_paths": ["base.txt"], "commit_message": "feat: governed",
+    }
+    tampered_state_path = Path(governed_env["MYRMEX_STATE_HOME"]) / "runs" / governed_run / "state.json"
+    tampered_state_before_source = tampered_state_path.read_bytes()
+    tampered_events_path = tampered_state_path.parent / "events.jsonl"
+    for label, mutate in (
+        ("missing-scope", lambda auth: auth.pop("source_scope")),
+        ("tampered-scope", lambda auth: auth["source_scope"].update({"commit_message": "feat: forged"})),
+    ):
+        tampered_state = json.loads(tampered_state_before_source)
+        persisted_auth = next(item for item in tampered_state["authorizations"] if item.get("authorization_id") == governed_grant_auth["authorization_id"])
+        mutate(persisted_auth)
+        tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+        scope_state_before = tampered_state_path.read_bytes()
+        scope_events_before = tampered_events_path.read_bytes()
+        scope_result = helper(
+            governed_env, governed_run, governed_grant_auth["authorization_id"], governed_repo, ok=False,
+        )
+        expected_scope_error = "GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISSING" if label == "missing-scope" else "GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISMATCH"
+        assert expected_scope_error in scope_result
+        assert tampered_state_path.read_bytes() == scope_state_before
+        assert tampered_events_path.read_bytes() == scope_events_before
+    tampered_state_path.write_bytes(tampered_state_before_source)
+    scope_mismatch_cases = (
+        ("root", {"repository_root": str(governed_repo.parent / "wrong-root")}),
+        ("branch", {"branch_override": "wrong-branch"}),
+        ("head", {"expected_head_override": "a" * 40}),
+        ("digest", {"candidate_sha": "0" * 64}),
+        ("paths", {"path": "wrong-path.txt"}),
+        ("message", {"message": "feat: wrong-message"}),
+    )
+    scope_grant_state_before = tampered_state_path.read_bytes()
+    scope_grant_events_before = tampered_events_path.read_bytes()
+    for label, overrides in scope_mismatch_cases:
+        mismatch_kwargs = {
+            "env": governed_env, "run_id": governed_run, "repo": governed_repo,
+            "branch": governed_branch, "expected_head": governed_base, "operation_id": accepted_operation,
+            "request_id": f"bad-scope-{label}", "path": "base.txt", "message": "feat: governed",
+            "candidate_sha": governed_digest, "revision": 8, "ok": False,
+        }
+        mismatch_kwargs.update(overrides)
+        create_governed_grant(**mismatch_kwargs)
+        assert state(governed_env, "show", governed_run)["revision"] == 8
+        assert tampered_state_path.read_bytes() == scope_grant_state_before
+        assert tampered_events_path.read_bytes() == scope_grant_events_before
+    tampered_state = json.loads(tampered_state_before_source)
+    source_operation = next(
+        item for item in tampered_state["pending_operations"] if item.get("operation_id") == accepted_operation
+    )
+    source_operation["effect"]["response_type"] = "plan"
+    source_operation["receipt"]["response_type"] = "plan"
+    tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+    tampered_intent_auth = tampered_grant["authorizations"][-1]
+    tampered_intent = {key: tampered_intent_auth[key] for key in (
+        "authorization_id", "authority", "request_id", "repository_root", "branch", "expected_head",
+        "allowed_paths", "scope_digest", "commit_message", "commit_message_digest", "grant_kind",
+        "parent_run_id", "work_unit_id", "candidate_diff_sha", "source_operation_id", "source_request_id",
+        "source_scope", "accepted_work_unit",
+    )}
+    tampered_intent["pre_effect"] = baseline(governed_repo, governed_base)
+    intent_state_before_source = tampered_state_path.read_bytes()
+    intent_events_before_source = (tampered_state_path.parent / "events.jsonl").read_bytes()
+    tampered_intent_result = command([
+        str(STATE), "operation", governed_run, "intent", "--kind", "local_commit", "--idempotency-key",
+        f"local-commit:{tampered_intent_auth['authorization_id']}:{tampered_intent_auth['authority']}:{tampered_intent_auth['request_id']}",
+        "--authorization-id", tampered_intent_auth["authorization_id"], "--intent-json", json.dumps(tampered_intent),
+        "--expect-revision", "8",
+    ], env=governed_env, ok=False)
+    assert "GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID" in tampered_intent_result.stderr
+    assert tampered_state_path.read_bytes() == intent_state_before_source
+    assert (tampered_state_path.parent / "events.jsonl").read_bytes() == intent_events_before_source
+    tampered_execution = helper(
+        governed_env, governed_run, tampered_grant["authorizations"][-1]["authorization_id"], governed_repo, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID" in tampered_execution
+    assert state(governed_env, "show", governed_run)["revision"] == 8
+    tampered_state_path.write_bytes(tampered_state_before_source)
+    tampered_state = json.loads(tampered_state_before_source)
+    source_operation = next(
+        item for item in tampered_state["pending_operations"] if item.get("operation_id") == accepted_operation
+    )
+    source_operation["effect"]["frontier_decision"] = "REJECT"
+    tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+    reject_mismatch_state = tampered_state_path.read_bytes()
+    reject_mismatch_events = tampered_events_path.read_bytes()
+    reject_mismatch = helper(
+        governed_env, governed_run, tampered_grant["authorizations"][-1]["authorization_id"], governed_repo, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED" in reject_mismatch
+    assert tampered_state_path.read_bytes() == reject_mismatch_state
+    assert tampered_events_path.read_bytes() == reject_mismatch_events
+    tampered_state_path.write_bytes(tampered_state_before_source)
+    tampered_state = json.loads(tampered_state_before_source)
+    source_operation = next(
+        item for item in tampered_state["pending_operations"] if item.get("operation_id") == accepted_operation
+    )
+    source_operation["receipt"]["request_id"] = "tampered-source-request"
+    tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+    tampered_identity = helper(
+        governed_env, governed_run, tampered_grant["authorizations"][-1]["authorization_id"], governed_repo, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID" in tampered_identity
+    assert state(governed_env, "show", governed_run)["revision"] == 8
+    tampered_state_path.write_bytes(tampered_state_before_source)
+    tampered_state = json.loads(tampered_state_before_source)
+    source_operation = next(
+        item for item in tampered_state["pending_operations"] if item.get("operation_id") == accepted_operation
+    )
+    del source_operation["receipt"]["message_id"]
+    tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+    missing_identity_state = tampered_state_path.read_bytes()
+    missing_identity_events = tampered_events_path.read_bytes()
+    missing_identity = helper(
+        governed_env, governed_run, tampered_grant["authorizations"][-1]["authorization_id"], governed_repo, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID" in missing_identity
+    assert tampered_state_path.read_bytes() == missing_identity_state
+    assert tampered_events_path.read_bytes() == missing_identity_events
+    tampered_state_path.write_bytes(tampered_state_before_source)
+    governed_grant_state = create_governed_grant(
+        governed_env, governed_run, governed_repo, governed_branch, governed_base,
+        accepted_operation, "governed-grant", "base.txt", "feat: governed", governed_digest, 8,
+    )
+    governed_auth = governed_grant_state["authorizations"][-1]
+    governed_committed = helper(
+        governed_env, governed_run, governed_auth["authorization_id"], governed_repo,
+    )
+    assert governed_committed["commit_policy"] == "governed"
+    assert governed_committed["push_policy"] == "deny"
+    assert governed_committed["authorizations"][-1]["status"] == "consumed"
+    assert governed_committed["pending_operations"][-1]["status"] == "confirmed"
+    governed_commit_sha = governed_committed["pending_operations"][-1]["receipt"]["commit_sha"]
+    assert git(governed_repo, "rev-parse", "HEAD").stdout.strip() == governed_commit_sha
+    assert governed_committed["repository_root"] == str(governed_repo.resolve())
+    assert governed_committed["branch"] == governed_branch
+    governed_state_path = Path(governed_env["MYRMEX_STATE_HOME"]) / "runs" / governed_run / "state.json"
+    governed_events_path = governed_state_path.parent / "events.jsonl"
+    governed_state_before_replay = governed_state_path.read_bytes()
+    governed_events_before_replay = governed_events_path.read_bytes()
+    command(["git", "-C", str(governed_repo), "read-tree", "HEAD"], env=os.environ.copy())
+    replayed_governed = helper(
+        governed_env, governed_run, governed_auth["authorization_id"], governed_repo,
+    )
+    assert replayed_governed["revision"] == governed_committed["revision"]
+    assert replayed_governed["pending_operations"][-1]["receipt"]["commit_sha"] == governed_commit_sha
+    assert governed_state_path.read_bytes() == governed_state_before_replay
+    assert governed_events_path.read_bytes() == governed_events_before_replay
+
+    # A candidate digest is checked before any operation intent is written.
+    bad_candidate = create_governed_grant(
+        governed_env, governed_run, governed_repo, governed_branch, governed_commit_sha,
+        accepted_operation, "bad-candidate", "base.txt", "feat: governed", "0" * 64, governed_committed["revision"],
+        ok=False,
+    )
+    assert bad_candidate == {}
+    assert state(governed_env, "show", governed_run)["revision"] == governed_committed["revision"]
+    bad_head = create_governed_grant(
+        governed_env, governed_run, governed_repo, governed_branch, governed_base,
+        accepted_operation, "bad-head", "base.txt", "feat: governed", governed_digest,
+        governed_committed["revision"],
+    )
+    bad_head_result = helper(
+        governed_env, governed_run, bad_head["authorizations"][-1]["authorization_id"], governed_repo, ok=False,
+    )
+    assert "AUTHORIZATION_HEAD_IDENTITY_MISMATCH" in bad_head_result
 
 print("local commit authorization tests: PASS")

@@ -176,6 +176,170 @@ def authorization_matches(state: dict[str, Any], authorization_id: str) -> dict[
     fail(f"authorization not found: {authorization_id}")
 
 
+def candidate_diff_digest(repo: Path, auth: dict[str, Any]) -> str:
+    """Hash the exact binary patch selected by the authorization."""
+    output = require_git(
+        repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-color",
+        auth["expected_head"], "--", *auth["allowed_paths"],
+    )
+    untracked: list[str] = []
+    for relative_path in auth["allowed_paths"]:
+        tracked = git(repo, "ls-files", "--error-unmatch", "--", relative_path).returncode == 0
+        if tracked:
+            continue
+        path = safe_worktree_path(repo, relative_path)
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(file_stat.st_mode):
+            content = os.fsencode(os.readlink(path))
+            mode = "120000"
+        elif stat.S_ISREG(file_stat.st_mode):
+            content = path.read_bytes()
+            mode = "100755" if file_stat.st_mode & 0o111 else "100644"
+        else:
+            fail(f"special or directory path is not allowed: {relative_path}")
+        untracked.append(
+            f"UNTRACKED\0{relative_path}\0{mode}\0{hashlib.sha256(content).hexdigest()}\n"
+        )
+    return hashlib.sha256((output + "".join(untracked)).encode()).hexdigest()
+
+
+GOVERNED_SOURCE_ALIAS_KEYS = {
+    "type", "status", "transport", "decision", "response", "response_message_id", "response_id",
+    "plan", "proposed_plan", "next_work_unit", "next_work_unit_id", "completed_work_unit_id",
+    "parent_gate", "parent_gate_intent", "parent_gate_operation", "parent_gate_continuation",
+    "continuation", "continuation_of", "begin_wu", "BEGIN_WU",
+}
+
+
+def require_governed_source_field(source: dict[str, Any], field: str, expected: Any, label: str) -> Any:
+    if field not in source:
+        fail(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is missing")
+    value = source[field]
+    if field in {"operation_id", "request_id", "message_id", "work_unit_id"}:
+        if not isinstance(value, str) or not value:
+            fail(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is invalid")
+    elif field == "response_type" and value != "sub_objective_complete":
+        fail(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} conflicts")
+    elif field == "frontier_decision" and value != "ACCEPT":
+        fail(f"GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED: {label} conflicts")
+    elif field == "transport_status" and value != "success":
+        fail(f"GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED: {label} is not canonical success")
+    if value != expected:
+        fail(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} conflicts")
+    return value
+
+
+def reject_governed_source_markers(state: dict[str, Any], operation: dict[str, Any], effect: dict[str, Any], receipt: dict[str, Any]) -> None:
+    intent = operation.get("intent")
+    if operation.get("kind") != "frontier_exchange" or (
+        isinstance(intent, dict) and (intent.get("parent_gate") is True or intent.get("purpose") == "parent_gate")
+    ):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    operation_id_value = operation.get("operation_id")
+    for gate in [state.get("parent_gate"), *state.get("parent_gate_history", [])]:
+        if isinstance(gate, dict) and gate.get("operation_id") == operation_id_value:
+            fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    next_work_unit = state.get("next_work_unit")
+    if isinstance(next_work_unit, dict):
+        provenance = next_work_unit.get("provenance")
+        if isinstance(provenance, dict) and provenance.get("operation_id") == operation_id_value:
+            fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    operation_markers = {
+        "proposed_plan", "plan", "next_work_unit", "next_work_unit_id", "completed_work_unit_id",
+        "parent_gate", "parent_gate_intent", "parent_gate_operation", "parent_gate_continuation",
+        "continuation", "continuation_of", "begin_wu", "BEGIN_WU",
+    }
+    if any(key in operation for key in operation_markers):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    for source in (intent, effect, receipt):
+        if isinstance(source, dict) and any(key in source for key in GOVERNED_SOURCE_ALIAS_KEYS):
+            fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+
+
+def governed_standing_matches(state: dict[str, Any], auth: dict[str, Any]) -> None:
+    standing = state.get("commit_policy_authorization")
+    if not isinstance(standing, dict) or standing.get("status") != "active":
+        fail("governed local_commit requires an active standing authorization")
+    accepted = auth.get("accepted_work_unit")
+    if not isinstance(accepted, dict):
+        fail("GOVERNED_AUTHORIZATION_ACCEPTED_WU_MISMATCH")
+    source = standing.get("source")
+    if not isinstance(source, dict):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+    if (
+        auth.get("source_operation_id") != source.get("operation_id")
+        or auth.get("source_request_id") != standing.get("source_request_id")
+    ):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+    operation = next(
+        (item for item in state.get("pending_operations", [])
+         if isinstance(item, dict) and item.get("operation_id") == source.get("operation_id")),
+        None,
+    )
+    if not isinstance(operation, dict) or operation.get("kind") != "frontier_exchange":
+        fail("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+    if operation.get("status") != "confirmed" and operation.get("effective_status") != "confirmed":
+        fail("GOVERNED_AUTHORIZATION_SOURCE_NOT_CONFIRMED")
+    effective_outcome = operation.get("effective_outcome")
+    recovered = isinstance(effective_outcome, dict)
+    if recovered:
+        effect = effective_outcome.get("effect")
+        receipt = effective_outcome.get("receipt")
+    else:
+        effect = operation.get("effect")
+        receipt = operation.get("receipt")
+    if not isinstance(effect, dict) or not isinstance(receipt, dict):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_MISSING")
+    reject_governed_source_markers(state, operation, effect, receipt)
+    operation_fields = {
+        "operation_id": operation.get("operation_id"),
+        "request_id": operation.get("effective_request_id" if recovered else "request_id"),
+        "message_id": operation.get("effective_message_id" if recovered else "message_id"),
+        "response_type": operation.get("effective_response_type" if recovered else "response_type"),
+        "frontier_decision": operation.get("effective_frontier_decision" if recovered else "frontier_decision"),
+        "transport_status": operation.get("effective_transport_status" if recovered else "transport_status"),
+        "work_unit_id": operation.get("effective_work_unit_id" if recovered else "work_unit_id"),
+    }
+    source_request = require_governed_source_field(operation_fields, "request_id", operation_fields["request_id"], "operation request_id")
+    source_message = require_governed_source_field(operation_fields, "message_id", operation_fields["message_id"], "operation message_id")
+    require_governed_source_field(operation_fields, "operation_id", operation.get("operation_id"), "operation_id")
+    response_type = require_governed_source_field(operation_fields, "response_type", "sub_objective_complete", "operation response_type")
+    decision = require_governed_source_field(operation_fields, "frontier_decision", "ACCEPT", "operation frontier_decision")
+    transport = require_governed_source_field(operation_fields, "transport_status", "success", "operation transport_status")
+    work_unit_id = require_governed_source_field(operation_fields, "work_unit_id", operation_fields["work_unit_id"], "operation work_unit_id")
+    if recovered:
+        for field in ("request_id", "message_id", "frontier_decision", "transport_status"):
+            require_governed_source_field(effective_outcome, field, operation_fields[field], f"effective outcome {field}")
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: operation intent is missing")
+    require_governed_source_field(intent, "request_id", source_request, "intent request_id")
+    require_governed_source_field(intent, "message_id", source_message, "intent message_id")
+    for label, evidence in (("effect", effect), ("receipt", receipt)):
+        require_governed_source_field(evidence, "operation_id", operation["operation_id"], f"{label} operation_id")
+        require_governed_source_field(evidence, "request_id", source_request, f"{label} request_id")
+        require_governed_source_field(evidence, "message_id", source_message, f"{label} message_id")
+        require_governed_source_field(evidence, "response_type", response_type, f"{label} response_type")
+        require_governed_source_field(evidence, "frontier_decision", decision, f"{label} frontier_decision")
+        require_governed_source_field(evidence, "transport_status", transport, f"{label} transport_status")
+        require_governed_source_field(evidence, "work_unit_id", work_unit_id, f"{label} work_unit_id")
+    source_scope = auth.get("source_scope")
+    if not isinstance(source_scope, dict):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISSING")
+    for key in ("repository_root", "branch", "expected_head", "candidate_diff_sha", "allowed_paths", "commit_message"):
+        if key not in effect or key not in receipt or effect.get(key) != receipt.get(key) or source_scope.get(key) != effect.get(key):
+            fail("GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISMATCH")
+    if source_request != standing.get("source_request_id") or source_message != source.get("message_id"):
+        fail("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+    if source.get("work_unit_id") != work_unit_id or accepted.get("work_unit_id") != auth.get("work_unit_id") or work_unit_id != auth.get("work_unit_id"):
+        fail("GOVERNED_AUTHORIZATION_ACCEPTED_WU_MISMATCH")
+    if accepted.get("repository_root") != auth.get("repository_root") or accepted.get("branch") != auth.get("branch"):
+        fail("GOVERNED_AUTHORIZATION_TARGET_IDENTITY_MISMATCH")
+
+
 def operation_key(auth: dict[str, Any]) -> str:
     return f"local-commit:{auth['authorization_id']}:{auth['authority']}:{auth['request_id']}"
 
@@ -200,6 +364,22 @@ def validate_authorization(state: dict[str, Any], auth: dict[str, Any], repo: Pa
         fail("authorization kind is not local_commit")
     if auth.get("authority") not in {"user", "frontier"}:
         fail("authorization authority is invalid")
+    governed = auth.get("grant_kind") == "governed"
+    if governed:
+        standing = state.get("commit_policy_authorization")
+        if state.get("commit_policy") != "governed" or not isinstance(standing, dict) or standing.get("status") != "active":
+            fail("governed local_commit requires an active standing authorization")
+        governed_standing_matches(state, auth)
+        if auth.get("parent_run_id") != state.get("run_id"):
+            fail("GOVERNED_AUTHORIZATION_PARENT_IDENTITY_MISMATCH")
+        if not isinstance(auth.get("work_unit_id"), str) or not auth.get("work_unit_id"):
+            fail("governed local_commit work-unit identity is missing")
+        if not isinstance(auth.get("candidate_diff_sha"), str) or not re.fullmatch(r"[0-9a-f]{64}", auth["candidate_diff_sha"]):
+            fail("governed local_commit candidate diff digest is invalid")
+        if not isinstance(auth.get("source_operation_id"), str) or not isinstance(auth.get("source_request_id"), str):
+            fail("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+        if not isinstance(auth.get("source_scope"), dict):
+            fail("GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISSING")
     if auth.get("status") != "open":
         fail("authorization is not open")
     if auth.get("max_uses") != 1 or auth.get("consumed_uses") != 0:
@@ -239,6 +419,9 @@ def scope_digest(auth: dict[str, Any]) -> str:
         "allowed_paths": auth.get("allowed_paths"),
         "commit_message": auth.get("commit_message"),
     }
+    for key in ("parent_run_id", "work_unit_id", "candidate_diff_sha"):
+        if auth.get(key) is not None:
+            payload[key] = auth[key]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -295,7 +478,7 @@ def post_effect_mismatch(repo: Path, baseline: dict[str, Any], new_commit_sha: s
 
 
 def intent_for(auth: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    return {
+    intent = {
         "authorization_id": auth["authorization_id"],
         "authority": auth["authority"],
         "request_id": auth["request_id"],
@@ -308,6 +491,13 @@ def intent_for(auth: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]
         "commit_message_digest": auth["commit_message_digest"],
         "pre_effect": baseline,
     }
+    for key in (
+        "grant_kind", "parent_run_id", "work_unit_id", "candidate_diff_sha",
+        "source_operation_id", "source_request_id", "source_scope", "accepted_work_unit",
+    ):
+        if key in auth:
+            intent[key] = auth[key]
+    return intent
 
 
 def discover_commit(repo: Path, head: str, auth: dict[str, Any]) -> dict[str, Any] | None:
@@ -352,6 +542,15 @@ def validate_operation_identity(operation: dict[str, Any], auth: dict[str, Any])
         "commit_message": auth["commit_message"],
         "commit_message_digest": auth["commit_message_digest"],
     }
+    if auth.get("grant_kind") == "governed":
+        expected.update({
+            "grant_kind": "governed", "parent_run_id": auth["parent_run_id"],
+            "work_unit_id": auth["work_unit_id"], "candidate_diff_sha": auth["candidate_diff_sha"],
+            "source_operation_id": auth["source_operation_id"],
+            "source_request_id": auth["source_request_id"],
+            "source_scope": auth["source_scope"],
+            "accepted_work_unit": auth["accepted_work_unit"],
+        })
     intent = operation.get("intent")
     if (
         operation.get("operation_id") != operation_id(auth)
@@ -375,6 +574,12 @@ def validate_commit_record(record: Any, auth: dict[str, Any], commit: dict[str, 
         "branch": auth["branch"],
         "paths": auth["allowed_paths"],
     }
+    if auth.get("grant_kind") == "governed":
+        expected.update({
+            "work_unit_id": auth["work_unit_id"],
+            "candidate_diff_sha": auth["candidate_diff_sha"],
+            "source_scope": auth["source_scope"],
+        })
     if not receipt:
         expected["parent_sha"] = auth["expected_head"]
     if any(record.get(key) != value for key, value in expected.items()):
@@ -448,6 +653,17 @@ def finish_operation(
         "commit_sha": commit["commit_sha"], "branch": auth["branch"], "paths": commit["paths"],
         "tree_sha": commit["tree_sha"], "message": commit["message"], "push": "not_requested",
     }
+    if auth.get("grant_kind") == "governed":
+        effect.update({
+            "parent_run_id": auth["parent_run_id"], "work_unit_id": auth["work_unit_id"],
+            "candidate_diff_sha": auth["candidate_diff_sha"],
+            "source_scope": auth["source_scope"],
+        })
+        receipt.update({
+            "parent_run_id": auth["parent_run_id"], "work_unit_id": auth["work_unit_id"],
+            "candidate_diff_sha": auth["candidate_diff_sha"],
+            "source_scope": auth["source_scope"],
+        })
     state = state_show(state_bin, env, run_id)
     op = operation_for(state, op_id)
     if op is None:
@@ -734,8 +950,16 @@ def run_local_commit(args: argparse.Namespace) -> int:
     env = safe_git_environment(repo)
     state = state_show(state_bin, env, args.run_id)
     auth = authorization_matches(state, args.authorization_id)
-    if state.get("commit_policy") != "authorized":
-        fail("local_commit requires commit_policy=authorized")
+    if state.get("commit_policy") not in {"authorized", "governed"}:
+        fail("local_commit requires a governed commit policy")
+    if state.get("commit_policy") == "governed" and auth.get("grant_kind") != "governed":
+        fail("GOVERNED_LOCAL_COMMIT_GRANT_REQUIRED")
+    if auth.get("grant_kind") == "governed":
+        if state.get("commit_policy") != "governed" or state.get("status") != "active":
+            fail("governed local_commit requires an active parent run")
+        standing = state.get("commit_policy_authorization")
+        if not isinstance(standing, dict) or standing.get("status") != "active":
+            fail("governed local_commit requires an active standing authorization")
     if not repo.is_dir() or not (repo / ".git").exists():
         fail("repository_root is not a Git repository")
     if auth.get("repository_root") != str(repo):
@@ -759,6 +983,12 @@ def run_local_commit(args: argparse.Namespace) -> int:
             print(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True))
             return 0
         validate_authorization(state, auth, repo, branch, auth["expected_head"], message)
+        if auth.get("grant_kind") == "governed":
+            actual_candidate_digest = candidate_diff_digest(repo, auth)
+            if args.candidate_diff_sha is not None and args.candidate_diff_sha != actual_candidate_digest:
+                fail("CANDIDATE_DIFF_IDENTITY_MISMATCH")
+            if auth.get("candidate_diff_sha") != actual_candidate_digest:
+                fail("CANDIDATE_DIFF_IDENTITY_MISMATCH")
         if existing_operation is not None:
             validate_operation_identity(existing_operation, auth)
         if head != auth["expected_head"]:
@@ -813,6 +1043,8 @@ def run_local_commit(args: argparse.Namespace) -> int:
                 str(item) for item in state.get("protected_dirty_paths", []) if isinstance(item, str)
             ]
             validate_preflight_scope(repo, auth, protected_paths, real_index_path, real_index_before)
+            if auth.get("grant_kind") == "governed" and candidate_diff_digest(repo, auth) != auth.get("candidate_diff_sha"):
+                fail("CANDIDATE_DIFF_IDENTITY_MISMATCH")
             commit = discover_unreferenced_commit(repo, auth)
             if commit is None:
                 commit = create_commit_object(
@@ -853,6 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
     commit.add_argument("--authorization-id", required=True)
     commit.add_argument("--repository-root", required=True)
     commit.add_argument("--message")
+    commit.add_argument("--candidate-diff-sha")
     commit.add_argument("--state-bin", default=str(DEFAULT_STATE))
     commit.set_defaults(func=run_local_commit)
     return parser

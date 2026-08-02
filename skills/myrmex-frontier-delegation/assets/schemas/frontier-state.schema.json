@@ -151,8 +151,66 @@
       "enum": [
         "deny",
         "ask",
-        "authorized"
+        "authorized",
+        "governed"
       ]
+    },
+    "commit_policy_authorization": {
+      "type": ["object", "null"],
+      "required": [
+        "authorization_id",
+        "authority",
+        "source_request_id",
+        "scope",
+        "source",
+        "accepted_work_unit",
+        "status",
+        "authorized_at",
+        "audit_history"
+      ],
+      "properties": {
+        "authorization_id": {"type": "string", "pattern": "^policy-auth-[0-9a-f]{24}$"},
+        "authority": {"const": "user"},
+        "source_request_id": {"type": "string", "minLength": 1},
+        "scope": {
+          "type": "object",
+          "required": ["parent_run_id", "parent_objective", "repository_root", "branch"],
+          "properties": {
+            "parent_run_id": {"type": "string", "minLength": 1},
+            "parent_objective": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "source": {
+          "type": "object",
+          "required": ["operation_id", "request_id", "message_id", "work_unit_id", "response_type", "frontier_decision"],
+          "properties": {
+            "operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+            "request_id": {"type": "string", "minLength": 1},
+            "message_id": {"type": "string", "minLength": 1},
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "response_type": {"const": "sub_objective_complete"},
+            "frontier_decision": {"const": "ACCEPT"}
+          },
+          "additionalProperties": false
+        },
+        "accepted_work_unit": {
+          "type": "object",
+          "required": ["work_unit_id", "repository_root", "branch"],
+          "properties": {
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "status": {"enum": ["active", "revoked"]},
+        "authorized_at": {"type": "string", "format": "date-time"},
+        "audit_history": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+      },
+      "additionalProperties": false
     },
     "push_policy": {
       "enum": [
@@ -1080,6 +1138,35 @@
           "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
           "commit_message": {"type": "string", "minLength": 1},
           "commit_message_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "grant_kind": {"enum": ["governed"]},
+          "parent_run_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+          "source_request_id": {"type": "string", "minLength": 1},
+          "source_scope": {
+            "type": "object",
+            "required": ["repository_root", "branch", "expected_head", "candidate_diff_sha", "allowed_paths", "commit_message"],
+            "properties": {
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1},
+              "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+              "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+              "commit_message": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          },
+          "accepted_work_unit": {
+            "type": "object",
+            "required": ["work_unit_id", "repository_root", "branch"],
+            "properties": {
+              "work_unit_id": {"type": "string", "minLength": 1},
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          },
           "max_uses": {"const": 1},
           "consumed_uses": {"type": "integer", "minimum": 0},
           "expires_at": {"type": ["string", "null"], "format": "date-time"},
@@ -1139,6 +1226,12 @@
               "abandoned"
             ]
           },
+          "request_id": {"type": "string", "minLength": 1},
+          "message_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "effective_request_id": {"type": "string", "minLength": 1},
+          "effective_message_id": {"type": "string", "minLength": 1},
+          "effective_work_unit_id": {"type": "string", "minLength": 1},
           "intent": {
             "type": "object"
           },

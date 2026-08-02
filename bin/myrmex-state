@@ -37,7 +37,7 @@ PHASES = {
     "consolidating-evidence", "proceeding-to-next-gate",
 }
 STATUSES = {"active", "blocked", "dormant", "failed", "cancelled", "superseded"}
-POLICIES = {"deny", "ask", "authorized"}
+POLICIES = {"deny", "ask", "authorized", "governed"}
 EXECUTION_POLICIES = {"auto", "direct-only", "delegated", "frontier"}
 EFFECTIVE_ROUTES = {"auto", "direct", "delegated", "frontier"}
 EXECUTION_ROUTE = {
@@ -144,6 +144,8 @@ GITHUB_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d
 TRACKING_BODY_LINK_RE = re.compile(r"<!--\s*myrmex:tracking-issue-url=(https://github\.com/[^\s]+/issues/\d+)\s*-->")
 AUTHORIZATION_AUTHORITIES = {"user", "frontier"}
 AUTHORIZATION_STATUSES = {"open", "consumed", "expired", "revoked"}
+STANDING_AUTHORITY = "user"
+STANDING_AUTHORIZATION_ID_RE = re.compile(r"policy-auth-[0-9a-f]{24}")
 # `patch` is retained only for non-critical metadata while the state-machine
 # commands are introduced incrementally. These prefixes are intentionally
 # checked before applying a dotted key so a caller cannot bypass a domain
@@ -175,6 +177,7 @@ PROTECTED_PATCH_PATHS = {
     "remediation",
     "correction",
     "authorizations",
+    "commit_policy_authorization",
     "pending_operations",
     "recovery_history",
     "effective_outcome",
@@ -342,6 +345,8 @@ def ensure_v2_defaults(data: dict[str, Any]) -> None:
         data["pending_operations"] = []
     if state_is_v2(data) and "authorizations" not in data:
         data["authorizations"] = []
+    if state_is_v2(data) and "commit_policy_authorization" not in data:
+        data["commit_policy_authorization"] = None
     if state_is_v2(data) and "parent_gate" not in data:
         data["parent_gate"] = None
     if state_is_v2(data) and "parent_gate_history" not in data:
@@ -514,6 +519,8 @@ def normalize_allowed_paths(values: list[str] | None) -> list[str]:
 
 def authorization_scope_digest(
     repository_root: str, branch: str, expected_head: str, allowed_paths: list[str], message: str,
+    *, parent_run_id: str | None = None, work_unit_id: str | None = None,
+    candidate_diff_sha: str | None = None,
 ) -> str:
     payload = {
         "repository_root": repository_root,
@@ -522,6 +529,12 @@ def authorization_scope_digest(
         "allowed_paths": allowed_paths,
         "commit_message": message,
     }
+    if parent_run_id is not None:
+        payload["parent_run_id"] = parent_run_id
+    if work_unit_id is not None:
+        payload["work_unit_id"] = work_unit_id
+    if candidate_diff_sha is not None:
+        payload["candidate_diff_sha"] = candidate_diff_sha
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -584,7 +597,44 @@ def validate_authorizations(data: dict[str, Any], *, required: bool) -> None:
         scope_digest = authorization.get("scope_digest")
         if not isinstance(scope_digest, str) or not SHA256_RE.fullmatch(scope_digest):
             raise SystemExit("authorization scope_digest is invalid")
-        expected_scope = authorization_scope_digest(repository_root, authorization["branch"], authorization["expected_head"], allowed_paths, message)
+        governed = authorization.get("grant_kind") == "governed" or "work_unit_id" in authorization
+        parent_run_id = authorization.get("parent_run_id")
+        work_unit_id = authorization.get("work_unit_id")
+        candidate_diff_sha = authorization.get("candidate_diff_sha")
+        if governed:
+            if parent_run_id != data.get("run_id"):
+                raise SystemExit("governed authorization parent_run_id must match the parent run")
+            require_work_unit_id(work_unit_id)
+            if not isinstance(candidate_diff_sha, str) or not SHA256_RE.fullmatch(candidate_diff_sha):
+                raise SystemExit("governed authorization candidate_diff_sha is invalid")
+            for key in ("source_operation_id", "source_request_id"):
+                if not isinstance(authorization.get(key), str) or not authorization[key]:
+                    raise SystemExit(f"governed authorization {key} is required")
+            accepted_wu = authorization.get("accepted_work_unit")
+            if not isinstance(accepted_wu, dict) or accepted_wu.get("work_unit_id") != work_unit_id:
+                raise SystemExit("governed authorization accepted_work_unit is invalid")
+            for key in ("repository_root", "branch"):
+                if not isinstance(accepted_wu.get(key), str) or not accepted_wu[key]:
+                    raise SystemExit(f"governed authorization accepted_work_unit {key} is required")
+            if accepted_wu["repository_root"] != repository_root or accepted_wu["branch"] != authorization["branch"]:
+                raise SystemExit("governed authorization target identity does not match accepted work unit")
+            source_scope = authorization.get("source_scope")
+            expected_source_scope = {
+                "repository_root": repository_root,
+                "branch": authorization["branch"],
+                "expected_head": authorization["expected_head"],
+                "candidate_diff_sha": candidate_diff_sha,
+                "allowed_paths": allowed_paths,
+                "commit_message": message,
+            }
+            if source_scope != expected_source_scope:
+                raise SystemExit("governed authorization source_scope does not match grant identity")
+        expected_scope = authorization_scope_digest(
+            repository_root, authorization["branch"], authorization["expected_head"], allowed_paths, message,
+            parent_run_id=parent_run_id if governed else None,
+            work_unit_id=work_unit_id if governed else None,
+            candidate_diff_sha=candidate_diff_sha if governed else None,
+        )
         if scope_digest != expected_scope:
             raise SystemExit("authorization scope_digest does not match authorization scope")
         for key in ("max_uses", "consumed_uses"):
@@ -610,6 +660,62 @@ def validate_authorizations(data: dict[str, Any], *, required: bool) -> None:
             raise SystemExit("open authorization cannot have consumed_at")
         if authorization["status"] in {"consumed", "expired", "revoked"} and consumed_at is None:
             raise SystemExit("closed authorization requires consumed_at")
+
+
+def validate_commit_policy_authorization(data: dict[str, Any], *, required: bool) -> None:
+    standing = data.get("commit_policy_authorization")
+    if standing is None:
+        if required:
+            raise SystemExit("governed commit policy requires a standing authorization")
+        return
+    if not isinstance(standing, dict):
+        raise SystemExit("commit_policy_authorization must be an object or null")
+    authorization_id_value = standing.get("authorization_id")
+    if not isinstance(authorization_id_value, str) or not STANDING_AUTHORIZATION_ID_RE.fullmatch(authorization_id_value):
+        raise SystemExit("standing commit policy authorization has an invalid authorization_id")
+    if standing.get("authority") != STANDING_AUTHORITY:
+        raise SystemExit("standing commit policy authorization requires human authority")
+    for key in ("source_request_id", "authorized_at"):
+        if not isinstance(standing.get(key), str) or not standing[key]:
+            raise SystemExit(f"standing commit policy authorization {key} is required")
+    parse_authorization_expiry(standing["authorized_at"])
+    if standing.get("status") not in {"active", "revoked"}:
+        raise SystemExit("standing commit policy authorization has an invalid status")
+    scope = standing.get("scope")
+    if not isinstance(scope, dict):
+        raise SystemExit("standing commit policy authorization scope is required")
+    expected_scope = {
+        "parent_run_id": data.get("run_id"),
+        "repository_root": data.get("repository_root"),
+        "branch": data.get("branch"),
+    }
+    if any(scope.get(key) != value for key, value in expected_scope.items()):
+        raise SystemExit("standing commit policy authorization scope does not match the parent")
+    if not isinstance(scope.get("parent_objective"), str) or not scope["parent_objective"]:
+        raise SystemExit("standing commit policy authorization parent objective is required")
+    source = standing.get("source")
+    if not isinstance(source, dict):
+        raise SystemExit("standing commit policy authorization source is required")
+    for key in ("operation_id", "request_id", "message_id", "work_unit_id", "response_type", "frontier_decision"):
+        if not isinstance(source.get(key), str) or not source[key]:
+            raise SystemExit(f"standing commit policy authorization source {key} is required")
+    if source.get("request_id") != standing["source_request_id"]:
+        raise SystemExit("standing commit policy authorization source request mismatch")
+    if source.get("response_type") != "sub_objective_complete" or source.get("frontier_decision") != "ACCEPT":
+        raise SystemExit("standing commit policy authorization requires SUB_OBJECTIVE_COMPLETE/ACCEPT evidence")
+    accepted_wu = standing.get("accepted_work_unit")
+    if not isinstance(accepted_wu, dict) or accepted_wu.get("work_unit_id") != source["work_unit_id"]:
+        raise SystemExit("standing commit policy authorization accepted work unit is invalid")
+    for key in ("repository_root", "branch"):
+        if not isinstance(accepted_wu.get(key), str) or not accepted_wu[key]:
+            raise SystemExit(f"standing commit policy authorization accepted work unit {key} is required")
+    audit_history = standing.get("audit_history")
+    if not isinstance(audit_history, list) or not audit_history:
+        raise SystemExit("standing commit policy authorization audit_history is required")
+    if not all(isinstance(entry, dict) for entry in audit_history):
+        raise SystemExit("standing commit policy authorization audit_history entries must be objects")
+    if data.get("commit_policy") == "governed" and standing.get("status") != "active" and data.get("status") not in TERMINAL_RUN_STATUSES:
+        raise SystemExit("active governed commit policy requires an active standing authorization")
 
 
 def write_state(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
@@ -1026,6 +1132,7 @@ def validate_state(data: dict[str, Any]) -> None:
     validate_pending_operations(data, required=False)
     validate_frontier_artifact_roots(data)
     validate_authorizations(data, required=False)
+    validate_commit_policy_authorization(data, required=data.get("commit_policy") == "governed")
     if not isinstance(data.get("budgets"), dict):
         raise SystemExit("budgets must be an object")
     validate_continuity_state(data)
@@ -1289,6 +1396,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    if args.commit_policy == "governed":
+        raise SystemExit("commit_policy=governed requires commit-policy authorize")
     if bool(args.objective) == bool(args.objective_file):
         raise SystemExit("provide exactly one of --objective or --objective-file")
     objective = args.objective
@@ -1359,6 +1468,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "receipts": {},
         "pending_operations": [],
         "authorizations": [],
+        "commit_policy_authorization": None,
         "delegation_ledger": [],
         "delegation_batches": [],
         "attempts": {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0},
@@ -1691,7 +1801,9 @@ FRONTIER_METADATA_KEYS = {
     "artifact_root", "blocker", "chat_url", "clarification", "frontier_decision",
     "message_id", "poll_count", "proposed_plan", "recovery_actions", "request_id",
     "response_digest", "response_id", "response_message_id", "response_type", "scope",
-    "stable", "status", "task_id", "transport_status", "type",
+    "stable", "status", "task_id", "transport_status", "type", "work_unit_id",
+    "repository_root", "branch", "expected_head", "candidate_diff_sha",
+    "allowed_paths", "commit_message",
 }
 
 
@@ -2272,8 +2384,17 @@ def cmd_operation(args: argparse.Namespace) -> int:
             expected_key = f"local-commit:{args.authorization_id}:{authorization.get('authority')}:{authorization.get('request_id')}"
             if args.idempotency_key != expected_key:
                 raise SystemExit("LOCAL_COMMIT_OPERATION_IDENTITY_MISMATCH")
-            if data.get("commit_policy") != "authorized" or authorization.get("status") != "open":
-                raise SystemExit("local_commit intent requires an open authorized commit policy")
+            if data.get("commit_policy") not in {"authorized", "governed"}:
+                raise SystemExit("local_commit intent requires an open governed commit grant")
+            if data.get("commit_policy") == "governed":
+                if authorization.get("grant_kind") != "governed":
+                    raise SystemExit("GOVERNED_LOCAL_COMMIT_GRANT_REQUIRED")
+                standing = data.get("commit_policy_authorization")
+                if not isinstance(standing, dict) or standing.get("status") != "active":
+                    raise SystemExit("local_commit intent requires an active standing commit policy authorization")
+                validate_governed_authorization_source(data, authorization)
+            if authorization.get("status") != "open":
+                raise SystemExit("local_commit intent requires an open governed commit grant")
             if authorization_is_expired(authorization):
                 raise SystemExit("AUTHORIZATION_EXPIRED")
         require_operation_route(data, args.kind)
@@ -2438,6 +2559,351 @@ def find_authorization(data: dict[str, Any], authorization_id_value: str) -> dic
     raise SystemExit(f"authorization not found: {authorization_id_value}")
 
 
+GOVERNED_SOURCE_ALIAS_KEYS = {
+    "type", "status", "transport", "decision", "response", "response_message_id", "response_id",
+    "plan", "proposed_plan", "next_work_unit", "next_work_unit_id", "completed_work_unit_id",
+    "parent_gate", "parent_gate_intent", "parent_gate_operation", "parent_gate_continuation",
+    "continuation", "continuation_of", "begin_wu", "BEGIN_WU",
+}
+
+
+def matching_work_unit_id(effect: dict[str, Any], receipt: dict[str, Any]) -> str | None:
+    values = [source.get("work_unit_id") for source in (effect, receipt)]
+    if all(isinstance(value, str) and value for value in values) and values[0] == values[1]:
+        return values[0]
+    return None
+
+
+def reject_governed_source_markers(data: dict[str, Any], operation: dict[str, Any], effect: dict[str, Any], receipt: dict[str, Any]) -> None:
+    if operation.get("kind") != "frontier_exchange" or is_parent_gate_operation(operation):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    operation_id_value = operation.get("operation_id")
+    for gate in [data.get("parent_gate"), *data.get("parent_gate_history", [])]:
+        if isinstance(gate, dict) and gate.get("operation_id") == operation_id_value:
+            raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    next_work_unit = data.get("next_work_unit")
+    if isinstance(next_work_unit, dict):
+        provenance = next_work_unit.get("provenance")
+        if isinstance(provenance, dict) and provenance.get("operation_id") == operation_id_value:
+            raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    sources = [operation.get("intent"), effect, receipt]
+    operation_markers = {
+        "proposed_plan", "plan", "next_work_unit", "next_work_unit_id", "completed_work_unit_id",
+        "parent_gate", "parent_gate_intent", "parent_gate_operation", "parent_gate_continuation",
+        "continuation", "continuation_of", "begin_wu", "BEGIN_WU",
+    }
+    if any(key in operation for key in operation_markers):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if any(key in source for key in GOVERNED_SOURCE_ALIAS_KEYS):
+            raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+
+
+def require_governed_source_field(source: dict[str, Any], field: str, expected: Any, label: str) -> Any:
+    if field not in source:
+        raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is missing")
+    value = source[field]
+    if field == "response_type":
+        try:
+            value = normalize_frontier_response_type(value)
+        except SystemExit as exc:
+            raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is malformed") from exc
+    elif field == "frontier_decision":
+        try:
+            value = normalize_frontier_decision(value)
+        except SystemExit as exc:
+            raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is malformed") from exc
+    elif field == "transport_status":
+        if value != "success":
+            raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED: {label} is not canonical success")
+    elif field in {"operation_id", "request_id", "message_id", "work_unit_id"}:
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} is invalid")
+    if value != expected:
+        raise SystemExit(f"GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: {label} conflicts")
+    return value
+
+
+def source_operation_for_accepted_work_unit(
+    data: dict[str, Any], *, operation_id_value: str | None, request_id: str | None,
+    require_commit_scope: bool = False,
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for operation in data.get("pending_operations", []):
+        if not isinstance(operation, dict):
+            continue
+        if operation_id_value is not None and operation.get("operation_id") == operation_id_value:
+            candidates = [operation]
+            break
+        if operation_id_value is None and request_id is not None:
+            identity = frontier_operation_identity(operation)
+            if identity.get("request_id") == request_id:
+                candidates.append(operation)
+    if not candidates:
+        raise SystemExit("accepted work-unit source operation was not found")
+    operation = candidates[0]
+    if operation.get("kind") != "frontier_exchange" or operation.get("status") != "confirmed":
+        if operation.get("effective_status") != "confirmed":
+            raise SystemExit("accepted work-unit source operation is not confirmed")
+    effective_outcome = operation.get("effective_outcome")
+    recovered = isinstance(effective_outcome, dict)
+    if recovered:
+        effect = effective_outcome.get("effect")
+        receipt = effective_outcome.get("receipt")
+    else:
+        effect = operation.get("effect")
+        receipt = operation.get("receipt")
+    if not isinstance(effect, dict) or not isinstance(receipt, dict):
+        raise SystemExit("accepted work-unit source operation lacks effect and receipt")
+    reject_governed_source_markers(data, operation, effect, receipt)
+    operation_fields = {
+        "operation_id": operation.get("operation_id"),
+        "request_id": operation.get("effective_request_id" if recovered else "request_id"),
+        "message_id": operation.get("effective_message_id" if recovered else "message_id"),
+        "response_type": operation.get("effective_response_type" if recovered else "response_type"),
+        "frontier_decision": operation.get("effective_frontier_decision" if recovered else "frontier_decision"),
+        "transport_status": operation.get("effective_transport_status" if recovered else "transport_status"),
+        "work_unit_id": operation.get("effective_work_unit_id" if recovered else "work_unit_id"),
+    }
+    source_request = require_governed_source_field(operation_fields, "request_id", operation_fields["request_id"], "operation request_id")
+    message_id = require_governed_source_field(operation_fields, "message_id", operation_fields["message_id"], "operation message_id")
+    require_governed_source_field(operation_fields, "operation_id", operation.get("operation_id"), "operation_id")
+    response_type = require_governed_source_field(operation_fields, "response_type", "sub_objective_complete", "operation response_type")
+    decision = require_governed_source_field(operation_fields, "frontier_decision", "ACCEPT", "operation frontier_decision")
+    transport = require_governed_source_field(operation_fields, "transport_status", "success", "operation transport_status")
+    work_unit_id = require_work_unit_id(require_governed_source_field(
+        operation_fields, "work_unit_id", operation_fields["work_unit_id"], "operation work_unit_id",
+    ))
+    if recovered:
+        for field in ("request_id", "message_id", "frontier_decision", "transport_status"):
+            require_governed_source_field(effective_outcome, field, operation_fields[field], f"effective outcome {field}")
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_EVIDENCE_INVALID: operation intent is missing")
+    require_governed_source_field(intent, "request_id", source_request, "intent request_id")
+    require_governed_source_field(intent, "message_id", message_id, "intent message_id")
+    for label, source in (("effect", effect), ("receipt", receipt)):
+        require_governed_source_field(source, "operation_id", operation["operation_id"], f"{label} operation_id")
+        require_governed_source_field(source, "request_id", source_request, f"{label} request_id")
+        require_governed_source_field(source, "message_id", message_id, f"{label} message_id")
+        require_governed_source_field(source, "response_type", response_type, f"{label} response_type")
+        require_governed_source_field(source, "frontier_decision", decision, f"{label} frontier_decision")
+        require_governed_source_field(source, "transport_status", transport, f"{label} transport_status")
+        require_governed_source_field(source, "work_unit_id", work_unit_id, f"{label} work_unit_id")
+    work_unit = data.get("work_units", {}).get(work_unit_id)
+    if not isinstance(work_unit, dict) or work_unit.get("status") in {"blocked", "cancelled", "legacy-ambiguous"}:
+        raise SystemExit("accepted work-unit is not persisted and usable")
+
+    matching_entries = [
+        entry for entry in data.get("delegation_ledger", [])
+        if isinstance(entry, dict) and entry.get("work_unit_id") == work_unit_id
+    ]
+    entry = matching_entries[-1] if matching_entries else {}
+    target_root = None
+    target_branch = None
+    for source in (effect, receipt, intent if isinstance(intent, dict) else {}, work_unit, entry):
+        if not isinstance(source, dict):
+            continue
+        target_root = target_root or source.get("repository_root") or source.get("workspace_repository_root")
+        target_branch = target_branch or source.get("branch") or source.get("workspace_branch") or source.get("target_branch")
+    if target_root is None:
+        target_root = entry.get("workspace") or data.get("repository_root")
+    if target_branch is None:
+        target_branch = data.get("branch")
+    target_root = normalize_repository_path(str(target_root), "accepted work-unit repository root")
+    if not isinstance(target_branch, str) or not target_branch:
+        raise SystemExit("accepted work-unit branch is required")
+    source_scope: dict[str, Any] | None = None
+    if require_commit_scope:
+        source_scope = {}
+        for key in ("repository_root", "branch", "expected_head", "candidate_diff_sha", "allowed_paths", "commit_message"):
+            values = [source[key] for source in (effect, receipt) if key in source]
+            if len(values) != 2 or values[0] != values[1]:
+                raise SystemExit(f"accepted work-unit source {key} identity is missing or conflicting")
+            source_scope[key] = values[0]
+        source_scope["repository_root"] = normalize_repository_path(
+            source_scope["repository_root"], "accepted work-unit source repository root",
+        )
+        source_scope["expected_head"] = require_candidate_sha(
+            source_scope["expected_head"], "accepted work-unit source expected head",
+        )
+        source_scope["candidate_diff_sha"] = require_scope_digest(
+            source_scope["candidate_diff_sha"], "accepted work-unit source candidate diff SHA",
+        )
+        source_scope["allowed_paths"] = normalize_allowed_paths(source_scope["allowed_paths"])
+        if source_scope["repository_root"] != target_root or source_scope["branch"] != target_branch:
+            raise SystemExit("accepted work-unit source target identity conflicts with persisted WU")
+        if not isinstance(source_scope["commit_message"], str) or not source_scope["commit_message"]:
+            raise SystemExit("accepted work-unit source commit message is invalid")
+    return {
+        "operation_id": operation["operation_id"], "request_id": source_request,
+        "message_id": message_id, "work_unit_id": work_unit_id,
+        "response_type": response_type, "frontier_decision": "ACCEPT",
+        "repository_root": target_root, "branch": target_branch,
+        "source_scope": source_scope,
+    }
+
+
+def validate_governed_authorization_source(
+    data: dict[str, Any], authorization: dict[str, Any],
+) -> dict[str, Any]:
+    standing = data.get("commit_policy_authorization")
+    standing_source = standing.get("source") if isinstance(standing, dict) else None
+    if (
+        not isinstance(standing_source, dict)
+        or authorization.get("source_operation_id") != standing_source.get("operation_id")
+        or authorization.get("source_request_id") != standing_source.get("request_id")
+    ):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+    accepted = source_operation_for_accepted_work_unit(
+        data,
+        operation_id_value=authorization.get("source_operation_id"),
+        request_id=authorization.get("source_request_id"),
+        require_commit_scope=True,
+    )
+    if accepted["response_type"] != "sub_objective_complete":
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+    expected_scope = {
+        "repository_root": authorization.get("repository_root"),
+        "branch": authorization.get("branch"),
+        "expected_head": authorization.get("expected_head"),
+        "candidate_diff_sha": authorization.get("candidate_diff_sha"),
+        "allowed_paths": authorization.get("allowed_paths"),
+        "commit_message": authorization.get("commit_message"),
+    }
+    if accepted["request_id"] != authorization.get("source_request_id"):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_REQUEST_MISMATCH")
+    if accepted["work_unit_id"] != authorization.get("work_unit_id"):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_WU_MISMATCH")
+    if accepted["repository_root"] != authorization.get("repository_root") or accepted["branch"] != authorization.get("branch"):
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_TARGET_MISMATCH")
+    if accepted.get("source_scope") != expected_scope:
+        raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISMATCH")
+    return accepted
+
+
+def standing_authorization_id(authority: str, source_request_id: str, scope: dict[str, Any]) -> str:
+    encoded = json.dumps({"authority": authority, "source_request_id": source_request_id, "scope": scope}, sort_keys=True, separators=(",", ":"))
+    return "policy-auth-" + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+
+
+def disable_commit_policy_authorization(data: dict[str, Any], reason: str) -> None:
+    standing = data.get("commit_policy_authorization")
+    if not isinstance(standing, dict) or standing.get("status") != "active":
+        return
+    standing["status"] = "revoked"
+    standing.setdefault("audit_history", []).append({
+        "event": "disabled", "reason": reason, "recorded_at": utcnow(),
+    })
+
+
+def revoke_legacy_local_commit_authorizations(data: dict[str, Any]) -> list[str]:
+    """Close pre-governed grants before enabling the governed policy."""
+    revoked: list[str] = []
+    now = utcnow()
+    for authorization in data.get("authorizations", []):
+        if not isinstance(authorization, dict):
+            continue
+        if (
+            authorization.get("kind") == "local_commit"
+            and authorization.get("status") == "open"
+            and authorization.get("grant_kind") != "governed"
+        ):
+            authorization["status"] = "revoked"
+            authorization["consumed_at"] = now
+            revoked.append(str(authorization.get("authorization_id")))
+    return revoked
+
+
+def cmd_commit_policy(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "commit-policy")
+    ensure_v2_defaults(data)
+    validate_state(data)
+    if args.commit_policy_action != "authorize":
+        raise SystemExit("unsupported commit-policy action")
+    require_active_run(data, "commit-policy authorize")
+    if not is_continuous_parent(data):
+        raise SystemExit("standing commit authorization requires a continuous parent objective")
+    if data.get("push_policy") != "deny":
+        raise SystemExit("standing commit authorization requires push_policy=deny")
+    if args.authority != STANDING_AUTHORITY:
+        raise SystemExit("standing commit authorization requires human authority=user")
+    source_request_id = args.source_request_id or args.request_id
+    if not isinstance(source_request_id, str) or not source_request_id:
+        raise SystemExit("--source-request-id is required")
+    work_unit_id = require_work_unit_id(args.work_unit_id)
+    accepted = source_operation_for_accepted_work_unit(
+        data, operation_id_value=args.source_operation_id, request_id=source_request_id,
+    )
+    if accepted["response_type"] != "sub_objective_complete":
+        raise SystemExit("standing commit authorization requires SUB_OBJECTIVE_COMPLETE/ACCEPT evidence")
+    if accepted["request_id"] != source_request_id or accepted["work_unit_id"] != work_unit_id:
+        raise SystemExit("standing commit authorization source identity mismatch")
+    if data.get("branch") is None or not isinstance(data.get("branch"), str) or not data["branch"]:
+        raise SystemExit("standing commit authorization requires a persisted parent branch")
+    scope = {
+        "parent_run_id": data["run_id"],
+        "parent_objective": data["parent_objective"],
+        "repository_root": data["repository_root"],
+        "branch": data["branch"],
+    }
+    auth_id = standing_authorization_id(STANDING_AUTHORITY, source_request_id, scope)
+    expected = {
+        "authorization_id": auth_id,
+        "authority": STANDING_AUTHORITY,
+        "source_request_id": source_request_id,
+        "scope": scope,
+        "source": {key: accepted[key] for key in (
+            "operation_id", "request_id", "message_id", "work_unit_id", "response_type", "frontier_decision",
+        )},
+        "accepted_work_unit": {
+            "work_unit_id": accepted["work_unit_id"],
+            "repository_root": accepted["repository_root"],
+            "branch": accepted["branch"],
+        },
+    }
+    existing = data.get("commit_policy_authorization")
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise SystemExit("COMMIT_POLICY_AUTHORIZATION_CONFLICT")
+        compare_keys = ("authorization_id", "authority", "source_request_id", "scope", "source", "accepted_work_unit")
+        if any(existing.get(key) != expected[key] for key in compare_keys):
+            raise SystemExit("COMMIT_POLICY_AUTHORIZATION_CONFLICT")
+        if existing.get("status") != "active" or data.get("commit_policy") != "governed":
+            raise SystemExit("COMMIT_POLICY_AUTHORIZATION_CONFLICT")
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    revoked_legacy = revoke_legacy_local_commit_authorizations(data)
+    now = utcnow()
+    standing = {
+        **expected,
+        "status": "active",
+        "authorized_at": now,
+        "audit_history": [{
+            "event": "authorized", "authority": STANDING_AUTHORITY,
+            "source_request_id": source_request_id, "recorded_at": now,
+        }],
+    }
+    standing["audit_history"].extend({
+        "event": "legacy_grant_revoked", "authorization_id": authorization_id_value,
+        "recorded_at": now,
+    } for authorization_id_value in revoked_legacy)
+    data["commit_policy_authorization"] = standing
+    data["commit_policy"] = "governed"
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "commit_policy.authorized", "standing governed commit authorization created", {
+        "authorization_id": auth_id, "authority": STANDING_AUTHORITY,
+        "source_request_id": source_request_id, "work_unit_id": work_unit_id,
+        "revoked_legacy_authorization_ids": revoked_legacy,
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def authorization_is_expired(authorization: dict[str, Any]) -> bool:
     expires_at = parse_authorization_expiry(authorization.get("expires_at"))
     return expires_at is not None and expires_at <= dt.datetime.now(dt.timezone.utc)
@@ -2459,6 +2925,16 @@ def authorization_operation_matches(authorization: dict[str, Any], operation: di
         "commit_message": authorization["commit_message"],
         "commit_message_digest": authorization["commit_message_digest"],
     }
+    if authorization.get("grant_kind") == "governed":
+        expected.update({
+            "grant_kind": "governed", "parent_run_id": authorization["parent_run_id"],
+            "work_unit_id": authorization["work_unit_id"],
+            "candidate_diff_sha": authorization["candidate_diff_sha"],
+            "source_operation_id": authorization["source_operation_id"],
+            "source_request_id": authorization["source_request_id"],
+            "source_scope": authorization["source_scope"],
+            "accepted_work_unit": authorization["accepted_work_unit"],
+        })
     expected_key = f"local-commit:{authorization['authorization_id']}:{authorization['authority']}:{authorization['request_id']}"
     if operation.get("idempotency_key") != expected_key or operation.get("operation_id") != operation_id("local_commit", expected_key):
         return False
@@ -2510,6 +2986,13 @@ def validate_local_commit_receipt(authorization: dict[str, Any], operation: dict
             raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
         if source.get("commit_sha") != commit_sha:
             raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
+        if authorization.get("grant_kind") == "governed" and (
+            source.get("parent_run_id") != authorization.get("parent_run_id")
+            or source.get("work_unit_id") != authorization.get("work_unit_id")
+            or source.get("candidate_diff_sha") != authorization.get("candidate_diff_sha")
+            or source.get("source_scope") != authorization.get("source_scope")
+        ):
+            raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
     if receipt.get("branch") != authorization["branch"] or receipt.get("paths") != authorization["allowed_paths"]:
         raise SystemExit("AUTHORIZATION_COMMIT_RECEIPT_MISMATCH")
     if receipt.get("message") != authorization["commit_message"]:
@@ -2549,17 +3032,23 @@ def cmd_authorization(args: argparse.Namespace) -> int:
     validate_state(data)
     if args.authorization_action == "create":
         require_active_run(data, "authorization create")
-        if data.get("commit_policy") != "authorized":
-            raise SystemExit("local_commit authorization requires commit_policy=authorized")
+        governed = data.get("commit_policy") == "governed"
+        if data.get("commit_policy") not in {"authorized", "governed"}:
+            raise SystemExit("local_commit authorization requires a typed governed commit policy")
+        standing = data.get("commit_policy_authorization")
+        if governed and (not isinstance(standing, dict) or standing.get("status") != "active"):
+            raise SystemExit("local_commit authorization requires an active standing commit policy authorization")
         repository_root = normalize_repository_path(args.repository_root)
-        if repository_root != normalize_repository_path(data["repository_root"]):
+        if not governed and repository_root != normalize_repository_path(data["repository_root"]):
             raise SystemExit("AUTHORIZATION_REPOSITORY_IDENTITY_MISMATCH")
         if not isinstance(args.branch, str) or not args.branch:
             raise SystemExit("--branch is required")
-        if data.get("branch") is not None and data["branch"] != args.branch:
+        if not governed and data.get("branch") is not None and data["branch"] != args.branch:
             raise SystemExit("AUTHORIZATION_BRANCH_IDENTITY_MISMATCH")
         if args.authority not in AUTHORIZATION_AUTHORITIES:
             raise SystemExit("--authority is required")
+        if governed and args.authority != STANDING_AUTHORITY:
+            raise SystemExit("governed local_commit authorization requires authority=user")
         if not isinstance(args.request_id, str) or not args.request_id:
             raise SystemExit("--request-id is required")
         if args.max_uses != 1:
@@ -2569,9 +3058,52 @@ def cmd_authorization(args: argparse.Namespace) -> int:
         message = args.commit_message
         if not isinstance(message, str) or not message:
             raise SystemExit("--message is required")
+        work_unit_id: str | None = None
+        candidate_diff_sha: str | None = None
+        source_operation_id: str | None = None
+        source_request_id: str | None = None
+        accepted_work_unit: dict[str, Any] | None = None
+        parent_run_id: str | None = None
+        if governed:
+            parent_run_id = data["run_id"]
+            work_unit_id = require_work_unit_id(args.work_unit_id)
+            candidate_diff_sha = require_scope_digest(args.candidate_diff_sha, "--candidate-diff-sha")
+            source_request_id = args.source_request_id or standing.get("source_request_id")
+            source_operation_id = args.source_operation_id or (standing.get("source") or {}).get("operation_id")
+            if not isinstance(source_request_id, str) or not source_request_id:
+                raise SystemExit("--source-request-id is required for governed local_commit authorization")
+            standing_source = standing.get("source") if isinstance(standing, dict) else None
+            if (
+                not isinstance(standing_source, dict)
+                or source_request_id != standing_source.get("request_id")
+                or source_operation_id != standing_source.get("operation_id")
+            ):
+                raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH")
+            accepted_work_unit = source_operation_for_accepted_work_unit(
+                data, operation_id_value=source_operation_id, request_id=source_request_id,
+                require_commit_scope=True,
+            )
+            if accepted_work_unit["response_type"] != "sub_objective_complete":
+                raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED")
+            if accepted_work_unit["request_id"] != source_request_id or accepted_work_unit["work_unit_id"] != work_unit_id:
+                raise SystemExit("governed local_commit authorization source identity mismatch")
+            if accepted_work_unit["repository_root"] != repository_root or accepted_work_unit["branch"] != args.branch:
+                raise SystemExit("governed local_commit authorization target identity mismatch")
+            expected_source_scope = {
+                "repository_root": repository_root, "branch": args.branch,
+                "expected_head": expected_head, "candidate_diff_sha": candidate_diff_sha,
+                "allowed_paths": paths, "commit_message": message,
+            }
+            validated_source_scope = accepted_work_unit.get("source_scope")
+            if validated_source_scope != expected_source_scope:
+                raise SystemExit("GOVERNED_AUTHORIZATION_SOURCE_SCOPE_MISMATCH")
         expires_at = args.expires_at
         parse_authorization_expiry(expires_at)
-        scope_digest = authorization_scope_digest(repository_root, args.branch, expected_head, paths, message)
+        scope_digest = authorization_scope_digest(
+            repository_root, args.branch, expected_head, paths, message,
+            parent_run_id=parent_run_id, work_unit_id=work_unit_id,
+            candidate_diff_sha=candidate_diff_sha,
+        )
         if args.scope_digest is not None and args.scope_digest != scope_digest:
             raise SystemExit("AUTHORIZATION_SCOPE_DIGEST_MISMATCH")
         auth_id = authorization_id(args.authority, args.request_id, scope_digest)
@@ -2590,6 +3122,16 @@ def cmd_authorization(args: argparse.Namespace) -> int:
             "max_uses": args.max_uses,
             "expires_at": expires_at,
         }
+        if governed:
+            expected.update({
+                "grant_kind": "governed", "parent_run_id": parent_run_id,
+                "work_unit_id": work_unit_id, "candidate_diff_sha": candidate_diff_sha,
+                "source_operation_id": source_operation_id, "source_request_id": source_request_id,
+                "source_scope": copy.deepcopy(validated_source_scope),
+                "accepted_work_unit": {key: accepted_work_unit[key] for key in (
+                    "work_unit_id", "repository_root", "branch",
+                )},
+            })
         existing = next(
             (item for item in data["authorizations"]
              if isinstance(item, dict) and item.get("kind") == "local_commit" and item.get("request_id") == args.request_id),
@@ -3197,6 +3739,8 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
         data, operation, args, recovery=False,
     )
+    effect["operation_id"] = operation["operation_id"]
+    receipt["operation_id"] = operation["operation_id"]
     terminal_status = "confirmed" if status == "success" and not errors else "failed"
     reason = None if terminal_status == "confirmed" else "Frontier transport " + status
     if errors:
@@ -3222,8 +3766,13 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     now = utcnow()
     operation["effect"] = effect
     operation["receipt"] = receipt
+    operation["request_id"] = request_id
+    operation["message_id"] = message_id
     operation["transport_status"] = status
     operation["frontier_decision"] = decision
+    work_unit_id = matching_work_unit_id(effect, receipt)
+    if work_unit_id is not None:
+        operation["work_unit_id"] = work_unit_id
     if response_type is not None:
         operation["response_type"] = response_type
         proposed_plan = proposed_plan_from_sources(effect, receipt)
@@ -3278,6 +3827,8 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
     status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
         data, operation, args, recovery=True,
     )
+    effect["operation_id"] = operation["operation_id"]
+    receipt["operation_id"] = operation["operation_id"]
     if status != "success" or decision is None or errors or message_id is None:
         raise SystemExit("FRONTIER_RECOVERY_EVIDENCE_INVALID: " + "; ".join(sorted(set(errors or ["transport is not successful"]))))
     task_id = args.task_id or identity["task_id"]
@@ -3302,6 +3853,11 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
     operation["effective_status"] = "confirmed"
     operation["effective_transport_status"] = status
     operation["effective_frontier_decision"] = decision
+    operation["effective_request_id"] = request_id
+    operation["effective_message_id"] = message_id
+    work_unit_id = matching_work_unit_id(effect, receipt)
+    if work_unit_id is not None:
+        operation["effective_work_unit_id"] = work_unit_id
     operation["effective_outcome"] = {
         "transport_status": status, "frontier_decision": decision,
         "request_id": request_id, "message_id": message_id,
@@ -3341,6 +3897,25 @@ def accessible_workspace(value: str | None) -> str:
     return str(workspace)
 
 
+def workspace_git_identity(workspace: str) -> tuple[str | None, str | None]:
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+        )
+        branch_result = subprocess.run(
+            ["git", "-C", workspace, "branch", "--show-current"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if root_result.returncode != 0 or branch_result.returncode != 0:
+        return None, None
+    root = root_result.stdout.strip()
+    branch = branch_result.stdout.strip()
+    return (normalize_repository_path(root) if root else None), (branch or None)
+
+
 def require_continuous_work_unit_provenance(data: dict[str, Any], work_unit_id: str) -> None:
     if not is_continuous_parent(data):
         return
@@ -3378,6 +3953,7 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
         raise SystemExit("--task-id must be a non-empty string")
     work_unit_id = require_work_unit_id(args.work_unit_id)
     workspace = accessible_workspace(args.workspace)
+    workspace_repository_root, workspace_branch = workspace_git_identity(workspace)
     intent = {
         "task_id": args.task_id,
         "work_unit_id": work_unit_id,
@@ -3386,6 +3962,10 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
         "role": args.role,
         "reason": args.reason,
     }
+    if workspace_repository_root is not None:
+        intent["workspace_repository_root"] = workspace_repository_root
+    if workspace_branch is not None:
+        intent["workspace_branch"] = workspace_branch
     existing = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
     require_continuous_work_unit_provenance(data, work_unit_id)
     # A stale/legacy started row cannot be silently claimed by a new preflight.
@@ -3433,6 +4013,10 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
         "started_at": utcnow(), "completed_at": None, "status": "started", "outcome": "STARTED",
         "operation_id": operation["operation_id"],
     }
+    if workspace_repository_root is not None:
+        entry["workspace_repository_root"] = workspace_repository_root
+    if workspace_branch is not None:
+        entry["workspace_branch"] = workspace_branch
     data["delegation_ledger"].append(entry)
     data["attempts"][args.role + "s"] = entry["attempt"]
     data["active_work_unit_id"] = work_unit["work_unit_id"]
@@ -4912,6 +5496,7 @@ def cmd_complete(args: argparse.Namespace) -> int:
     data["phase"] = "dormant"
     data["status"] = "dormant"
     data["blocker"] = None
+    disable_commit_policy_authorization(data, "parent objective completed")
     data["completion"] = {"completed_at": utcnow(), "message": args.message}
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "objective.complete", args.message, {"revision": saved["revision"]})
@@ -5055,6 +5640,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     data["phase"] = "cancelled"
     data["status"] = "cancelled"
     data["blocker"] = args.reason
+    disable_commit_policy_authorization(data, "parent run cancelled")
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "run.cancelled", args.reason, {
         "type": cancellation_type, "request_id": args.request_id, "message_id": args.message_id,
@@ -5126,6 +5712,19 @@ def build_parser() -> argparse.ArgumentParser:
     patch.add_argument("--expect-revision", type=int)
     patch.set_defaults(func=cmd_patch)
 
+    commit_policy = sub.add_parser("commit-policy", help="authorize a governed parent local-commit mode")
+    commit_policy_sub = commit_policy.add_subparsers(dest="commit_policy_action", required=True)
+    commit_policy_authorize = commit_policy_sub.add_parser("authorize", help="authorize standing governed local commits")
+    commit_policy_authorize.add_argument("run_id")
+    commit_policy_authorize.add_argument("--authority", required=True)
+    commit_policy_authorize.add_argument("--source-request-id")
+    commit_policy_authorize.add_argument("--request-id", dest="request_id")
+    commit_policy_authorize.add_argument("--source-operation-id", "--frontier-operation-id", dest="source_operation_id")
+    commit_policy_authorize.add_argument("--work-unit-id", required=True)
+    commit_policy_authorize.add_argument("--evidence-json")
+    commit_policy_authorize.add_argument("--expect-revision", type=int, required=True)
+    commit_policy_authorize.set_defaults(func=cmd_commit_policy)
+
     transition = sub.add_parser("transition", help="apply one validated active-run phase transition")
     transition.add_argument("run_id")
     transition.add_argument("--to-phase", choices=sorted(PHASES), required=True)
@@ -5176,6 +5775,10 @@ def build_parser() -> argparse.ArgumentParser:
     authorization.add_argument("--message", "--commit-message", dest="commit_message")
     authorization.add_argument("--max-uses", type=int, default=1)
     authorization.add_argument("--expires-at")
+    authorization.add_argument("--work-unit-id")
+    authorization.add_argument("--candidate-diff-sha")
+    authorization.add_argument("--source-operation-id", "--frontier-operation-id", dest="source_operation_id")
+    authorization.add_argument("--source-request-id")
     authorization.add_argument("--authorization-id")
     authorization.add_argument("--operation-id")
     authorization.add_argument("--commit-sha")

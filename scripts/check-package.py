@@ -377,9 +377,11 @@ def main() -> int:
     require_text(ROOT / "docs/OPERATIONS.md", [
         "resolve-delivery-policy.py", "tracking_issue", "policy_digest", "body_digest", "recomputing",
         "github-tracking-issue-recovery.py", "myrmex-state delivery", "github-pr-recovery.py", "idempotent",
+        "commit-policy authorize", "candidate-diff-sha", "governed",
     ], errors)
     require_text(ROOT / "docs/SECURITY.md", [
         "typed side-effect boundary", "policy digest", "recomputes", "mandatory digest", "ISSUE_APPROVED", "PR_CREATED_LABEL_PENDING",
+        "SUB_OBJECTIVE_COMPLETE", "candidate diff digest", "Generic patches",
     ], errors)
     if (ROOT / ".github").exists() and not (ROOT / ".github" / "workflows" / "ci.yml").is_file():
         errors.append("missing GitHub CI workflow: .github/workflows/ci.yml")

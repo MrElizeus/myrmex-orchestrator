@@ -1060,6 +1060,376 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     )
     assert "parent objective has not passed a parent gate" in parent_incomplete.stderr
 
+    # A plain local-commit authorization is denied until a typed standing
+    # parent authorization establishes governed mode.  The standing command
+    # records only accepted Frontier WU evidence and is idempotent.
+    deny_commit = run(
+        "init", "--run-id", "myrmex-commit-policy-deny", "--objective", "deny commit policy",
+        "--repository-root", td, "--branch", "main", "--mode", "autonomous", "--scope", "narrow",
+        "--commit-policy", "deny", "--push-policy", "deny", env=env,
+    ).stdout.strip()
+    denied_authorization = run(
+        "authorization", deny_commit, "create", "--authority", "user", "--request-id", "ordinary-denied",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "ordinary.txt", "--message", "feat: ordinary", "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "typed governed commit policy" in denied_authorization.stderr
+    assert json.loads(run("show", deny_commit, env=env).stdout)["revision"] == 0
+
+    governed_parent = run(
+        "init", "--run-id", "myrmex-governed-parent", "--objective", "governed parent",
+        "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
+        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "authorized", "--push-policy", "deny", env=env,
+    ).stdout.strip()
+    legacy_authorization = json.loads(run(
+        "authorization", governed_parent, "create", "--authority", "user", "--request-id", "legacy-before-governed",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "legacy.txt", "--message", "feat: legacy", "--expect-revision", "0", env=env,
+    ).stdout)["authorizations"][0]
+    run(
+        "delegation-preflight", governed_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "accepted WU", "--task-id", "task-governed", "--work-unit-id", "WU-governed",
+        "--workspace", td, "--expect-revision", "1", env=env,
+    )
+    run(
+        "delegation", governed_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "accepted WU", "--task-id", "task-governed", "--work-unit-id", "WU-governed",
+        "--workspace", td, "--status", "success", "--expect-revision", "2", env=env,
+    )
+    accepted_start = json.loads(run(
+        "frontier", governed_parent, "start", "--request-id", "accepted-wu-request",
+        "--task-id", "accepted-wu-task", "--message-id", "accepted-wu-message", "--expect-revision", "3", env=env,
+    ).stdout)
+    accepted_operation = accepted_start["pending_operations"][-1]["operation_id"]
+    accepted_evidence = json.dumps({
+        "request_id": "accepted-wu-request", "message_id": "accepted-wu-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "sub_objective_complete", "work_unit_id": "WU-governed",
+        "repository_root": str(Path(td).resolve()), "branch": "main", "expected_head": "b" * 40,
+        "candidate_diff_sha": "a" * 64, "allowed_paths": ["governed.txt"],
+        "commit_message": "feat: governed",
+    })
+    standing = json.loads(run(
+        "frontier", governed_parent, "result", "--operation-id", accepted_operation,
+        "--request-id", "accepted-wu-request", "--message-id", "accepted-wu-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "sub_objective_complete", "--effect-json", accepted_evidence,
+        "--receipt-json", accepted_evidence, "--expect-revision", "4", env=env,
+    ).stdout)
+    standing = json.loads(run(
+        "commit-policy", "authorize", governed_parent, "--authority", "user",
+        "--source-request-id", "accepted-wu-request", "--source-operation-id", accepted_operation,
+        "--work-unit-id", "WU-governed", "--expect-revision", "5", env=env,
+    ).stdout)
+    assert standing["revision"] == 6 and standing["commit_policy"] == "governed"
+    run(
+        "work-unit", governed_parent, "complete", "--work-unit-id", "WU-governed",
+        "--evidence-json", '{"verification":"passed"}', "--expect-revision", "6", env=env,
+    )
+    assert standing["commit_policy_authorization"]["authority"] == "user"
+    assert legacy_authorization["status"] == "open"
+    revoked_legacy = standing["authorizations"][0]
+    assert revoked_legacy["authorization_id"] == legacy_authorization["authorization_id"]
+    assert revoked_legacy["status"] == "revoked" and revoked_legacy["consumed_at"] is not None
+    standing_path = Path(env["MYRMEX_STATE_HOME"]) / "runs" / governed_parent / "state.json"
+    standing_before = standing_path.read_bytes()
+    replayed_standing = json.loads(run(
+        "commit-policy", "authorize", governed_parent, "--authority", "user",
+        "--source-request-id", "accepted-wu-request", "--source-operation-id", accepted_operation,
+        "--work-unit-id", "WU-governed", "--expect-revision", "99", env=env,
+    ).stdout)
+    assert replayed_standing["revision"] == 7 and standing_path.read_bytes() == standing_before
+    conflict_standing = run(
+        "commit-policy", "authorize", governed_parent, "--authority", "frontier",
+        "--source-request-id", "accepted-wu-request", "--source-operation-id", accepted_operation,
+        "--work-unit-id", "WU-governed", "--expect-revision", "7", env=env, ok=False,
+    )
+    assert "human authority=user" in conflict_standing.stderr
+    legacy_intent = run(
+        "operation", governed_parent, "intent", "--kind", "local_commit",
+        "--idempotency-key", f"local-commit:{legacy_authorization['authorization_id']}:user:legacy-before-governed",
+        "--authorization-id", legacy_authorization["authorization_id"], "--intent-json", "{}",
+        "--expect-revision", "7", env=env, ok=False,
+    )
+    assert "GOVERNED_LOCAL_COMMIT_GRANT_REQUIRED" in legacy_intent.stderr
+    governed_grant = json.loads(run(
+        "authorization", governed_parent, "create", "--authority", "user", "--request-id", "governed-grant",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "governed.txt", "--message", "feat: governed", "--work-unit-id", "WU-governed",
+        "--candidate-diff-sha", "a" * 64, "--source-operation-id", accepted_operation,
+        "--source-request-id", "accepted-wu-request", "--expect-revision", "7", env=env,
+    ).stdout)
+    assert governed_grant["authorizations"][-1]["grant_kind"] == "governed"
+    patch_standing = run(
+        "patch", governed_parent, "--set", "commit_policy_authorization.authority=frontier",
+        "--expect-revision", "8", env=env, ok=False,
+    )
+    assert "protected state path" in patch_standing.stderr
+    cancelled_governed = json.loads(run(
+        "cancel", governed_parent, "--reason", "parent cancelled", "--expect-revision", "8", env=env,
+    ).stdout)
+    assert cancelled_governed["commit_policy_authorization"]["status"] == "revoked"
+    run(
+        "authorization", governed_parent, "create", "--authority", "user", "--request-id", "after-cancel",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "governed.txt", "--message", "feat: governed", "--work-unit-id", "WU-governed",
+        "--candidate-diff-sha", "a" * 64, "--source-operation-id", accepted_operation,
+        "--source-request-id", "accepted-wu-request", "--expect-revision", "9", env=env, ok=False,
+    )
+
+    complete_governed = run(
+        "init", "--run-id", "myrmex-governed-complete", "--objective", "governed complete",
+        "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
+        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+    ).stdout.strip()
+    run(
+        "delegation-preflight", complete_governed, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "accepted WU", "--task-id", "task-complete", "--work-unit-id", "WU-complete",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
+    run(
+        "delegation", complete_governed, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "accepted WU", "--task-id", "task-complete", "--work-unit-id", "WU-complete",
+        "--workspace", td, "--status", "success", "--expect-revision", "1", env=env,
+    )
+    complete_start = json.loads(run(
+        "frontier", complete_governed, "start", "--request-id", "complete-wu-request",
+        "--task-id", "complete-wu-task", "--message-id", "complete-wu-message", "--expect-revision", "2", env=env,
+    ).stdout)
+    complete_operation = complete_start["pending_operations"][-1]["operation_id"]
+    complete_evidence = json.dumps({
+        "request_id": "complete-wu-request", "message_id": "complete-wu-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "sub_objective_complete", "work_unit_id": "WU-complete",
+    })
+    run(
+        "frontier", complete_governed, "result", "--operation-id", complete_operation,
+        "--request-id", "complete-wu-request", "--message-id", "complete-wu-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "sub_objective_complete", "--effect-json", complete_evidence,
+        "--receipt-json", complete_evidence, "--expect-revision", "3", env=env,
+    )
+    run(
+        "commit-policy", "authorize", complete_governed, "--authority", "user",
+        "--source-request-id", "complete-wu-request", "--source-operation-id", complete_operation,
+        "--work-unit-id", "WU-complete", "--expect-revision", "4", env=env,
+    )
+    run(
+        "work-unit", complete_governed, "complete", "--work-unit-id", "WU-complete",
+        "--evidence-json", '{"verification":"passed"}', "--expect-revision", "5", env=env,
+    )
+    parent_complete_start = json.loads(run(
+        "frontier", complete_governed, "start", "--request-id", "complete-parent-request",
+        "--task-id", "complete-parent-task", "--message-id", "complete-parent-message", "--expect-revision", "6", env=env,
+    ).stdout)
+    parent_complete_operation = parent_complete_start["pending_operations"][-1]["operation_id"]
+    parent_complete_evidence = json.dumps({
+        "request_id": "complete-parent-request", "message_id": "complete-parent-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "parent_objective_complete",
+    })
+    run(
+        "frontier", complete_governed, "result", "--operation-id", parent_complete_operation,
+        "--request-id", "complete-parent-request", "--message-id", "complete-parent-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "parent_objective_complete", "--effect-json", parent_complete_evidence,
+        "--receipt-json", parent_complete_evidence, "--expect-revision", "7", env=env,
+    )
+    completed_governed = json.loads(run(
+        "complete", complete_governed, "--message", "parent complete", "--expect-revision", "8", env=env,
+    ).stdout)
+    assert completed_governed["state"]["commit_policy_authorization"]["status"] == "revoked"
+    run(
+        "authorization", complete_governed, "create", "--authority", "user", "--request-id", "after-complete",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "governed.txt", "--message", "feat: governed", "--work-unit-id", "WU-complete",
+        "--candidate-diff-sha", "a" * 64, "--source-operation-id", complete_operation,
+        "--source-request-id", "complete-wu-request", "--expect-revision", "9", env=env, ok=False,
+    )
+
+    # A confirmed Frontier plan is not standing commit-policy evidence; only
+    # SUB_OBJECTIVE_COMPLETE/ACCEPT may establish the parent authorization.
+    plan_parent = run(
+        "init", "--run-id", "myrmex-governed-plan-rejected", "--objective", "governed plan rejection",
+        "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
+        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+    ).stdout.strip()
+    run(
+        "delegation-preflight", plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "completed WU", "--task-id", "task-plan-parent", "--work-unit-id", "WU-plan-parent",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
+    run(
+        "delegation", plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "completed WU", "--task-id", "task-plan-parent", "--work-unit-id", "WU-plan-parent",
+        "--workspace", td, "--status", "success", "--expect-revision", "1", env=env,
+    )
+    run(
+        "work-unit", plan_parent, "complete", "--work-unit-id", "WU-plan-parent",
+        "--evidence-json", '{"verification":"passed"}', "--expect-revision", "2", env=env,
+    )
+    plan_started = json.loads(run(
+        "frontier", plan_parent, "start", "--request-id", "plan-request",
+        "--task-id", "plan-task", "--message-id", "plan-message", "--expect-revision", "3", env=env,
+    ).stdout)
+    plan_operation = plan_started["pending_operations"][-1]["operation_id"]
+    plan = {"work_unit_id": "WU-plan", "summary": "accepted next WU"}
+    plan_evidence = json.dumps({
+        "request_id": "plan-request", "message_id": "plan-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "plan", "proposed_plan": plan,
+    })
+    run(
+        "frontier", plan_parent, "result", "--operation-id", plan_operation,
+        "--request-id", "plan-request", "--message-id", "plan-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT", "--response-type", "plan",
+        "--plan-json", json.dumps(plan), "--effect-json", plan_evidence, "--receipt-json", plan_evidence,
+        "--expect-revision", "4", env=env,
+    )
+    run(
+        "delegation-preflight", plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "approved next WU", "--task-id", "task-plan-next", "--work-unit-id", "WU-plan",
+        "--workspace", td, "--expect-revision", "5", env=env,
+    )
+    rejected_plan_authorization = run(
+        "commit-policy", "authorize", plan_parent, "--authority", "user",
+        "--source-request-id", "plan-request", "--source-operation-id", plan_operation,
+        "--work-unit-id", "WU-plan", "--expect-revision", "6", env=env, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED" in rejected_plan_authorization.stderr
+    assert json.loads(run("show", plan_parent, env=env).stdout)["revision"] == 6
+    run(
+        "delegation", plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "completed next WU", "--task-id", "task-plan-next", "--work-unit-id", "WU-plan",
+        "--workspace", td, "--status", "success", "--expect-revision", "6", env=env,
+    )
+    run(
+        "work-unit", plan_parent, "complete", "--work-unit-id", "WU-plan",
+        "--evidence-json", '{"verification":"passed"}', "--expect-revision", "7", env=env,
+    )
+    parent_gate_accept = json.loads(run(
+        "frontier", plan_parent, "start", "--request-id", "parent-gate-accept-request",
+        "--task-id", "parent-gate-accept-task", "--message-id", "parent-gate-accept-message",
+        "--expect-revision", "8", env=env,
+    ).stdout)
+    parent_gate_accept_operation = parent_gate_accept["pending_operations"][-1]["operation_id"]
+    parent_gate_scope = {
+        "repository_root": str(Path(td).resolve()), "branch": "main", "expected_head": "b" * 40,
+        "candidate_diff_sha": "d" * 64, "allowed_paths": ["plan.txt"], "commit_message": "feat: plan",
+    }
+    parent_gate_accept_evidence = json.dumps({
+        "request_id": "parent-gate-accept-request", "message_id": "parent-gate-accept-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "sub_objective_complete", "work_unit_id": "WU-plan",
+        **parent_gate_scope,
+    })
+    run(
+        "frontier", plan_parent, "result", "--operation-id", parent_gate_accept_operation,
+        "--request-id", "parent-gate-accept-request", "--message-id", "parent-gate-accept-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "sub_objective_complete", "--effect-json", parent_gate_accept_evidence,
+        "--receipt-json", parent_gate_accept_evidence, "--expect-revision", "9", env=env,
+    )
+    parent_gate_state_path = Path(env["MYRMEX_STATE_HOME"]) / "runs" / plan_parent / "state.json"
+    parent_gate_events_path = parent_gate_state_path.parent / "events.jsonl"
+    parent_gate_state_before_reject = parent_gate_state_path.read_bytes()
+    parent_gate_events_before_reject = parent_gate_events_path.read_bytes()
+    rejected_parent_gate_accept = run(
+        "commit-policy", "authorize", plan_parent, "--authority", "user",
+        "--source-request-id", "parent-gate-accept-request", "--source-operation-id", parent_gate_accept_operation,
+        "--work-unit-id", "WU-plan", "--expect-revision", "10", env=env, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_NOT_ACCEPTED" in rejected_parent_gate_accept.stderr
+    assert parent_gate_state_path.read_bytes() == parent_gate_state_before_reject
+    assert parent_gate_events_path.read_bytes() == parent_gate_events_before_reject
+
+    grant_plan_parent = run(
+        "init", "--run-id", "myrmex-governed-grant-plan", "--objective", "governed grant plan rejection",
+        "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
+        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+    ).stdout.strip()
+    run(
+        "delegation-preflight", grant_plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "completed WU", "--task-id", "task-grant-plan-one", "--work-unit-id", "WU-grant-plan-one",
+        "--workspace", td, "--expect-revision", "0", env=env,
+    )
+    run(
+        "delegation", grant_plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "completed WU", "--task-id", "task-grant-plan-one", "--work-unit-id", "WU-grant-plan-one",
+        "--workspace", td, "--status", "success", "--expect-revision", "1", env=env,
+    )
+    grant_sub_started = json.loads(run(
+        "frontier", grant_plan_parent, "start", "--request-id", "grant-sub-request",
+        "--task-id", "grant-sub-task", "--message-id", "grant-sub-message", "--expect-revision", "2", env=env,
+    ).stdout)
+    grant_sub_operation = grant_sub_started["pending_operations"][-1]["operation_id"]
+    grant_scope = {
+        "repository_root": str(Path(td).resolve()), "branch": "main", "expected_head": "b" * 40,
+        "candidate_diff_sha": "c" * 64, "allowed_paths": ["plan.txt"], "commit_message": "feat: plan",
+    }
+    grant_sub_evidence = json.dumps({
+        "request_id": "grant-sub-request", "message_id": "grant-sub-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT",
+        "response_type": "sub_objective_complete", "work_unit_id": "WU-grant-plan-one",
+        **grant_scope,
+    })
+    run(
+        "frontier", grant_plan_parent, "result", "--operation-id", grant_sub_operation,
+        "--request-id", "grant-sub-request", "--message-id", "grant-sub-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT", "--response-type", "sub_objective_complete",
+        "--effect-json", grant_sub_evidence, "--receipt-json", grant_sub_evidence, "--expect-revision", "3", env=env,
+    )
+    run(
+        "commit-policy", "authorize", grant_plan_parent, "--authority", "user",
+        "--source-request-id", "grant-sub-request", "--source-operation-id", grant_sub_operation,
+        "--work-unit-id", "WU-grant-plan-one", "--expect-revision", "4", env=env,
+    )
+    run(
+        "work-unit", grant_plan_parent, "complete", "--work-unit-id", "WU-grant-plan-one",
+        "--evidence-json", '{"verification":"passed"}', "--expect-revision", "5", env=env,
+    )
+    grant_plan_started = json.loads(run(
+        "frontier", grant_plan_parent, "start", "--request-id", "grant-plan-request",
+        "--task-id", "grant-plan-task", "--message-id", "grant-plan-message", "--expect-revision", "6", env=env,
+    ).stdout)
+    grant_plan_operation = grant_plan_started["pending_operations"][-1]["operation_id"]
+    grant_plan = {"work_unit_id": "WU-grant-plan-two", "summary": "next WU"}
+    grant_plan_evidence = json.dumps({
+        "request_id": "grant-plan-request", "message_id": "grant-plan-message",
+        "transport_status": "success", "frontier_decision": "ACCEPT", "response_type": "plan",
+        "proposed_plan": grant_plan, **grant_scope,
+    })
+    run(
+        "frontier", grant_plan_parent, "result", "--operation-id", grant_plan_operation,
+        "--request-id", "grant-plan-request", "--message-id", "grant-plan-message",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT", "--response-type", "plan",
+        "--plan-json", json.dumps(grant_plan), "--effect-json", grant_plan_evidence,
+        "--receipt-json", grant_plan_evidence, "--expect-revision", "7", env=env,
+    )
+    run(
+        "delegation-preflight", grant_plan_parent, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "approved next WU", "--task-id", "task-grant-plan-two", "--work-unit-id", "WU-grant-plan-two",
+        "--workspace", td, "--expect-revision", "8", env=env,
+    )
+    grant_plan_rejected = run(
+        "authorization", grant_plan_parent, "create", "--authority", "user", "--request-id", "grant-from-plan",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "plan.txt", "--message", "feat: plan", "--work-unit-id", "WU-grant-plan-two",
+        "--candidate-diff-sha", "c" * 64, "--source-operation-id", grant_plan_operation,
+        "--source-request-id", "grant-plan-request", "--expect-revision", "9", env=env, ok=False,
+    )
+    assert "GOVERNED_AUTHORIZATION_SOURCE_IDENTITY_MISMATCH" in grant_plan_rejected.stderr
+    assert json.loads(run("show", grant_plan_parent, env=env).stdout)["revision"] == 9
+    wrong_wu_source = run(
+        "authorization", grant_plan_parent, "create", "--authority", "user", "--request-id", "grant-wrong-wu",
+        "--repository-root", td, "--branch", "main", "--expected-head", "b" * 40,
+        "--allowed-path", "plan.txt", "--message", "feat: plan", "--work-unit-id", "WU-grant-plan-two",
+        "--candidate-diff-sha", "c" * 64, "--source-operation-id", grant_sub_operation,
+        "--source-request-id", "grant-sub-request", "--expect-revision", "9", env=env, ok=False,
+    )
+    assert "governed local_commit authorization source identity mismatch" in wrong_wu_source.stderr
+    assert json.loads(run("show", grant_plan_parent, env=env).stdout)["revision"] == 9
+
     terminal = run(
         "init", "--run-id", "myrmex-terminal-state", "--objective", "Terminal state", "--repository-root", td,
         "--mode", "autonomous", "--scope", "narrow", env=env,
@@ -1128,7 +1498,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert "patch requires an active run" in invalid_pair.stderr
 
     doctor = json.loads(run("doctor", env=env).stdout)
-    assert doctor["ok"] is True and doctor["runs"] == 23
+    assert doctor["ok"] is True and doctor["runs"] == 28
 
     schema = json.loads((ROOT / "contracts" / "frontier-state-v2.schema.json").read_text())
     missing = sorted(set(schema["required"]) - set(extra_blocked))
