@@ -11,11 +11,14 @@
 
 Myrmex agents deny `.env` reads and must not transmit secrets to browser models. Redact tokens, cookies, private keys, database URLs, customer data, and sensitive logs.
 
-Native memory is private local metadata, not a source archive. Its stores use
-owner-only directories/files, and promotion/refutation/confirmation reject
-environment files, repository-escaping evidence paths, malformed digests, and
-obvious secret-bearing text. Child agents return `memory_candidates`; only the
-primary may persist a candidate or change its lifecycle.
+Native memory is private local metadata, not a source archive. Its owner-only
+stores reject new environment-file, escaping-path, malformed-digest, and
+secret-bearing records. Detection recognizes valid `ghp_`, `gho_`, `ghu_`,
+`ghs_`, `ghr_`, and `github_pat_` tokens without rejecting prefix-like prose;
+evidence is scanned before hashing and rejected values are never printed,
+logged, hashed into public evidence, or persisted. Legacy records remain
+readable. Child agents return `memory_candidates`; only the primary persists
+or changes their lifecycle.
 
 Installation scope is a stricter local privacy boundary, not a sharing channel:
 it requires a sanitized claim, null project identity/repository reference, and
@@ -23,11 +26,13 @@ tool/model applicability. Project-private material needs an explicit rewritten
 claim, sanitization reason, and fresh proof before promotion. The raw proof is
 validated only locally; installation records retain digest-derived evidence
 handles rather than project paths, run/WU IDs, commits, or verifier/frontier
-request IDs. Metrics additionally turn work-unit/run/request IDs into opaque
-per-project handles and accept only normalized recovery codes and safe test
-categories—not commands or paths. Records are never uploaded by default,
-shared across installations, used to train a model, or allowed to modify policy
-automatically.
+request IDs. Metrics pseudonymize repository identity, usernames, local paths,
+and WU/run/request IDs with installation-keyed HMAC-SHA-256 and
+record-type/schema-version separation; this is not anonymization. The key is
+atomic, private, installation-local, never exported/stored in repository files,
+schemas, or metrics, and fails closed when insecure. Metrics accept only
+normalized recovery codes and safe test categories; records are not uploaded,
+shared across installations, used to train a model, or allowed to modify policy.
 
 ## Repository protection
 

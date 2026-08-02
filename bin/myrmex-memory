@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,14 +45,18 @@ METRIC_ID_RE = re.compile(r"^metric_[A-Za-z0-9_-]{8,128}$")
 KIND_RE = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+METRIC_HANDLE_RE = re.compile(r"^(?:sha256|hmac-sha256):[0-9a-f]{64}$")
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,63}", re.I)
 DECAY_RE = re.compile(r"^(?:half-life|linear):[1-9][0-9]*$")
 SENSITIVE_TEXT_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----", re.I),
     re.compile(r"\b(?:sk|gh[opsu])-[A-Za-z0-9_-]{12,}\b", re.I),
+    re.compile(r"(?<![A-Za-z0-9_])gh[opsur]_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"),
+    re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{82}(?![A-Za-z0-9_])"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~-]{12,}\b", re.I),
     re.compile(r"\b(?:api[_-]?key|password|secret|authorization|cookie)\s*[:=]\s*[^\s]{6,}", re.I),
 ]
+METRIC_KEY_BYTES = 32
 METRIC_OUTCOMES = {"success", "partial", "failed", "blocked"}
 VERIFICATION_VERDICTS = {"pass", "fail", "blocked", "unknown"}
 METRIC_RECOVERY_EVENTS = {"reconcile", "receipt-replayed", "operation-recovered", "result-collected", "retry-resumed", "none"}
@@ -81,14 +87,6 @@ def memory_home() -> Path:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def normalize_origin(value: str) -> str:
@@ -174,6 +172,7 @@ def installation_paths() -> dict[str, Path]:
         "events": root / "events.jsonl",
         "index": root / "index.json",
         "metrics": root / "work-unit-metrics.jsonl",
+        "metric_key": root / "metric-hmac.key",
         "lock": root / "lock",
     }
 
@@ -302,9 +301,66 @@ def reject_sensitive_text(value: str, label: str) -> None:
         fail(f"MEMORY_SENSITIVITY_REJECTED: {label} appears to contain a secret")
 
 
+def reject_sensitive_bytes(value: bytes, label: str) -> None:
+    """Scan evidence bytes without exposing or hashing their contents first."""
+    reject_sensitive_text(value.decode("utf-8", errors="replace"), label)
+
+
+def reject_sensitive_value(value: Any, label: str) -> None:
+    """Reject secrets in a new record without including the matched value."""
+    if isinstance(value, dict):
+        for nested in value.values():
+            reject_sensitive_value(nested, label)
+    elif isinstance(value, list):
+        for nested in value:
+            reject_sensitive_value(nested, label)
+    elif isinstance(value, str):
+        reject_sensitive_text(value, label)
+
+
+def inspect_optional_evidence_for_secrets(items: list[dict[str, Any]], root: Path | None) -> None:
+    """Scan accessible candidate evidence before its metadata can be persisted."""
+    if root is None:
+        return
+    for item in items:
+        path = (root / item["path"]).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if path.is_file():
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot inspect evidence: {exc}")
+            reject_sensitive_bytes(content, "evidence content")
+
+
+def load_metric_hmac_key(paths: dict[str, Path]) -> bytes:
+    """Load or atomically create the private installation metric key."""
+    path = paths["metric_key"]
+    try:
+        if path.is_symlink():
+            fail("MEMORY_KEY_UNAVAILABLE: metric key must not be a symbolic link")
+        if not path.exists():
+            atomic_write_bytes(path, secrets.token_bytes(METRIC_KEY_BYTES))
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            fail("MEMORY_KEY_UNAVAILABLE: metric key must be a private regular file")
+        key = path.read_bytes()
+    except MemoryError:
+        raise
+    except OSError as exc:
+        fail(f"MEMORY_KEY_UNAVAILABLE: cannot access metric key: {exc}")
+    if len(key) != METRIC_KEY_BYTES:
+        fail("MEMORY_KEY_UNAVAILABLE: metric key has an invalid length")
+    return key
+
+
 def safe_relative_path(value: Any) -> str:
     if not isinstance(value, str) or not value or len(value) > 1024:
         fail("evidence path must be a non-empty relative string")
+    reject_sensitive_text(value, "evidence path")
     candidate = Path(value)
     if candidate.is_absolute() or ".." in candidate.parts or any(part in {"", "."} for part in candidate.parts):
         fail("MEMORY_EVIDENCE_REJECTED: evidence path must stay below the project root")
@@ -463,7 +519,12 @@ def validate_accessible_evidence(items: list[dict[str, Any]], root: Path | None)
             fail("MEMORY_EVIDENCE_REJECTED: evidence path escapes repository root")
         if not path.is_file():
             fail(f"MEMORY_EVIDENCE_REJECTED: evidence file is not accessible: {item['path']}")
-        observed = "sha256:" + sha256_file(path)
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            fail(f"MEMORY_EVIDENCE_REJECTED: evidence file is not accessible: {item['path']}")
+        reject_sensitive_bytes(content, "evidence content")
+        observed = "sha256:" + sha256_bytes(content)
         if observed != item["digest"]:
             fail(f"MEMORY_EVIDENCE_REJECTED: evidence digest mismatch: {item['path']}")
 
@@ -602,6 +663,7 @@ def validate_record(
     identity: str | None = None,
     *,
     expected_scope: str | None = None,
+    reject_secrets: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(record, dict):
         fail("MEMORY_BACKEND_UNAVAILABLE: event record is not an object")
@@ -709,6 +771,8 @@ def validate_record(
             fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid refutation timestamp: {exc}")
     if not isinstance(record["revision"], int) or record["revision"] < 0:
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid memory revision")
+    if reject_secrets:
+        reject_sensitive_value(record, "memory record")
     return record
 
 
@@ -721,12 +785,26 @@ def metric_text(value: Any, label: str, *, maximum: int = 2000, nullable: bool =
     return value
 
 
-def opaque_metric_handle(project: str, namespace: str, value: str) -> str:
-    """Derive a deterministic installation-local handle without raw labels."""
+def nullable_metric_handle(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not METRIC_HANDLE_RE.fullmatch(value):
+        fail(f"{label} must be an opaque metric pseudonym or null")
+    return value
+
+
+def opaque_metric_handle(key: bytes, record_type: str, value: str) -> str:
+    """Derive a stable installation-local HMAC pseudonym with domain separation."""
+    domain = "\0".join((METRIC_SCHEMA, record_type, value)).encode("utf-8")
+    return "hmac-sha256:" + hmac.new(key, domain, hashlib.sha256).hexdigest()
+
+
+def legacy_metric_handle(project: str, namespace: str, value: str) -> str:
+    """Read-only compatibility derivation for pre-HMAC metric records."""
     return "sha256:" + sha256_bytes((namespace + "\0" + project + "\0" + value).encode("utf-8"))
 
 
-def metric_project_identity(args: argparse.Namespace, root: Path | None) -> str:
+def metric_source_identity(args: argparse.Namespace, root: Path | None) -> str:
     supplied = getattr(args, "project_identity", None)
     if root is not None:
         derived = project_identity_from_root(str(root))
@@ -738,7 +816,11 @@ def metric_project_identity(args: argparse.Namespace, root: Path | None) -> str:
     fail("--repository-root or a sha256 --project-identity is required for work-unit metrics")
 
 
-def parse_metric_verification(value: str, project: str) -> dict[str, Any]:
+def metric_project_identity(args: argparse.Namespace, root: Path | None, key: bytes) -> str:
+    return opaque_metric_handle(key, "project-identity", metric_source_identity(args, root))
+
+
+def parse_metric_verification(value: str) -> dict[str, Any]:
     raw = parse_json(value, "--verification-json")
     if not isinstance(raw, dict) or set(raw) != {"verdict", "request_id", "evidence"}:
         fail("--verification-json must contain verdict, request_id, and evidence")
@@ -748,7 +830,7 @@ def parse_metric_verification(value: str, project: str) -> dict[str, Any]:
     raw_request_id = nullable_string(raw["request_id"], "metric verification request_id")
     return {
         "verdict": verdict,
-        "request_id": None if raw_request_id is None else opaque_metric_handle(project, "verification-request", raw_request_id),
+        "request_id": raw_request_id,
         "evidence": normalize_evidence_list(raw["evidence"], "metric verification evidence"),
     }
 
@@ -794,7 +876,7 @@ def parse_metric_tests(value: str) -> list[dict[str, Any]]:
     return tests
 
 
-def validate_metric(metric: Any) -> dict[str, Any]:
+def validate_metric(metric: Any, *, reject_secrets: bool = False) -> dict[str, Any]:
     if not isinstance(metric, dict):
         fail("MEMORY_BACKEND_UNAVAILABLE: metric record is not an object")
     required = {
@@ -807,9 +889,9 @@ def validate_metric(metric: Any) -> dict[str, Any]:
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric identity")
     if metric["scope"] != INSTALLATION_SCOPE or metric["sensitivity"] != "sanitized":
         fail("MEMORY_SENSITIVITY_REJECTED: metrics must be sanitized installation records")
-    if not isinstance(metric["project_identity"], str) or not SHA256_RE.fullmatch(metric["project_identity"]):
-        fail("MEMORY_BACKEND_UNAVAILABLE: metric project identity must be a private hash")
-    if not isinstance(metric["work_unit_id"], str) or not SHA256_RE.fullmatch(metric["work_unit_id"]):
+    if not isinstance(metric["project_identity"], str) or not METRIC_HANDLE_RE.fullmatch(metric["project_identity"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: metric project identity must be an opaque pseudonym")
+    if not isinstance(metric["work_unit_id"], str) or not METRIC_HANDLE_RE.fullmatch(metric["work_unit_id"]):
         fail("MEMORY_BACKEND_UNAVAILABLE: metric work-unit identity must be an opaque hash")
     if metric["outcome"] not in METRIC_OUTCOMES:
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric outcome")
@@ -824,7 +906,7 @@ def validate_metric(metric: Any) -> dict[str, Any]:
     verification = metric["verification"]
     if not isinstance(verification, dict) or set(verification) != {"verdict", "request_id", "evidence"} or verification["verdict"] not in VERIFICATION_VERDICTS:
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric verification")
-    nullable_digest(verification["request_id"], "metric verification request_id")
+    nullable_metric_handle(verification["request_id"], "metric verification request_id")
     if not isinstance(verification["evidence"], list):
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric verification evidence")
     for item in verification["evidence"]:
@@ -857,13 +939,15 @@ def validate_metric(metric: Any) -> dict[str, Any]:
     provenance = metric["provenance"]
     if not isinstance(provenance, dict) or set(provenance) != {"authority", "request_id", "run_id"} or provenance["authority"] != "primary":
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid metric provenance")
-    if not isinstance(provenance["request_id"], str) or not SHA256_RE.fullmatch(provenance["request_id"]):
+    if not isinstance(provenance["request_id"], str) or not METRIC_HANDLE_RE.fullmatch(provenance["request_id"]):
         fail("MEMORY_BACKEND_UNAVAILABLE: invalid opaque metric request_id")
-    nullable_digest(provenance["run_id"], "metric run_id")
+    nullable_metric_handle(provenance["run_id"], "metric run_id")
     try:
         nullable_timestamp(metric["created_at"], "metric created_at")
     except MemoryError as exc:
         fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid metric timestamp: {exc}")
+    if reject_secrets:
+        reject_sensitive_value(metric, "metric record")
     return metric
 
 
@@ -1101,6 +1185,7 @@ def cmd_candidate(args: argparse.Namespace) -> int:
     if args.sensitivity not in SENSITIVITIES:
         fail("invalid --sensitivity")
     evidence = parse_evidence(args.evidence_json, "--evidence-json")
+    inspect_optional_evidence_for_secrets(evidence, project_root(args))
     provenance = parse_provenance(args.provenance_json, request_id)
     if scope == INSTALLATION_SCOPE:
         # A direct installation candidate has no project provenance. Preserve
@@ -1143,7 +1228,7 @@ def cmd_candidate(args: argparse.Namespace) -> int:
             "refutation": None,
             "revision": 0,
         }
-        validate_record(record, identity, expected_scope=scope)
+        validate_record(record, identity, expected_scope=scope, reject_secrets=True)
         event = make_event("memory.candidate_created", record, request_id)
         append_events(paths, [event])
         events.append(event)
@@ -1192,7 +1277,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
         record["freshness"] = dict(record["freshness"], last_confirmed_at=now)
         record["updated_at"] = now
         record["revision"] += 1
-        validate_record(record, identity, expected_scope=scope)
+        validate_record(record, identity, expected_scope=scope, reject_secrets=True)
         event = make_event("memory.promoted", record, request_id, {"from_status": "candidate"})
         append_events(paths, [event])
         events.append(event)
@@ -1277,7 +1362,7 @@ def cmd_installation_promote(args: argparse.Namespace) -> int:
             "refutation": None,
             "revision": 0,
         }
-        validate_record(record, None, expected_scope=INSTALLATION_SCOPE)
+        validate_record(record, None, expected_scope=INSTALLATION_SCOPE, reject_secrets=True)
         event = make_event(
             "memory.installation_promoted",
             record,
@@ -1337,7 +1422,7 @@ def cmd_refute(args: argparse.Namespace) -> int:
         if resolution == "revoke":
             record["status"] = "revoked"
             record["revoked_by"] = request_id
-            validate_record(record, identity, expected_scope=scope)
+            validate_record(record, identity, expected_scope=scope, reject_secrets=True)
             emitted.append(make_event("memory.refuted", record, request_id, {"resolution": "revoke"}))
             result: dict[str, Any] = {"refuted": True, "resolution": "revoke", "memory": record}
         else:
@@ -1360,8 +1445,8 @@ def cmd_refute(args: argparse.Namespace) -> int:
             replacement["supersedes"] = record["memory_id"]
             replacement["updated_at"] = now
             replacement["revision"] += 1
-            validate_record(record, identity, expected_scope=scope)
-            validate_record(replacement, identity, expected_scope=scope)
+            validate_record(record, identity, expected_scope=scope, reject_secrets=True)
+            validate_record(replacement, identity, expected_scope=scope, reject_secrets=True)
             emitted.append(make_event("memory.refuted", record, request_id, {"resolution": "supersede"}))
             emitted.append(make_event("memory.supersession_linked", replacement, request_id, {"supersedes": record["memory_id"]}))
             result = {"refuted": True, "resolution": "supersede", "memory": record, "replacement": replacement}
@@ -1418,7 +1503,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         record["freshness"] = dict(record["freshness"], last_confirmed_at=now)
         record["updated_at"] = now
         record["revision"] += 1
-        validate_record(record, identity, expected_scope=scope)
+        validate_record(record, identity, expected_scope=scope, reject_secrets=True)
         event = make_event(
             "memory.confirmed",
             record,
@@ -1634,33 +1719,47 @@ def cmd_metric_record(args: argparse.Namespace) -> int:
     root = project_root(args)
     if root is None:
         fail("MEMORY_EVIDENCE_REJECTED: --repository-root is required for work-unit metrics")
-    identity = metric_project_identity(args, root)
+    source_identity = metric_source_identity(args, root)
     request_id = check_request_id(args.request_id, "--request-id", required=True)
     if args.authority != "primary":
         fail("MEMORY_AUTHORITY_REQUIRED: only primary authority may record work-unit metrics")
     raw_work_unit_id = metric_text(args.work_unit_id, "--work-unit-id", maximum=256)
     assert isinstance(raw_work_unit_id, str)
-    work_unit_id = opaque_metric_handle(identity, "work-unit", raw_work_unit_id)
     if args.outcome not in METRIC_OUTCOMES:
         fail("invalid --outcome")
     if args.corrections_used < 0:
         fail("--corrections-used must be non-negative")
     defect_evidence = parse_evidence(args.defect_evidence_json, "--defect-evidence-json")
-    verification = parse_metric_verification(args.verification_json, identity)
+    verification_input = parse_metric_verification(args.verification_json)
     recovery = parse_metric_recovery(args.recovery_json)
     tests = parse_metric_tests(args.tests_json)
-    all_evidence = defect_evidence + verification["evidence"]
-    validate_optional_accessible_evidence(all_evidence, root)
-    sanitized_defect_evidence = sanitize_installation_evidence(defect_evidence)
-    sanitized_verification = dict(verification, evidence=sanitize_installation_evidence(verification["evidence"]))
     raw_run_id = nullable_string(args.run_id, "--run-id")
-    run_id = None if raw_run_id is None else opaque_metric_handle(identity, "run", raw_run_id)
     tool_version = nullable_string(args.tool_version, "--tool-version")
     model = nullable_string(args.model, "--model")
-    metric_request_id = opaque_metric_handle(identity, "metric-request", request_id)
+    all_evidence = defect_evidence + verification_input["evidence"]
+    validate_optional_accessible_evidence(all_evidence, root)
     with installation_lock(create=True) as paths:
+        key = load_metric_hmac_key(paths)
+        identity = metric_project_identity(args, root, key)
+        work_unit_id = opaque_metric_handle(key, "work-unit", raw_work_unit_id)
+        verification = dict(
+            verification_input,
+            request_id=(
+                None
+                if verification_input["request_id"] is None
+                else opaque_metric_handle(key, "verification-request", verification_input["request_id"])
+            ),
+        )
+        run_id = None if raw_run_id is None else opaque_metric_handle(key, "run", raw_run_id)
+        metric_request_id = opaque_metric_handle(key, "metric-request", request_id)
+        sanitized_defect_evidence = sanitize_installation_evidence(defect_evidence)
+        sanitized_verification = dict(verification, evidence=sanitize_installation_evidence(verification["evidence"]))
         metrics = read_metrics(paths["metrics"])
-        prior = [metric for metric in metrics if metric["provenance"]["request_id"] == metric_request_id]
+        legacy_request_id = legacy_metric_handle(source_identity, "metric-request", request_id)
+        prior = [
+            metric for metric in metrics
+            if metric["provenance"]["request_id"] in {metric_request_id, legacy_request_id}
+        ]
         if prior:
             if len(prior) == 1:
                 return emit({"recorded": False, "idempotent": True, "metric": prior[0]})
@@ -1681,18 +1780,22 @@ def cmd_metric_record(args: argparse.Namespace) -> int:
             "provenance": {"authority": "primary", "request_id": metric_request_id, "run_id": run_id},
             "created_at": utcnow(),
         }
-        validate_metric(metric)
+        validate_metric(metric, reject_secrets=True)
         append_metrics(paths, [metric])
     return emit({"recorded": True, "idempotent": False, "metric": metric})
 
 
 def cmd_metric_list(args: argparse.Namespace) -> int:
-    identity = metric_project_identity(args, project_root(args))
-    with installation_lock(create=False) as paths:
-        if not paths["root"].is_dir():
-            return emit({"backend": "local-jsonl", "project_identity": identity, "metrics": []})
+    root = project_root(args)
+    source_identity = metric_source_identity(args, root)
+    with installation_lock(create=True) as paths:
+        key = load_metric_hmac_key(paths)
+        identity = metric_project_identity(args, root, key)
         metrics = read_metrics(paths["metrics"])
-    filtered = [metric for metric in metrics if metric["project_identity"] == identity]
+    filtered = [
+        metric for metric in metrics
+        if metric["project_identity"] in {identity, source_identity}
+    ]
     filtered.sort(key=lambda metric: (metric["created_at"], metric["metric_id"]), reverse=True)
     return emit({"backend": "local-jsonl", "project_identity": identity, "metrics": filtered[:args.limit]})
 

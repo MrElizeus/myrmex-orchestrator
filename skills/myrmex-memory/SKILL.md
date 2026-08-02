@@ -1,6 +1,6 @@
 ---
 name: myrmex-memory
-description: "Use when prior project decisions/recovery context matter or durable non-obvious knowledge should be retrieved or governed as evidence-backed project memory. Keeps exact run state separate, makes the primary the sole writer, and uses Engram only as an optional adapter."
+description: "Use when prior project decisions/recovery context matter or durable non-obvious knowledge should be retrieved or governed as evidence-backed project memory. Keeps exact run state separate, makes the primary the sole writer, rejects token-shaped secrets, and uses installation-keyed HMAC metric pseudonyms."
 license: Apache-2.0
 compatibility: "Python 3.10+; myrmex-memory local backend; optional Engram mem_* or engram_* tools"
 metadata:
