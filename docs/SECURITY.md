@@ -67,7 +67,7 @@ changes before consumption.
 
 ## Browser
 
-The Playwright profile is expected to be authenticated by the user in advance. Agents never enter credentials or solve MFA. Only one client should use a persistent profile at a time.
+The Playwright profile is expected to be authenticated by the user in advance. Agents never enter credentials or solve MFA. Only one client should use a persistent profile at a time. Every run derives or requires an absolute external artifact root before browser launch; the profile and MCP output directory remain beneath it, outside the repository, Git common directory, linked worktrees, and current working directory. State records only sanitized identity, response, stability, polling, recovery, and root metadata—not cookies, tokens, auth headers, session tokens, or raw profile contents.
 
 ## Permission-boundary caveat
 

@@ -44,6 +44,7 @@ Use autonomous frontier delegation for this narrow objective. Continue through i
 myrmex-state doctor
 myrmex-state list
 myrmex-state show <run-id>
+myrmex-state init --objective-file <file> --repository-root <repo> --artifact-root /absolute/external/run-root --mode autonomous --scope narrow
 myrmex-state transition <run-id> --to-phase collecting-context --reason "context gathered" --expect-revision <n>
 myrmex-state route set <run-id> --policy direct-only --authority user --request-id <request-id> --expect-revision <n>
 myrmex-state reconcile <run-id>

@@ -123,6 +123,11 @@
       "type": "string",
       "minLength": 1
     },
+    "artifact_root": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
     "branch": {
       "type": [
         "string",

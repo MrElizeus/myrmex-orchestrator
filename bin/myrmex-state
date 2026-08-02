@@ -177,6 +177,7 @@ PROTECTED_PATCH_PATHS = {
     "clarification",
     "pause",
     "cancellation",
+    "artifact_root",
 }
 
 
@@ -261,8 +262,14 @@ def require_v2(data: dict[str, Any], command: str) -> None:
 
 
 def sanitize_evidence(value: Any) -> Any:
-    """Keep failure evidence useful without storing credentials or bearer tokens."""
-    sensitive = re.compile(r"(?:api[_-]?key|token|secret|password|authorization(?!_id)|cookie)", re.I)
+    """Keep evidence useful without storing credentials or browser contents."""
+    sensitive = re.compile(
+        r"(?:api[_-]?key|token|secret|password|authorization(?!_id)|cookie|"
+        r"auth(?:entication)?[_-]?headers?|session(?:[_-]?token)?|"
+        r"storage[_-]?state|raw[_-]?(?:profile|response)|profile(?:[_-]?(?:content|contents))?|"
+        r"credential|headers?)",
+        re.I,
+    )
     token = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)", re.I)
     if isinstance(value, dict):
         return {str(key): "[REDACTED]" if sensitive.search(str(key)) else sanitize_evidence(item)
@@ -355,6 +362,118 @@ def normalize_repository_path(value: str, option: str = "repository root") -> st
     if not isinstance(value, str) or not value.strip():
         raise SystemExit(f"{option} must be a non-empty path")
     return str(Path(value).expanduser().resolve())
+
+
+def git_artifact_boundaries(repository_root: str) -> list[Path]:
+    """Return the repository, common Git directory, and every worktree path."""
+    boundaries = [Path(repository_root).expanduser().resolve()]
+
+    def git_output(*arguments: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repository_root, *arguments],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    common = git_output("rev-parse", "--git-common-dir")
+    if common:
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = boundaries[0] / common_path
+        boundaries.append(common_path.resolve())
+
+    worktrees = git_output("worktree", "list", "--porcelain")
+    if worktrees:
+        for line in worktrees.splitlines():
+            if line.startswith("worktree "):
+                boundaries.append(Path(line.removeprefix("worktree ")).resolve())
+    return list(dict.fromkeys(boundaries))
+
+
+def normalize_artifact_root(
+    value: str,
+    repository_root: str,
+    *,
+    option: str = "artifact root",
+    create: bool = False,
+) -> str:
+    """Resolve and enforce an external, symlink-safe transport artifact root."""
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{option} must be a non-empty absolute path")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit(f"{option} must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise SystemExit(f"{option} cannot be resolved: {exc}") from exc
+    for boundary in git_artifact_boundaries(repository_root):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            continue
+        raise SystemExit(f"{option} must be outside protected repository path: {boundary}")
+    if resolved.exists() and not resolved.is_dir():
+        raise SystemExit(f"{option} must be a directory: {resolved}")
+    if create:
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+            reread = resolved.resolve(strict=True)
+        except OSError as exc:
+            raise SystemExit(f"{option} cannot be created: {exc}") from exc
+        if reread != resolved:
+            for boundary in git_artifact_boundaries(repository_root):
+                try:
+                    reread.relative_to(boundary)
+                except ValueError:
+                    continue
+                raise SystemExit(f"{option} symlink escapes into protected repository path: {boundary}")
+            resolved = reread
+    return str(resolved)
+
+
+def artifact_root_for_run(run_id: str, repository_root: str, requested: str | None = None) -> str:
+    if requested is None:
+        for variable in ("MYRMEX_FRONTIER_ARTIFACT_ROOT", "MYRMEX_ARTIFACT_ROOT"):
+            if variable in os.environ:
+                requested = os.environ[variable]
+                break
+    if requested is None:
+        # State may itself be configured inside a checked-out workspace during
+        # tests or recovery. Do not derive transport files beneath that state
+        # directory; use the stable user state namespace instead.
+        requested = str(
+            Path.home() / ".local" / "state" / "opencode" / "myrmex-orchestrator"
+            / "frontier-artifacts" / run_id
+        )
+    return normalize_artifact_root(requested, repository_root)
+
+
+def artifact_root_for_state(data: dict[str, Any]) -> str:
+    stored = data.get("artifact_root")
+    if stored is not None:
+        return normalize_artifact_root(str(stored), str(data["repository_root"]))
+    # v1/v2 historical runs predate this field. Keep them readable while making
+    # their next transport operation use the same deterministic external path.
+    return artifact_root_for_run(str(data["run_id"]), str(data["repository_root"]))
+
+
+def validate_frontier_artifact_roots(data: dict[str, Any]) -> None:
+    """Validate persisted root metadata without requiring old runs to migrate."""
+    if data.get("artifact_root") is not None:
+        normalize_artifact_root(str(data["artifact_root"]), str(data["repository_root"]))
+    for operation in data.get("pending_operations", []):
+        if not isinstance(operation, dict) or operation.get("kind") != "frontier_exchange":
+            continue
+        intent = operation.get("intent")
+        if isinstance(intent, dict) and intent.get("artifact_root") is not None:
+            normalize_artifact_root(str(intent["artifact_root"]), str(data["repository_root"]))
 
 
 def normalize_allowed_paths(values: list[str] | None) -> list[str]:
@@ -893,6 +1012,7 @@ def validate_state(data: dict[str, Any]) -> None:
     is_v2 = state_is_v2(data)
     validate_execution(data, required=is_v2)
     validate_pending_operations(data, required=False)
+    validate_frontier_artifact_roots(data)
     validate_authorizations(data, required=False)
     if not isinstance(data.get("budgets"), dict):
         raise SystemExit("budgets must be an object")
@@ -1153,6 +1273,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "myrmex-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + slug(objective) + "-" + secrets.token_hex(3)
     )
     validate_run_id(run_id)
+    artifact_root = artifact_root_for_run(run_id, repo, args.artifact_root)
     directory = run_dir(run_id)
     if directory.exists():
         raise SystemExit(f"run already exists: {run_id}")
@@ -1169,6 +1290,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "phase": "initializing",
         "status": "active",
         "repository_root": repo,
+        "artifact_root": artifact_root,
         "branch": args.branch,
         "base_sha": args.base_sha,
         "protected_dirty_paths": args.protected_dirty_path or [],
@@ -1535,6 +1657,19 @@ def parse_object_json(value: str | None, option: str, *, default: dict[str, Any]
     return sanitize_evidence(parsed)
 
 
+FRONTIER_METADATA_KEYS = {
+    "artifact_root", "blocker", "chat_url", "clarification", "frontier_decision",
+    "message_id", "poll_count", "proposed_plan", "recovery_actions", "request_id",
+    "response_digest", "response_id", "response_message_id", "response_type", "scope",
+    "stable", "status", "task_id", "transport_status", "type",
+}
+
+
+def sanitize_frontier_payload(source: dict[str, Any]) -> dict[str, Any]:
+    """Persist transport metadata only; never retain raw browser response data."""
+    return sanitize_evidence({key: source[key] for key in FRONTIER_METADATA_KEYS if key in source})
+
+
 def response_type_from_sources(*sources: Any) -> str | None:
     values: list[str] = []
     for source in sources:
@@ -1603,6 +1738,53 @@ def find_operation_by_identity(data: dict[str, Any], kind: str, idempotency_key:
             and operation.get("idempotency_key") == idempotency_key
         ):
             return operation
+    return None
+
+
+def existing_frontier_identity(
+    data: dict[str, Any], *, request_id: str, task_id: str, message_id: str | None,
+    scope: str | None, chat_url: str | None, intent: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return an exact prior Frontier identity, or reject an attempted reuse."""
+    incoming = dict(intent)
+    for operation in data.get("pending_operations", []):
+        if not isinstance(operation, dict) or operation.get("kind") != "frontier_exchange":
+            continue
+        identity = frontier_operation_identity(operation)
+        if identity["request_id"] != request_id:
+            continue
+        if identity["task_id"] is not None and identity["task_id"] != task_id:
+            raise SystemExit("FRONTIER_REQUEST_IDENTITY_CONFLICT")
+        if identity["message_id"] is not None and message_id is not None and identity["message_id"] != message_id:
+            raise SystemExit("FRONTIER_REQUEST_IDENTITY_CONFLICT")
+        if identity["scope"] is not None and scope is not None and identity["scope"] != scope:
+            raise SystemExit("FRONTIER_REQUEST_IDENTITY_CONFLICT")
+        existing_intent = operation.get("intent")
+        if not isinstance(existing_intent, dict):
+            raise SystemExit("FRONTIER_REQUEST_IDENTITY_CONFLICT")
+        # A caller may learn the response message after the original send. It
+        # must still reuse that exchange rather than creating a second send.
+        if message_id is None:
+            incoming.pop("message_id", None)
+            existing_compare = dict(existing_intent)
+            existing_compare.pop("message_id", None)
+        else:
+            existing_compare = existing_intent
+        if chat_url is None:
+            incoming.pop("chat_url", None)
+            existing_compare = dict(existing_compare)
+            existing_compare.pop("chat_url", None)
+        if "artifact_root" not in existing_compare:
+            legacy_compare = dict(existing_compare)
+            legacy_compare.pop("artifact_root", None)
+            incoming_compare = dict(incoming)
+            incoming_compare.pop("artifact_root", None)
+        else:
+            legacy_compare = existing_compare
+            incoming_compare = incoming
+        if legacy_compare != incoming_compare:
+            raise SystemExit("FRONTIER_REQUEST_IDENTITY_CONFLICT")
+        return operation
     return None
 
 
@@ -2072,11 +2254,17 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     ensure_v2_defaults(data)
     require_active_run(data, "frontier start")
     ensure_route_allows(data, "frontier")
+    artifact_root = artifact_root_for_state(data)
     if not isinstance(args.request_id, str) or not args.request_id.strip():
         raise SystemExit("--request-id must be a non-empty string")
     if not isinstance(args.task_id, str) or not args.task_id.strip():
         raise SystemExit("--task-id must be a non-empty string")
     intent = parse_object_json(args.intent_json, "--intent-json")
+    requested_artifact_root = intent.get("artifact_root")
+    if requested_artifact_root is not None:
+        if normalize_artifact_root(str(requested_artifact_root), data["repository_root"]) != artifact_root:
+            raise SystemExit("FRONTIER_ARTIFACT_ROOT_IDENTITY_MISMATCH")
+    intent["artifact_root"] = artifact_root
     intent.update({"request_id": args.request_id, "task_id": args.task_id})
     intent.setdefault("scope", data["scope"])
     if args.message_id is not None:
@@ -2085,6 +2273,21 @@ def cmd_frontier(args: argparse.Namespace) -> int:
         intent["scope"] = args.scope
     if args.chat_url is not None:
         intent["chat_url"] = args.chat_url
+    identity_chat_url = args.chat_url if args.chat_url is not None else intent.get("chat_url")
+    existing_frontier = existing_frontier_identity(
+        data,
+        request_id=args.request_id,
+        task_id=args.task_id,
+        message_id=args.message_id,
+        scope=intent.get("scope"),
+        chat_url=identity_chat_url,
+        intent=intent,
+    )
+    if existing_frontier is not None:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if data.get("artifact_root") is None:
+        data["artifact_root"] = artifact_root
     parent_gate = data.get("parent_gate")
     starting_parent_gate = parent_gate_needs_request(data)
     if starting_parent_gate:
@@ -2126,8 +2329,8 @@ def cmd_frontier(args: argparse.Namespace) -> int:
 def frontier_response_objects(args: argparse.Namespace, *, recovery: bool) -> tuple[dict[str, Any], dict[str, Any]]:
     if recovery and (args.effect_json is None or args.receipt_json is None):
         raise SystemExit("Frontier recovery requires both --effect-json and --receipt-json")
-    effect = parse_object_json(args.effect_json, "--effect-json") if args.effect_json is not None else {}
-    receipt = parse_object_json(args.receipt_json, "--receipt-json") if args.receipt_json is not None else {}
+    effect = sanitize_frontier_payload(parse_object_json(args.effect_json, "--effect-json")) if args.effect_json is not None else {}
+    receipt = sanitize_frontier_payload(parse_object_json(args.receipt_json, "--receipt-json")) if args.receipt_json is not None else {}
     return effect, receipt
 
 
@@ -4118,7 +4321,12 @@ def cmd_artifact_path(args: argparse.Namespace) -> int:
     require_v2(data, "artifact-path")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.name):
         raise SystemExit("invalid artifact name")
-    path = run_dir(args.run_id) / "artifacts" / args.name
+    root = Path(normalize_artifact_root(artifact_root_for_state(data), data["repository_root"], create=True))
+    path = (root / args.name).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit("artifact path escapes the external artifact root") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     print(path)
     return 0
@@ -4273,6 +4481,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--mode", choices=["interactive", "autonomous"], required=True)
     init.add_argument("--scope", choices=["narrow", "continuous"], required=True)
     init.add_argument("--parent-objective")
+    init.add_argument("--artifact-root", help="absolute external per-run Frontier artifact root")
     init.add_argument("--branch")
     init.add_argument("--base-sha")
     init.add_argument("--protected-dirty-path", action="append")

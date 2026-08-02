@@ -7,6 +7,14 @@ status, revisions, task IDs, request IDs/digests, browser URL, locks,
 verification revision, commit SHA, push receipt, budgets, and blockers. Native
 project memory and Engram must never replace this transactional record.
 
+Each run also has one persisted absolute `artifact_root`, derived or supplied
+before transport. The state CLI resolves it against the repository, Git common
+directory, and linked worktrees before persistence and rejects repository-local
+or symlink-escaping roots. Frontier state retains only request/task/chat/message
+identity, response type/digest, stability/poll/recovery metadata, and the root;
+cookies, tokens, auth headers, session tokens, and raw browser/profile contents
+are never state artifacts.
+
 `myrmex-memory` stores durable, evidence-backed project claims across runs.
 The primary alone can create a candidate, promote it, revoke it, or supersede
 it. Transport/scout/worker/verifier return evidence or `memory_candidates`; no

@@ -2,6 +2,8 @@
   "$schema": "myrmex.config/v1",
   "frontier": {
     "default_chat_url": null,
+    "artifact_root": null,
+    "artifact_root_policy": "external-per-run",
     "timeout_seconds": 900,
     "poll_seconds": [
       5,

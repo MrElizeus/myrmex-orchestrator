@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -97,7 +98,119 @@ def atomic_write(path: Path, data: dict[str, Any]) -> None:
             pass
 
 
-def playwright_entry(config_dir: Path) -> dict[str, Any]:
+def git_artifact_boundaries(start: Path) -> list[Path]:
+    boundaries: list[Path] = []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        repository = Path(result.stdout.strip()).resolve()
+        boundaries.append(repository)
+        for command in (("rev-parse", "--git-common-dir"), ("worktree", "list", "--porcelain")):
+            try:
+                detail = subprocess.run(
+                    ["git", "-C", str(repository), *command],
+                    capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if detail.returncode != 0:
+                continue
+            if command[0] == "rev-parse":
+                common = Path(detail.stdout.strip())
+                if not common.is_absolute():
+                    common = repository / common
+                boundaries.append(common.resolve())
+            else:
+                for line in detail.stdout.splitlines():
+                    if line.startswith("worktree "):
+                        boundaries.append(Path(line.removeprefix("worktree ")).resolve())
+    return list(dict.fromkeys(boundaries))
+
+
+def external_artifact_root(value: str | None, *, config_path: Path, repository_root: str | None = None) -> Path:
+    if value is None:
+        for variable in ("MYRMEX_FRONTIER_ARTIFACT_ROOT", "MYRMEX_ARTIFACT_ROOT"):
+            if variable in os.environ:
+                value = os.environ[variable]
+                break
+    if value is None:
+        value = str(Path.home() / ".local" / "state" / "opencode" / "myrmex-orchestrator" / "frontier-transport")
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("artifact root must be a non-empty absolute path")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise SystemExit("artifact root must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise SystemExit(f"artifact root cannot be resolved: {exc}") from exc
+    boundaries = artifact_boundaries(config_path, repository_root)
+    for boundary in dict.fromkeys(boundaries):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            continue
+        raise SystemExit(f"artifact root must be external to protected path: {boundary}")
+    if resolved.exists() and not resolved.is_dir():
+        raise SystemExit(f"artifact root must be a directory: {resolved}")
+    return resolved
+
+
+def artifact_boundaries(config_path: Path, repository_root: str | None = None) -> list[Path]:
+    boundaries = [Path.cwd().resolve()]
+    boundaries.extend(git_artifact_boundaries(Path.cwd()))
+    boundaries.extend(git_artifact_boundaries(config_path.parent))
+    if repository_root is not None:
+        boundaries.extend(git_artifact_boundaries(Path(repository_root).expanduser()))
+    return list(dict.fromkeys(boundaries))
+
+
+def derived_artifact_path(
+    artifact_root: Path, name: str, *, config_path: Path, repository_root: str | None = None,
+) -> Path:
+    """Resolve one generated path without allowing symlink or boundary escapes."""
+    candidate = artifact_root / name
+    try:
+        candidate.relative_to(artifact_root)
+    except ValueError as exc:
+        raise SystemExit(f"derived artifact path escapes artifact root: {candidate}") from exc
+    current = candidate
+    while True:
+        if current.is_symlink():
+            raise SystemExit(f"derived artifact path cannot use an existing symlink: {current}")
+        if current == artifact_root:
+            break
+        current = current.parent
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as exc:
+        raise SystemExit(f"derived artifact path cannot be resolved: {candidate}: {exc}") from exc
+    try:
+        resolved.relative_to(artifact_root)
+    except ValueError as exc:
+        raise SystemExit(f"derived artifact path escapes artifact root: {candidate} -> {resolved}") from exc
+    for boundary in artifact_boundaries(config_path, repository_root):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            continue
+        raise SystemExit(f"derived artifact path enters protected path: {boundary}")
+    return resolved
+
+
+def playwright_entry(config_dir: Path, artifact_root: Path | None = None) -> dict[str, Any]:
+    artifact_root = artifact_root or external_artifact_root(None, config_path=config_dir / "opencode.json")
+    profile_dir = derived_artifact_path(
+        artifact_root, "browser-profile", config_path=config_dir / "opencode.json",
+    )
+    output_dir = derived_artifact_path(
+        artifact_root, "transport-output", config_path=config_dir / "opencode.json",
+    )
     command = ["npx", "-y", "@playwright/mcp@0.0.78"]
     chrome_candidates = [
         "/usr/bin/google-chrome-stable",
@@ -108,7 +221,11 @@ def playwright_entry(config_dir: Path) -> dict[str, Any]:
     executable = next((p for p in chrome_candidates if Path(p).exists()), None)
     if executable:
         command.extend(["--browser=chrome", f"--executable-path={executable}"])
-    command.append(f"--user-data-dir={config_dir / 'myrmex-chrome-profile'}")
+    command.extend([
+        f"--user-data-dir={profile_dir}",
+        f"--output-dir={output_dir}",
+        "--output-mode=file",
+    ])
     return {"command": command, "enabled": True, "type": "local"}
 
 
@@ -128,6 +245,8 @@ def validate_config_pair(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def check(args: argparse.Namespace) -> None:
     path = Path(args.config).expanduser().resolve()
+    artifact_root = external_artifact_root(args.artifact_root, config_path=path, repository_root=args.repository_root) \
+        if args.artifact_root is not None else None
     data, alternate = validate_config_pair(path)
     alternate_default = alternate.get("default_agent")
     if args.set_default and isinstance(alternate_default, str) and alternate_default != "myrmex-orchestrator":
@@ -146,12 +265,15 @@ def check(args: argparse.Namespace) -> None:
         "mcp_json": sorted((data.get("mcp") or {}).keys()),
         "mcp_jsonc": sorted((alternate.get("mcp") or {}).keys()),
     }
+    if artifact_root is not None:
+        result["artifact_root"] = str(artifact_root)
     print(json.dumps(result, indent=2))
 
 
 def apply(args: argparse.Namespace) -> None:
     path = Path(args.config).expanduser().resolve()
     config_dir = path.parent
+    artifact_root = external_artifact_root(args.artifact_root, config_path=path, repository_root=args.repository_root)
     data, alternate = validate_config_pair(path)
     alternate_mcp = alternate.get("mcp", {})
     original = json.loads(json.dumps(data))
@@ -162,6 +284,7 @@ def apply(args: argparse.Namespace) -> None:
         "set_default": False,
         "changed": False,
         "mcp_supplied_by_alternate_config": [],
+        "artifact_root": str(artifact_root),
     }
 
     if not args.no_mcp:
@@ -177,7 +300,7 @@ def apply(args: argparse.Namespace) -> None:
                 mcp["engram"] = value
                 record["added_mcp"]["engram"] = value
             if needs_playwright:
-                value = playwright_entry(config_dir)
+                value = playwright_entry(config_dir, artifact_root)
                 mcp["playwright"] = value
                 record["added_mcp"]["playwright"] = value
         if "engram" in alternate_mcp and "engram" not in current_mcp:
@@ -252,11 +375,15 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     c = sub.add_parser("check")
     c.add_argument("--config", required=True)
+    c.add_argument("--artifact-root")
+    c.add_argument("--repository-root")
     c.add_argument("--set-default", action="store_true")
     c.set_defaults(func=check)
     a = sub.add_parser("apply")
     a.add_argument("--config", required=True)
     a.add_argument("--record", required=True)
+    a.add_argument("--artifact-root")
+    a.add_argument("--repository-root")
     a.add_argument("--set-default", action="store_true")
     a.add_argument("--no-mcp", action="store_true")
     a.set_defaults(func=apply)
