@@ -1099,10 +1099,20 @@ def validate_state(data: dict[str, Any]) -> None:
             raise SystemExit("remediation grant references unknown work unit")
         if not isinstance(grant.get("request_id"), str) or not grant["request_id"]:
             raise SystemExit("remediation grant request_id is required")
+        if not isinstance(grant.get("verification_request_id"), str) or not grant["verification_request_id"]:
+            raise SystemExit("remediation grant verification_request_id is required")
+        if not isinstance(grant.get("defect_revision"), int) or grant["defect_revision"] < 0:
+            raise SystemExit("remediation grant defect_revision must be a non-negative integer")
         if not isinstance(grant.get("scope_digest"), str) or not SHA256_RE.fullmatch(grant["scope_digest"]):
             raise SystemExit("remediation grant scope_digest must be lowercase SHA-256")
         if not isinstance(grant.get("source_candidate_sha"), str) or not GIT_SHA_RE.fullmatch(grant["source_candidate_sha"]):
             raise SystemExit("remediation grant source_candidate_sha is invalid")
+        expected_grant_id = correction_grant_id(
+            grant["authority"], grant["request_id"], work_unit_id, grant["scope_digest"],
+            grant["source_candidate_sha"], grant["verification_request_id"], grant["defect_revision"],
+        )
+        if grant["grant_id"] != expected_grant_id:
+            raise SystemExit("remediation grant_id does not match its immutable identity")
         for key in ["granted_attempts", "consumed_attempts"]:
             if not isinstance(grant.get(key), int) or grant[key] < 0:
                 raise SystemExit(f"invalid remediation grant {key}")
@@ -1110,6 +1120,10 @@ def validate_state(data: dict[str, Any]) -> None:
             raise SystemExit("remediation grant over-consumed")
         if grant.get("status") not in {"open", "consumed", "expired", "revoked"}:
             raise SystemExit("invalid remediation grant status")
+        if grant["status"] == "open" and grant["consumed_attempts"] >= grant["granted_attempts"]:
+            raise SystemExit("open remediation grant has no remaining use")
+        if grant["status"] == "consumed" and grant["consumed_attempts"] != grant["granted_attempts"]:
+            raise SystemExit("consumed remediation grant must have exhausted its uses")
         consumed_by_work_unit[work_unit_id] = consumed_by_work_unit.get(work_unit_id, 0) + grant["consumed_attempts"]
     for work_unit_id, work_unit in work_units.items():
         if work_unit_id == "__legacy__":
@@ -1131,6 +1145,10 @@ def validate_state(data: dict[str, Any]) -> None:
                 raise SystemExit("invalid work-unit correction blocker")
             if not isinstance(blocked.get("source_request_id"), str) or not blocked["source_request_id"]:
                 raise SystemExit("work-unit correction blocker requires source_request_id")
+            if blocked.get("verification_request_id") != blocked["source_request_id"]:
+                raise SystemExit("work-unit correction blocker verification request identity mismatch")
+            if not isinstance(blocked.get("defect_revision"), int) or blocked["defect_revision"] < 0:
+                raise SystemExit("work-unit correction blocker requires defect_revision")
             if not isinstance(blocked.get("scope_digest"), str) or not SHA256_RE.fullmatch(blocked["scope_digest"]):
                 raise SystemExit("work-unit correction blocker requires scope_digest")
             if not isinstance(blocked.get("source_candidate_sha"), str) or not GIT_SHA_RE.fullmatch(blocked["source_candidate_sha"]):
@@ -3089,6 +3107,9 @@ def cmd_correction_preflight(args: argparse.Namespace) -> int:
         raise SystemExit("--source-request-id is required for corrections")
     scope_digest = require_scope_digest(args.scope_digest)
     source_candidate_sha = require_candidate_sha(args.source_candidate_sha)
+    defect_revision = latest_work_unit_defect_revision(data, work_unit_id)
+    if args.defect_revision is not None and require_defect_revision(args.defect_revision) != defect_revision:
+        raise SystemExit("CORRECTION_DEFECT_REVISION_CONFLICT")
     base_intent = {
         "task_id": args.task_id,
         "work_unit_id": work_unit_id,
@@ -3103,13 +3124,21 @@ def cmd_correction_preflight(args: argparse.Namespace) -> int:
     existing = find_operation_by_identity(data, "delegation", f"task:{args.task_id}")
     if existing is not None:
         intent = existing.get("intent")
+        existing_correction = intent.get("correction") if isinstance(intent, dict) else None
+        persisted_grant_id = (
+            existing_correction.get("grant_id")
+            if isinstance(existing_correction, dict) else None
+        )
         expected = {
             **base_intent,
             "correction": {
                 "work_unit_id": work_unit_id,
                 "source_request_id": args.source_request_id,
+                "verification_request_id": args.source_request_id,
                 "scope_digest": scope_digest,
                 "source_candidate_sha": source_candidate_sha,
+                "defect_revision": defect_revision,
+                "grant_id": persisted_grant_id,
             },
         }
         if intent != expected:
@@ -3137,14 +3166,21 @@ def cmd_correction_preflight(args: argparse.Namespace) -> int:
 
     grant: dict[str, Any] | None = None
     if work_unit["corrections_used"] >= work_unit["base_correction_limit"]:
-        grant = matching_correction_grant(data, work_unit_id, scope_digest, source_candidate_sha)
+        grant = matching_correction_grant(
+            data, work_unit_id, args.source_request_id, scope_digest, source_candidate_sha, defect_revision,
+        )
         if grant is None:
+            closed_grant = correction_grant_for_identity(
+                data, work_unit_id, args.source_request_id, scope_digest, source_candidate_sha, defect_revision,
+            )
+            if closed_grant is not None and closed_grant.get("status") != "open":
+                raise SystemExit("CORRECTION_GRANT_ALREADY_CONSUMED")
             block_correction(
                 data, scope="work_unit", work_unit_id=work_unit_id, code="BLOCKED_CORRECTION_BUDGET",
                 used=work_unit["corrections_used"], limit=work_unit["base_correction_limit"],
                 reason="work-unit correction budget exhausted for the supplied scope and candidate",
                 source_request_id=args.source_request_id, scope_digest=scope_digest,
-                source_candidate_sha=source_candidate_sha,
+                source_candidate_sha=source_candidate_sha, defect_revision=defect_revision,
             )
             saved = write_state(data, args.expect_revision)
             append_event(args.run_id, "correction.blocked", "work-unit correction budget exhausted", data["remediation"]["blocked"])
@@ -3155,15 +3191,20 @@ def cmd_correction_preflight(args: argparse.Namespace) -> int:
         "work_unit_id": work_unit_id,
         "work_unit_attempt": work_unit["corrections_used"] + 1,
         "source_request_id": args.source_request_id,
+        "verification_request_id": args.source_request_id,
         "scope_digest": scope_digest,
         "source_candidate_sha": source_candidate_sha,
+        "defect_revision": defect_revision,
         "grant_id": grant["grant_id"] if grant is not None else None,
     }
     intent = {**base_intent, "correction": {
         "work_unit_id": work_unit_id,
         "source_request_id": args.source_request_id,
+        "verification_request_id": args.source_request_id,
         "scope_digest": scope_digest,
         "source_candidate_sha": source_candidate_sha,
+        "defect_revision": defect_revision,
+        "grant_id": grant["grant_id"] if grant is not None else None,
     }}
     operation, created = record_operation_intent(
         data, kind="delegation", idempotency_key=f"task:{args.task_id}", intent=intent,
@@ -3304,6 +3345,23 @@ def require_candidate_sha(value: str | None, option: str = "--source-candidate-s
     return value.lower()
 
 
+def require_defect_revision(value: int | None, option: str = "--defect-revision") -> int:
+    if not isinstance(value, int) or value < 0:
+        raise SystemExit(f"{option} must be a non-negative integer")
+    return value
+
+
+def latest_work_unit_defect_revision(data: dict[str, Any], work_unit_id: str) -> int:
+    for record in reversed(data.get("defect_history", [])):
+        if not isinstance(record, dict) or record.get("work_unit_id") != work_unit_id:
+            continue
+        revision = record.get("revision")
+        if not isinstance(revision, int) or revision < 0:
+            raise SystemExit("invalid work-unit defect revision")
+        return revision
+    return 0
+
+
 def get_or_create_work_unit(data: dict[str, Any], work_unit_id: str) -> dict[str, Any]:
     work_units: dict[str, dict[str, Any]] = data["work_units"]
     current = work_units.get(work_unit_id)
@@ -3321,8 +3379,14 @@ def get_or_create_work_unit(data: dict[str, Any], work_unit_id: str) -> dict[str
     return current
 
 
-def correction_grant_id(authority: str, request_id: str, work_unit_id: str, scope_digest: str) -> str:
-    value = "\0".join((authority, request_id, work_unit_id, scope_digest))
+def correction_grant_id(
+    authority: str, request_id: str, work_unit_id: str, scope_digest: str,
+    source_candidate_sha: str, verification_request_id: str, defect_revision: int,
+) -> str:
+    value = "\0".join((
+        authority, request_id, work_unit_id, scope_digest, source_candidate_sha.lower(),
+        verification_request_id, str(defect_revision),
+    ))
     return "grant-" + hashlib.sha256(value.encode()).hexdigest()[:24]
 
 
@@ -3341,8 +3405,25 @@ def grant_is_expired(grant: dict[str, Any]) -> bool:
     return expires <= dt.datetime.now(dt.timezone.utc)
 
 
+def correction_grant_for_identity(
+    data: dict[str, Any], work_unit_id: str, verification_request_id: str,
+    scope_digest: str, source_candidate_sha: str, defect_revision: int,
+) -> dict[str, Any] | None:
+    for grant in data["remediation"]["grants"]:
+        if (
+            grant.get("work_unit_id") == work_unit_id
+            and grant.get("verification_request_id") == verification_request_id
+            and grant.get("scope_digest") == scope_digest
+            and str(grant.get("source_candidate_sha", "")).lower() == source_candidate_sha.lower()
+            and grant.get("defect_revision") == defect_revision
+        ):
+            return grant
+    return None
+
+
 def matching_correction_grant(
-    data: dict[str, Any], work_unit_id: str, scope_digest: str, source_candidate_sha: str,
+    data: dict[str, Any], work_unit_id: str, verification_request_id: str,
+    scope_digest: str, source_candidate_sha: str, defect_revision: int,
 ) -> dict[str, Any] | None:
     for grant in data["remediation"]["grants"]:
         if grant["status"] == "open" and grant_is_expired(grant):
@@ -3351,8 +3432,10 @@ def matching_correction_grant(
         if (
             grant["status"] == "open"
             and grant["work_unit_id"] == work_unit_id
+            and grant["verification_request_id"] == verification_request_id
             and grant["scope_digest"] == scope_digest
             and grant["source_candidate_sha"].lower() == source_candidate_sha.lower()
+            and grant["defect_revision"] == defect_revision
             and grant["consumed_attempts"] < grant["granted_attempts"]
         ):
             return grant
@@ -3363,6 +3446,7 @@ def block_correction(
     data: dict[str, Any], *, scope: str, work_unit_id: str | None, code: str,
     used: int, limit: int | None, reason: str, source_request_id: str | None = None,
     scope_digest: str | None = None, source_candidate_sha: str | None = None,
+    defect_revision: int | None = None,
 ) -> None:
     data["phase"] = "blocked"
     data["status"] = "blocked"
@@ -3379,8 +3463,10 @@ def block_correction(
     if scope == "work_unit":
         context.update({
             "source_request_id": source_request_id,
+            "verification_request_id": source_request_id,
             "scope_digest": scope_digest,
             "source_candidate_sha": source_candidate_sha,
+            "defect_revision": defect_revision,
         })
     data["remediation"]["blocked"] = context
     if scope == "work_unit" and work_unit_id is not None:
@@ -3484,33 +3570,67 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
             raise SystemExit("--expires-at must be an ISO-8601 timestamp with timezone") from exc
         if parsed_expiry.tzinfo is None:
             raise SystemExit("--expires-at must include a timezone")
-    grant_id = correction_grant_id(args.authority, args.request_id, work_unit_id, scope_digest)
-    existing = next((grant for grant in data["remediation"]["grants"] if grant["grant_id"] == grant_id), None)
+
+    blocked = data["remediation"].get("blocked")
+    existing = next((
+        grant for grant in data["remediation"]["grants"]
+        if grant.get("authority") == args.authority
+        and grant.get("request_id") == args.request_id
+        and grant.get("work_unit_id") == work_unit_id
+        and grant.get("scope_digest") == scope_digest
+        and str(grant.get("source_candidate_sha", "")).lower() == source_candidate_sha
+    ), None)
     if existing is not None:
+        verification_request_id = existing.get("verification_request_id")
+        defect_revision = existing.get("defect_revision")
+        if not isinstance(verification_request_id, str) or not isinstance(defect_revision, int):
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
+        if args.verification_request_id is not None and args.verification_request_id != verification_request_id:
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
+        if args.defect_revision is not None and require_defect_revision(args.defect_revision) != defect_revision:
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
+        grant_id = correction_grant_id(
+            args.authority, args.request_id, work_unit_id, scope_digest, source_candidate_sha,
+            verification_request_id, defect_revision,
+        )
         expected = {
             "authority": args.authority,
             "request_id": args.request_id,
             "work_unit_id": work_unit_id,
             "scope_digest": scope_digest,
             "source_candidate_sha": source_candidate_sha,
+            "verification_request_id": verification_request_id,
+            "defect_revision": defect_revision,
             "granted_attempts": args.max_additional_attempts,
             "expires_at": args.expires_at,
         }
+        if existing.get("grant_id") != grant_id:
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDEMPOTENCY_CONFLICT")
         if any(existing.get(key) != value for key, value in expected.items()):
             raise SystemExit("CORRECTION_AUTHORIZATION_IDEMPOTENCY_CONFLICT")
-        blocked = data["remediation"].get("blocked")
+        blocker_matches = (
+            data["phase"] == "blocked" and data["status"] == "blocked"
+            and data.get("blocker") == "BLOCKED_CORRECTION_BUDGET"
+            and isinstance(blocked, dict) and blocked.get("scope") == "work_unit"
+            and blocked.get("work_unit_id") == work_unit_id
+            and blocked.get("source_request_id") == verification_request_id
+            and blocked.get("verification_request_id") == verification_request_id
+            and blocked.get("scope_digest") == scope_digest
+            and str(blocked.get("source_candidate_sha", "")).lower() == source_candidate_sha
+            and blocked.get("defect_revision") == defect_revision
+        )
+        if not blocker_matches:
+            if data.get("status") == "active" and data.get("blocker") is None:
+                print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
         if (
             existing["status"] == "open" and existing["consumed_attempts"] < existing["granted_attempts"]
-            and isinstance(blocked, dict) and blocked.get("scope") == "work_unit"
-            and blocked.get("work_unit_id") == work_unit_id and data.get("blocker") == "BLOCKED_CORRECTION_BUDGET"
         ):
-            # A stale candidate can create a newer blocker while a previously
-            # authorized, still-open grant remains valid for its original
-            # scope.  Replaying that exact grant is the typed recovery path:
-            # it reopens the run, but only a correction carrying this grant's
-            # own scope/SHA can consume it.  New grants still require an exact
-            # match to the current blocker below, so this cannot authorize the
-            # stale candidate or cross a work-unit boundary.
+            # Replaying an open grant is safe only when the blocker is the exact
+            # identity that produced the grant.  The blocker identity check above
+            # deliberately runs before this branch, so a newer verification
+            # cycle cannot be replaced by an old authorization.
             data["remediation"]["blocked"] = None
             data["active_work_unit_id"] = work_unit_id
             data["work_units"][work_unit_id]["status"] = "remediating"
@@ -3522,8 +3642,8 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
                 "grant_id": grant_id,
                 "grant_scope_digest": scope_digest,
                 "grant_candidate_sha": source_candidate_sha,
-                "replaced_blocked_scope_digest": blocked.get("scope_digest"),
-                "replaced_blocked_candidate_sha": blocked.get("source_candidate_sha"),
+                "grant_verification_request_id": verification_request_id,
+                "grant_defect_revision": defect_revision,
                 "revision": saved["revision"],
             })
             print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
@@ -3531,7 +3651,6 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
 
-    blocked = data["remediation"].get("blocked")
     if (
         data["phase"] != "blocked" or data["status"] != "blocked"
         or data.get("blocker") != "BLOCKED_CORRECTION_BUDGET"
@@ -3539,8 +3658,27 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
         or blocked.get("work_unit_id") != work_unit_id
         or blocked.get("scope_digest") != scope_digest
         or str(blocked.get("source_candidate_sha", "")).lower() != source_candidate_sha
+        or blocked.get("source_request_id") != blocked.get("verification_request_id")
+        or not isinstance(blocked.get("verification_request_id"), str)
+        or not isinstance(blocked.get("defect_revision"), int)
     ):
         raise SystemExit("correction authorization requires the matching work-unit correction-budget blocker")
+    verification_request_id = blocked["verification_request_id"]
+    defect_revision = blocked["defect_revision"]
+    if args.verification_request_id is not None and args.verification_request_id != verification_request_id:
+        raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
+    if args.defect_revision is not None and require_defect_revision(args.defect_revision) != defect_revision:
+        raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
+    grant_id = correction_grant_id(
+        args.authority, args.request_id, work_unit_id, scope_digest, source_candidate_sha,
+        verification_request_id, defect_revision,
+    )
+    for grant in data["remediation"]["grants"]:
+        if (
+            grant.get("authority") == args.authority
+            and grant.get("request_id") == args.request_id
+        ):
+            raise SystemExit("CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT")
     work_unit = data["work_units"].get(work_unit_id)
     if not isinstance(work_unit, dict):
         raise SystemExit("correction authorization references an unknown work unit")
@@ -3551,6 +3689,8 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
         "work_unit_id": work_unit_id,
         "scope_digest": scope_digest,
         "source_candidate_sha": source_candidate_sha,
+        "verification_request_id": verification_request_id,
+        "defect_revision": defect_revision,
         "granted_attempts": args.max_additional_attempts,
         "consumed_attempts": 0,
         "status": "open",
@@ -3573,6 +3713,8 @@ def cmd_correction_authorize(args: argparse.Namespace) -> int:
         "work_unit_id": work_unit_id,
         "scope_digest": scope_digest,
         "source_candidate_sha": source_candidate_sha,
+        "verification_request_id": verification_request_id,
+        "defect_revision": defect_revision,
         "granted_attempts": args.max_additional_attempts,
         "revision": saved["revision"],
     })
@@ -4644,6 +4786,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegation.add_argument("--source-request-id")
     delegation.add_argument("--scope-digest")
     delegation.add_argument("--source-candidate-sha")
+    delegation.add_argument("--defect-revision", type=int)
     delegation.add_argument("--expect-revision", type=int, required=True)
     delegation.set_defaults(func=cmd_delegation)
 
@@ -4660,6 +4803,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_correction.add_argument("--source-request-id", required=True)
     start_correction.add_argument("--scope-digest", required=True)
     start_correction.add_argument("--source-candidate-sha", required=True)
+    start_correction.add_argument("--defect-revision", type=int)
     start_correction.add_argument("--expect-revision", type=int, required=True)
     start_correction.set_defaults(func=cmd_correction_start)
 
@@ -4670,6 +4814,8 @@ def build_parser() -> argparse.ArgumentParser:
     authorize.add_argument("--request-id", required=True)
     authorize.add_argument("--scope-digest", required=True)
     authorize.add_argument("--source-candidate-sha", required=True)
+    authorize.add_argument("--verification-request-id")
+    authorize.add_argument("--defect-revision", type=int)
     authorize.add_argument("--max-additional-attempts", type=int, required=True)
     authorize.add_argument("--expires-at")
     authorize.add_argument("--expect-revision", type=int, required=True)

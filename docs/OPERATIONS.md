@@ -64,8 +64,8 @@ myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{
 myrmex-state pause <run-id> --reason "pause requested" --expect-revision <n>
 myrmex-state resume <run-id> --expect-revision <n>
 myrmex-state cancel <run-id> --reason "parent cancelled" --cancellation-type PARENT_OBJECTIVE_CANCELLED --expect-revision <n>
-myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
-myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
+myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
+myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --verification-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
 
 ### Bounded local commit
@@ -127,11 +127,14 @@ Frontier exchange unless those same typed fields and identities are present.
 
 Correction capacity is scoped to each work unit: `--max-corrections-per-work-unit`
 defaults to two, while `--max-total-corrections` is an optional, independent
-run-wide cost ceiling. A correction records its work-unit ID, source request,
-defect-scope digest, and source candidate SHA. When a work unit exhausts its
-base capacity, only `correction authorize` can add the exact bounded number of
-attempts and clear that matching blocker; it cannot clear a different work
-unit's blocker or the run-wide ceiling.
+run-wide cost ceiling. A correction records its work-unit ID, verification
+request ID, defect revision, defect-scope digest, and source candidate SHA. A
+correction grant is bound to that complete identity and can be consumed once.
+When a work unit exhausts its base capacity, only `correction authorize` can
+add the exact bounded number of attempts and clear that matching blocker; an
+older grant cannot replace a newer blocker or authorize another candidate,
+verification cycle, work unit, or scope, and it cannot clear the run-wide
+ceiling.
 
 Resume in OpenCode:
 

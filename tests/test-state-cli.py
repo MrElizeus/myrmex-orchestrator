@@ -283,8 +283,8 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "transition", run_id, "--expect-revision", "13", "--to-phase", "implementing",
         "--reason", "generic transitions cannot clear a correction blocker", env=env, ok=False,
     )
-    # An authorization cannot clear WU-02 with WU-03 scope, but the matching
-    # typed grant reopens the run and gives exactly one extra attempt.
+    # An authorization cannot clear WU-02 with WU-03 scope.  The matching typed
+    # grant reopens the exact blocker and gives exactly one extra attempt.
     run(
         "correction", "authorize", run_id, "--work-unit-id", "WU-03", "--authority", "frontier",
         "--request-id", "req-frontier-wu03", "--scope-digest", "d" * 64,
@@ -319,20 +319,28 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     ).stdout)
     assert stale_scope["blocker"] == "BLOCKED_CORRECTION_BUDGET"
     assert stale_scope["remediation"]["grants"][0]["consumed_attempts"] == 0
-    reactivated = json.loads(run(
+    old_grant_replay = run(
         "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
         "--request-id", "req-frontier-wu02", "--scope-digest", "e" * 64,
         "--source-candidate-sha", "e" * 40, "--max-additional-attempts", "1",
+        "--expect-revision", "15", env=env, ok=False,
+    )
+    assert "CORRECTION_AUTHORIZATION_IDENTITY_CONFLICT" in old_grant_replay.stderr
+    reactivated = json.loads(run(
+        "correction", "authorize", run_id, "--work-unit-id", "WU-02", "--authority", "frontier",
+        "--request-id", "req-frontier-wu02-cycle-2", "--scope-digest", "f" * 64,
+        "--source-candidate-sha", "f" * 40, "--verification-request-id", "req-verify-wu02-stale",
+        "--defect-revision", "2", "--max-additional-attempts", "1",
         "--expect-revision", "15", env=env,
     ).stdout)
     assert reactivated["revision"] == 16 and reactivated["status"] == "active"
     grant_attempt = finish_correction(
         run_id, env=env, revision=16, task_id="task-correction-5", work_unit_id="WU-02",
-        reason="one authorized WU-02 correction", request_id="req-verify-wu02-4",
-        scope_digest="e" * 64, candidate_sha="e" * 40,
+        reason="one authorized WU-02 correction", request_id="req-verify-wu02-stale",
+        scope_digest="f" * 64, candidate_sha="f" * 40,
     )
     assert grant_attempt["work_units"]["WU-02"]["corrections_used"] == 3
-    assert grant_attempt["remediation"]["grants"][0]["consumed_attempts"] == 1
+    assert grant_attempt["remediation"]["grants"][1]["consumed_attempts"] == 1
     extra_blocked = json.loads(run(
         "correction", "start", run_id, "--reason", "grant cannot be reused", "--task-id", "task-correction-6",
         "--work-unit-id", "WU-02", "--workspace", td, "--source-request-id", "req-verify-wu02-5",

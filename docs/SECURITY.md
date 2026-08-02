@@ -53,6 +53,10 @@ automatically.
   the current state and exact reconcile action, but must not create a pause,
   cancel, abandonment, or replacement operation. Explicit pause and typed
   clarification retain a resumable action; cancellation remains terminal.
+- Correction grants are immutable identity capabilities: work unit, candidate
+  SHA, scope digest, verification request ID, and defect revision must all match
+  the current blocker. A consumed grant is never replayed, and a stale grant
+  cannot clear or replace a newer blocker.
 
 ## Delivery
 
