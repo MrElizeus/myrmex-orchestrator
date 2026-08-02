@@ -69,6 +69,30 @@ uses private-index plumbing and compare-and-swap ref updates. Post-effect
 snapshots still reject branch, tag, remote, ref, HEAD, or raw configuration
 changes before consumption.
 
+Tracking-issue and PR delivery have a separate typed side-effect boundary. The
+policy resolver is read-only and validation must use fake/local GitHub helpers;
+tests must not call live GitHub. Before any GitHub effect, state persists a
+`tracking_issue` intent containing the complete resolved policy, policy digest,
+and a stable objective/scope marker. State recomputes the resolver from the
+persisted repository root and exact input paths before accepting it, so a
+self-consistent forged allow artifact cannot bypass repository policy. The exact
+marker is the only unconditional resume identity; title similarity never
+authorizes adoption. A confirmed tracking operation requires the persisted
+repository, issue number, URL, approval marker, and a canonical
+`ISSUE_APPROVED` or `ISSUE_REUSED` receipt. Alias statuses are not accepted as
+approval. Ambiguous discovery, missing approval vocabulary,
+unconfirmed creation, and policy-denied creation remain blockers.
+
+A PR intent is rejected unless it names that confirmed approved issue. The
+state CLI generates the PR body from the persisted issue URL and writes a
+stable body marker and mandatory digest, preventing a copied, tampered, prefix,
+or stale issue link. Effect and receipt must also share the exact PR number and
+URL. The existing PR
+helper queries the exact head/base pair before creation and records
+`PR_CREATED_LABEL_PENDING` before label mutation. A retry must reconcile the
+typed operation and discover the saved issue/PR identity; it must never assume
+that a failed command had no remote effect or create a duplicate.
+
 ## Browser
 
 The Playwright profile is expected to be authenticated by the user in advance. Agents never enter credentials or solve MFA. Only one client should use a persistent profile at a time. Every run derives or requires an absolute external artifact root before browser launch; the profile and MCP output directory remain beneath it, outside the repository, Git common directory, linked worktrees, and current working directory. State records only sanitized identity, response, stability, polling, recovery, and root metadata—not cookies, tokens, auth headers, session tokens, or raw profile contents.

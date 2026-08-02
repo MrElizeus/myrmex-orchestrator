@@ -13,6 +13,7 @@ and by ``github-tracking-issue-recovery.py``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -173,18 +174,24 @@ def resolve(
         missing_action = "ask"
         creation_policy = "ask"
 
-    return {
+    decision = {
+        "on_missing_tracking_issue": missing_action,
+        "on_ambiguous_match": "ask" if effective["ask_on_ambiguous_match"] else "block",
+        "creation_policy": creation_policy,
+    }
+    resolved = {
         "schema": SCHEMA,
+        "repository_root": str(repository_root),
         "mode": mode,
         "delivery": {"tracking_issue": effective},
-        "decision": {
-            "on_missing_tracking_issue": missing_action,
-            "on_ambiguous_match": "ask" if effective["ask_on_ambiguous_match"] else "block",
-            "creation_policy": creation_policy,
-        },
+        "decision": decision,
         "provenance": {f"delivery.tracking_issue.{key}": provenance[key] for key in TRACKING_KEYS},
         "inputs": inputs,
     }
+    policy_digest = hashlib.sha256(json.dumps(
+        resolved, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    return {**resolved, "policy_digest": policy_digest}
 
 
 def build_parser() -> argparse.ArgumentParser:

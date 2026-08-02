@@ -183,6 +183,7 @@ def main() -> int:
     require_text(agent_dir / "myrmex-orchestrator.md", [
         '"myrmex-frontier": allow',
         '"playwright_*": deny', '"git push --force*": deny', "**DIRECT** — default",
+        "tracking_issue", "policy_digest", "body_digest", "recompute", "github-tracking-issue-recovery.py", "github-pr-recovery.py",
     ], errors)
     require_text(agent_dir / "myrmex-scout.md", [
         "edit: deny", "task: deny", '"mem_*": deny', '"playwright_*": deny', '"*": deny',
@@ -366,6 +367,20 @@ def main() -> int:
     for name in ["build-release.py", "collect-git-evidence.py", "inspect-agent-resolution.py", "validate-diff-size.py", "verify-receipt.py", "myrmex-git-local.py"]:
         if not (ROOT / "scripts" / name).is_file():
             errors.append(f"missing release/control script: scripts/{name}")
+    for name in ["resolve-delivery-policy.py", "github-tracking-issue-recovery.py", "github-pr-recovery.py"]:
+        if not (ROOT / "scripts" / name).is_file():
+            errors.append(f"missing delivery recovery script: scripts/{name}")
+
+    require_text(ROOT / "skills/myrmex-git-delivery/SKILL.md", [
+        "tracking_issue", "policy_digest", "body_digest", "recomputes", "ISSUE_APPROVED", "PR_CREATED", "myrmex-state delivery", "PR_CREATED_LABEL_PENDING",
+    ], errors)
+    require_text(ROOT / "docs/OPERATIONS.md", [
+        "resolve-delivery-policy.py", "tracking_issue", "policy_digest", "body_digest", "recomputing",
+        "github-tracking-issue-recovery.py", "myrmex-state delivery", "github-pr-recovery.py", "idempotent",
+    ], errors)
+    require_text(ROOT / "docs/SECURITY.md", [
+        "typed side-effect boundary", "policy digest", "recomputes", "mandatory digest", "ISSUE_APPROVED", "PR_CREATED_LABEL_PENDING",
+    ], errors)
     if (ROOT / ".github").exists() and not (ROOT / ".github" / "workflows" / "ci.yml").is_file():
         errors.append("missing GitHub CI workflow: .github/workflows/ci.yml")
 

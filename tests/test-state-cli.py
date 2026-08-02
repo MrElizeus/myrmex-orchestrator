@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / "bin" / "myrmex-state"
+POLICY_RESOLVER = ROOT / "scripts" / "resolve-delivery-policy.py"
 
 
 def run(*args: str, env: dict[str, str], ok: bool = True) -> subprocess.CompletedProcess[str]:
@@ -749,6 +751,306 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     )
     assert "required ci operation" in incomplete_ci.stderr
 
+    # Delivery is an ordered typed protocol: a confirmed approved tracking
+    # issue is the only identity that can authorize a PR intent, and the PR
+    # body generator derives its link from that persisted receipt.
+    delivery_run = run(
+        "init", "--run-id", "myrmex-delivery-flow", "--objective", "Delivery flow",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+    ).stdout.strip()
+    issue_body = Path(td) / "tracking-body.md"
+    issue_body.write_text("Authorized tracking scope\n")
+    issue_receipt = Path(td) / "tracking-receipt.json"
+    policy_result = subprocess.run(
+        [
+            "python3", str(POLICY_RESOLVER), "--repository-root", td, "--mode", "autonomous",
+            "--installation-profile", str(ROOT / "profiles" / "myrmex-defaults.json"),
+        ], capture_output=True, text=True, timeout=20,
+    )
+    assert policy_result.returncode == 0, policy_result.stderr
+    delivery_policy = json.loads(policy_result.stdout)
+    tracking_policy = delivery_policy["delivery"]["tracking_issue"]
+    tracking_intent = {
+        "required": True,
+        "repo": "acme/myrmex",
+        "title": "tracking: delivery flow",
+        "body_file": str(issue_body),
+        "receipt_file": str(issue_receipt),
+        "objective_id": "delivery-objective",
+        "scope_digest": "a" * 64,
+        "approval_marker": "status:approved",
+        "reuse_matching_approved": tracking_policy["reuse_matching_approved"],
+        "create_when_missing": tracking_policy["create_when_missing"],
+        "ask_on_ambiguous_match": tracking_policy["ask_on_ambiguous_match"],
+        "creation_policy": "authorized",
+        "ensure_approval": True,
+        "policy_digest": delivery_policy["policy_digest"],
+        "policy": delivery_policy,
+    }
+    missing_policy_intent = dict(tracking_intent)
+    missing_policy_intent.pop("policy")
+    missing_policy_intent.pop("policy_digest")
+    missing_policy = run(
+        "operation", delivery_run, "intent", "--kind", "tracking_issue",
+        "--idempotency-key", "tracking-issue:missing-policy", "--intent-json", json.dumps(missing_policy_intent),
+        "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "requires a resolved delivery policy" in missing_policy.stderr
+    bad_digest_intent = dict(tracking_intent)
+    bad_digest_intent["policy_digest"] = "b" * 64
+    bad_digest = run(
+        "operation", delivery_run, "intent", "--kind", "tracking_issue",
+        "--idempotency-key", "tracking-issue:bad-policy-digest", "--intent-json", json.dumps(bad_digest_intent),
+        "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "TRACKING_ISSUE_POLICY_DIGEST_MISMATCH" in bad_digest.stderr
+    deny_config = Path(td) / "deny-policy.json"
+    deny_config.write_text(json.dumps({"delivery": {"tracking_issue": {"create_when_missing": False}}}))
+    deny_result = subprocess.run(
+        [
+            "python3", str(POLICY_RESOLVER), "--repository-root", td, "--mode", "autonomous",
+            "--installation-profile", str(ROOT / "profiles" / "myrmex-defaults.json"),
+            "--repository-config", str(deny_config),
+        ], capture_output=True, text=True, timeout=20,
+    )
+    assert deny_result.returncode == 0, deny_result.stderr
+    deny_policy = json.loads(deny_result.stdout)
+    deny_intent = dict(tracking_intent)
+    deny_intent.update({"policy": deny_policy, "policy_digest": deny_policy["policy_digest"]})
+    deny_bypass = run(
+        "operation", delivery_run, "intent", "--kind", "tracking_issue",
+        "--idempotency-key", "tracking-issue:deny-bypass", "--intent-json", json.dumps(deny_intent),
+        "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "TRACKING_ISSUE_POLICY_INTENT_MISMATCH" in deny_bypass.stderr
+    forged_allow_policy = json.loads(json.dumps(deny_policy))
+    forged_allow_policy["delivery"]["tracking_issue"]["create_when_missing"] = True
+    forged_allow_policy["decision"] = {
+        "on_missing_tracking_issue": "create",
+        "on_ambiguous_match": "ask",
+        "creation_policy": "authorized",
+    }
+    forged_without_digest = {key: value for key, value in forged_allow_policy.items() if key != "policy_digest"}
+    forged_allow_policy["policy_digest"] = hashlib.sha256(json.dumps(
+        forged_without_digest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    forged_allow_intent = dict(tracking_intent)
+    forged_allow_intent.update({
+        "create_when_missing": True,
+        "policy": forged_allow_policy,
+        "policy_digest": forged_allow_policy["policy_digest"],
+    })
+    forged_allow = run(
+        "operation", delivery_run, "intent", "--kind", "tracking_issue",
+        "--idempotency-key", "tracking-issue:forged-allow", "--intent-json", json.dumps(forged_allow_intent),
+        "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "TRACKING_ISSUE_POLICY_RESOLUTION_MISMATCH" in forged_allow.stderr
+    premature_pr = run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:premature", "--intent-json", json.dumps({
+            "required": True, "repo": "acme/myrmex", "head": "fix/delivery", "base": "main",
+            "title": "fix: delivery", "body_file": str(issue_body), "receipt_file": str(issue_receipt),
+            "tracking_issue_operation_id": "op-" + "b" * 24,
+        }), "--expect-revision", "0", env=env, ok=False,
+    )
+    assert "operation not found" in premature_pr.stderr
+    tracking = json.loads(run(
+        "operation", delivery_run, "intent", "--kind", "tracking_issue",
+        "--idempotency-key", "tracking-issue:delivery-objective:" + "a" * 64,
+        "--intent-json", json.dumps(tracking_intent), "--expect-revision", "0", env=env,
+    ).stdout)
+    tracking_operation = tracking["pending_operations"][-1]
+    tracking_effect = {
+        "status": "ISSUE_APPROVED", "repo": "acme/myrmex", "number": 17,
+        "url": "https://github.com/acme/myrmex/issues/17",
+        "identity_marker": tracking_operation["intent"]["identity_marker"],
+        "approval_marker": "status:approved", "approved": True,
+    }
+    run(
+        "operation", delivery_run, "observe", "--operation-id", tracking_operation["operation_id"],
+        "--effect-json", json.dumps(tracking_effect), "--expect-revision", "1", env=env,
+    )
+    run(
+        "operation", delivery_run, "receipt", "--operation-id", tracking_operation["operation_id"],
+        "--receipt-json", json.dumps(tracking_effect), "--expect-revision", "2", env=env,
+    )
+    approved = json.loads(run(
+        "operation", delivery_run, "confirm", "--operation-id", tracking_operation["operation_id"],
+        "--status", "confirmed", "--reason", "tracking issue approval receipt verified",
+        "--expect-revision", "3", env=env,
+    ).stdout)
+    assert approved["pending_operations"][0]["status"] == "confirmed"
+    pr_template = Path(td) / "pr-template.md"
+    pr_template.write_text("Summary of the change\n")
+    pr_body = Path(td) / "pr-body.md"
+    body_artifact = json.loads(run(
+        "delivery", delivery_run, "pr-body", "--tracking-operation-id", tracking_operation["operation_id"],
+        "--template-file", str(pr_template), "--output-file", str(pr_body), env=env,
+    ).stdout)
+    issue_url = "https://github.com/acme/myrmex/issues/17"
+    assert body_artifact["tracking_issue_url"] == issue_url
+    assert issue_url in pr_body.read_text()
+    body_before_replay = pr_body.read_bytes()
+    replay_body = json.loads(run(
+        "delivery", delivery_run, "pr-body", "--tracking-issue-operation-id", tracking_operation["operation_id"],
+        "--body-file", str(pr_template), "--output-file", str(pr_body), env=env,
+    ).stdout)
+    assert replay_body["body_digest"] == body_artifact["body_digest"] and pr_body.read_bytes() == body_before_replay
+    pr_intent = {
+        "required": True, "repo": "acme/myrmex", "head": "fix/delivery", "base": "main",
+        "title": "fix: delivery", "body_file": str(pr_body), "receipt_file": str(Path(td) / "pr-receipt.json"),
+        "tracking_issue_operation_id": tracking_operation["operation_id"],
+        "body_digest": body_artifact["body_digest"],
+    }
+    prefix_body = Path(td) / "prefix-pr-body.md"
+    prefix_body.write_text("See https://github.com/acme/myrmex/issues/170 for context.\n")
+    prefix_intent = dict(pr_intent)
+    prefix_intent.update({
+        "body_file": str(prefix_body),
+        "body_digest": hashlib.sha256(prefix_body.read_bytes()).hexdigest(),
+    })
+    prefix_rejected = run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:prefix-issue-url", "--intent-json", json.dumps(prefix_intent),
+        "--expect-revision", "4", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_BODY_MISSING_TRACKING_ISSUE" in prefix_rejected.stderr
+    stale_marker_body = Path(td) / "stale-marker-pr-body.md"
+    stale_marker_body.write_text("<!-- myrmex:tracking-issue-url=https://github.com/acme/myrmex/issues/170 -->\n")
+    stale_marker_intent = dict(pr_intent)
+    stale_marker_intent.update({
+        "body_file": str(stale_marker_body),
+        "body_digest": hashlib.sha256(stale_marker_body.read_bytes()).hexdigest(),
+    })
+    stale_marker_rejected = run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:stale-issue-marker", "--intent-json", json.dumps(stale_marker_intent),
+        "--expect-revision", "4", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_BODY_TRACKING_ISSUE_MISMATCH" in stale_marker_rejected.stderr
+    missing_body_digest = dict(pr_intent)
+    missing_body_digest.pop("body_digest")
+    missing_digest_result = run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:missing-body-digest", "--intent-json", json.dumps(missing_body_digest),
+        "--expect-revision", "4", env=env, ok=False,
+    )
+    assert "requires body_digest" in missing_digest_result.stderr
+    pr_body.write_text(pr_body.read_text() + "tampered\n")
+    tampered_before_intent = run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:tampered-before-intent", "--intent-json", json.dumps(pr_intent),
+        "--expect-revision", "4", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_BODY_DIGEST_MISMATCH" in tampered_before_intent.stderr
+    pr_body.write_bytes(body_before_replay)
+    pr_state = json.loads(run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:fix/delivery:main", "--intent-json", json.dumps(pr_intent),
+        "--expect-revision", "4", env=env,
+    ).stdout)
+    pr_operation = pr_state["pending_operations"][-1]
+    replayed_pr = json.loads(run(
+        "operation", delivery_run, "intent", "--kind", "pull_request",
+        "--idempotency-key", "pull-request:fix/delivery:main", "--intent-json", json.dumps(pr_intent),
+        "--expect-revision", "99", env=env,
+    ).stdout)
+    assert replayed_pr["revision"] == 5 and len(replayed_pr["pending_operations"]) == 2
+    pr_effect = {
+        "status": "PR_CREATED_LABEL_PENDING", "repo": "acme/myrmex", "head": "fix/delivery",
+        "base": "main", "number": 23, "url": "https://github.com/acme/myrmex/pull/23",
+    }
+    pr_body.write_text(pr_body.read_text() + "tampered after intent\n")
+    tampered_effect = run(
+        "operation", delivery_run, "observe", "--operation-id", pr_operation["operation_id"],
+        "--effect-json", json.dumps(pr_effect), "--expect-revision", "5", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_BODY_DIGEST_MISMATCH" in tampered_effect.stderr
+    pr_body.write_bytes(body_before_replay)
+    run(
+        "operation", delivery_run, "observe", "--operation-id", pr_operation["operation_id"],
+        "--effect-json", json.dumps(pr_effect), "--expect-revision", "5", env=env,
+    )
+    mismatched_pr_receipt = {**pr_effect, "number": 24, "url": "https://github.com/acme/myrmex/pull/24", "status": "PR_CREATED"}
+    mismatched_identity = run(
+        "operation", delivery_run, "receipt", "--operation-id", pr_operation["operation_id"],
+        "--receipt-json", json.dumps(mismatched_pr_receipt), "--expect-revision", "6", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_EFFECT_RECEIPT_IDENTITY_MISMATCH" in mismatched_identity.stderr
+    pr_body.write_text(pr_body.read_text() + "tampered before receipt\n")
+    tampered_receipt = run(
+        "operation", delivery_run, "receipt", "--operation-id", pr_operation["operation_id"],
+        "--receipt-json", json.dumps({**pr_effect, "status": "PR_CREATED"}), "--expect-revision", "6", env=env, ok=False,
+    )
+    assert "PULL_REQUEST_BODY_DIGEST_MISMATCH" in tampered_receipt.stderr
+    pr_body.write_bytes(body_before_replay)
+    run(
+        "operation", delivery_run, "receipt", "--operation-id", pr_operation["operation_id"],
+        "--receipt-json", json.dumps({**pr_effect, "status": "PR_CREATED"}), "--expect-revision", "6", env=env,
+    )
+    confirmed_pr = json.loads(run(
+        "operation", delivery_run, "confirm", "--operation-id", pr_operation["operation_id"],
+        "--status", "confirmed", "--reason", "PR receipt verified", "--expect-revision", "7", env=env,
+    ).stdout)
+    assert [item["kind"] for item in confirmed_pr["pending_operations"]] == ["tracking_issue", "pull_request"]
+    assert all(item["status"] == "confirmed" for item in confirmed_pr["pending_operations"])
+
+    # Legacy-looking success aliases cannot satisfy either delivery gate.
+    alias_revision = 8
+    for index, alias in enumerate(["APPROVED", "REUSED", "SUCCESS", "CONFIRMED"]):
+        alias_intent = dict(tracking_intent)
+        alias_intent.update({"objective_id": f"alias-{index}", "scope_digest": ("b" + str(index)) * 32})
+        alias_state = json.loads(run(
+            "operation", delivery_run, "intent", "--kind", "tracking_issue",
+            "--idempotency-key", f"tracking-issue:alias-{index}", "--intent-json", json.dumps(alias_intent),
+            "--expect-revision", str(alias_revision), env=env,
+        ).stdout)
+        alias_operation = alias_state["pending_operations"][-1]
+        alias_effect = dict(tracking_effect)
+        alias_effect.update({"status": alias, "identity_marker": alias_operation["intent"]["identity_marker"]})
+        run(
+            "operation", delivery_run, "observe", "--operation-id", alias_operation["operation_id"],
+            "--effect-json", json.dumps(alias_effect), "--expect-revision", str(alias_revision + 1), env=env,
+        )
+        run(
+            "operation", delivery_run, "receipt", "--operation-id", alias_operation["operation_id"],
+            "--receipt-json", json.dumps(alias_effect), "--expect-revision", str(alias_revision + 2), env=env,
+        )
+        alias_confirmation = run(
+            "operation", delivery_run, "confirm", "--operation-id", alias_operation["operation_id"],
+            "--status", "confirmed", "--reason", "alias must not approve issue",
+            "--expect-revision", str(alias_revision + 3), env=env, ok=False,
+        )
+        assert "PULL_REQUEST_TRACKING_ISSUE_NOT_APPROVED" in alias_confirmation.stderr
+        alias_revision += 3
+
+    for index, alias in enumerate(["APPROVED", "REUSED", "SUCCESS", "CONFIRMED"]):
+        alias_pr_intent = dict(pr_intent)
+        alias_pr_state = json.loads(run(
+            "operation", delivery_run, "intent", "--kind", "pull_request",
+            "--idempotency-key", f"pull-request:alias-{index}", "--intent-json", json.dumps(alias_pr_intent),
+            "--expect-revision", str(alias_revision), env=env,
+        ).stdout)
+        alias_pr_operation = alias_pr_state["pending_operations"][-1]
+        alias_pr_effect = dict(pr_effect)
+        alias_pr_effect["status"] = alias
+        run(
+            "operation", delivery_run, "observe", "--operation-id", alias_pr_operation["operation_id"],
+            "--effect-json", json.dumps(alias_pr_effect), "--expect-revision", str(alias_revision + 1), env=env,
+        )
+        run(
+            "operation", delivery_run, "receipt", "--operation-id", alias_pr_operation["operation_id"],
+            "--receipt-json", json.dumps(alias_pr_effect), "--expect-revision", str(alias_revision + 2), env=env,
+        )
+        alias_pr_confirmation = run(
+            "operation", delivery_run, "confirm", "--operation-id", alias_pr_operation["operation_id"],
+            "--status", "confirmed", "--reason", "alias must not confirm PR",
+            "--expect-revision", str(alias_revision + 3), env=env, ok=False,
+        )
+        assert "PULL_REQUEST_RECEIPT_NOT_SUCCESSFUL" in alias_pr_confirmation.stderr
+        alias_revision += 3
+
     parent_gate = run(
         "init", "--run-id", "myrmex-parent-gate", "--objective", "Parent gate", "--parent-objective", "continuous objective",
         "--repository-root", td, "--mode", "autonomous", "--scope", "continuous", env=env,
@@ -826,7 +1128,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert "patch requires an active run" in invalid_pair.stderr
 
     doctor = json.loads(run("doctor", env=env).stdout)
-    assert doctor["ok"] is True and doctor["runs"] == 22
+    assert doctor["ok"] is True and doctor["runs"] == 23
 
     schema = json.loads((ROOT / "contracts" / "frontier-state-v2.schema.json").read_text())
     missing = sorted(set(schema["required"]) - set(extra_blocked))

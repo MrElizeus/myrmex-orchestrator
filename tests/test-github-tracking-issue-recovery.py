@@ -179,6 +179,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-tracking-issue-") as td:
     result, payload, saved = invoke(env, receipt_path, body_path, ensure_approval=True)
     assert result.returncode == 0, (result.stderr, payload)
     assert payload["status"] == saved["status"] == "ISSUE_APPROVED", payload
+    assert payload["approved"] is saved["approved"] is True, payload
     state = json.loads(state_path.read_text())
     assert len(state["issues"]) == 1 and {"name": APPROVAL_MARKER} in state["issues"][0]["labels"], state
     assert body_path.is_file() and IDENTITY not in body_path.read_text(), "helper must not mutate or delete the caller body"

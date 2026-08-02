@@ -136,6 +136,30 @@ Before editing or delegating a writer:
 
 Commit only after verification and explicit approval or a standing authorization stated by the user. Load `myrmex-git-delivery` for commit/push. Push only with explicit authorization. Never force-push or push destructive history. Do not push directly to a protected branch unless the user has explicitly named and authorized that branch.
 
+## Tracking issue and PR delivery order
+
+When the resolved delivery policy requires a tracking issue, make the GitHub
+boundary explicit and resumable. First run the read-only
+`scripts/resolve-delivery-policy.py`; then persist a typed `tracking_issue`
+operation before invoking `scripts/github-tracking-issue-recovery.py`. Persist
+the complete resolved policy and `policy_digest` in that intent. State must
+recompute the resolver from the persisted exact inputs before any helper call,
+then persist
+the helper artifact as observed effect and receipt, and confirm it only when
+the receipt is the canonical `ISSUE_APPROVED` or `ISSUE_REUSED` with the exact stable marker,
+repository, issue number, and URL from the intent.
+
+Never create a PR intent without that confirmed approved issue identity. Use
+`myrmex-state delivery <run-id> pr-body` to generate the PR body from the
+confirmed operation; do not hand-copy an issue URL. Persist a typed
+`pull_request` intent containing the generated body, mandatory `body_digest`, and tracking operation,
+then invoke the existing `scripts/github-pr-recovery.py`. Persist and confirm
+its receipt only when it is the canonical `PR_CREATED`; require an exact issue
+URL token/marker, recheck the body digest before effect/receipt/confirmation,
+and require matching effect/receipt PR identities. On resume, run `myrmex-state
+reconcile` first and reuse the saved operation, stable marker, body, and
+head/base identity; discovery must prove absence before any create retry.
+
 ## Verification
 
 Evidence is required, but proportionality matters.

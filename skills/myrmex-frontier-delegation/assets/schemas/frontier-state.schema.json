@@ -1485,9 +1485,165 @@
                 }
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {"const": "tracking_issue"}
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "intent": {"$ref": "#/$defs/trackingIssueIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {"const": "pull_request"}
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "intent": {"$ref": "#/$defs/pullRequestIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
+              }
+            }
           }
         ]
       }
+    }
+  },
+  "$defs": {
+    "deliveryPolicy": {
+      "type": "object",
+      "required": ["schema", "repository_root", "mode", "delivery", "decision", "policy_digest", "provenance", "inputs"],
+      "properties": {
+        "schema": {"const": "myrmex.delivery-policy/v1"},
+        "repository_root": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["autonomous", "interactive"]},
+        "delivery": {
+          "type": "object",
+          "required": ["tracking_issue"],
+          "properties": {
+            "tracking_issue": {
+              "type": "object",
+              "required": ["required", "reuse_matching_approved", "create_when_missing", "approval_marker", "ask_on_ambiguous_match"],
+              "properties": {
+                "required": {"type": "boolean"},
+                "reuse_matching_approved": {"type": "boolean"},
+                "create_when_missing": {"type": "boolean"},
+                "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+                "ask_on_ambiguous_match": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "decision": {
+          "type": "object",
+          "required": ["on_missing_tracking_issue", "on_ambiguous_match", "creation_policy"],
+          "properties": {
+            "on_missing_tracking_issue": {"enum": ["not-required", "create", "ask"]},
+            "on_ambiguous_match": {"enum": ["ask", "block"]},
+            "creation_policy": {"enum": ["deny", "ask", "authorized"]}
+          },
+          "additionalProperties": false
+        },
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {"type": "object"},
+        "inputs": {
+          "type": "object",
+          "required": ["run_authorization", "repository_config", "installation_profile"],
+          "properties": {
+            "run_authorization": {"type": ["string", "null"]},
+            "repository_config": {"type": ["string", "null"]},
+            "installation_profile": {"type": ["string", "null"]}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "trackingIssueIntent": {
+      "type": "object",
+      "required": [
+        "required",
+        "repo",
+        "title",
+        "body_file",
+        "receipt_file",
+        "objective_id",
+        "scope_digest",
+        "approval_marker",
+        "reuse_matching_approved",
+        "create_when_missing",
+        "ask_on_ambiguous_match",
+        "creation_policy",
+        "ensure_approval",
+        "identity_marker",
+        "policy_digest",
+        "policy"
+      ],
+      "properties": {
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "objective_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reuse_matching_approved": {"type": "boolean"},
+        "create_when_missing": {"type": "boolean"},
+        "ask_on_ambiguous_match": {"type": "boolean"},
+        "creation_policy": {"enum": ["deny", "ask", "authorized"]},
+        "ensure_approval": {"type": "boolean"},
+        "identity_marker": {"type": "string", "minLength": 1},
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "policy": {"$ref": "#/$defs/deliveryPolicy"}
+      },
+      "additionalProperties": true
+    },
+    "pullRequestIntent": {
+      "type": "object",
+      "required": [
+        "required",
+        "repo",
+        "head",
+        "base",
+        "title",
+        "body_file",
+        "receipt_file",
+        "tracking_issue_operation_id",
+        "tracking_issue_number",
+        "tracking_issue_url",
+        "tracking_issue_identity_marker",
+        "body_digest"
+      ],
+      "properties": {
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "head": {"type": "string", "minLength": 1},
+        "base": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "label": {"type": ["string", "null"]},
+        "tracking_issue_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+        "tracking_issue_number": {"type": "integer", "minimum": 1},
+        "tracking_issue_url": {"type": "string", "format": "uri"},
+        "tracking_issue_identity_marker": {"type": "string", "minLength": 1},
+        "body_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": true
     }
   }
 }

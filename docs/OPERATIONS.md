@@ -112,6 +112,93 @@ limited to non-critical metadata only. It cannot change phase, status,
 blockers, execution or Git policy, receipts, budgets/counters, work units,
 remediation authority, pending operations, or delegation identity.
 
+### Tracking issue and draft PR delivery
+
+Issue #4 delivery is an ordered protocol. Validation uses fake/local helpers
+only; neither the policy resolver nor the tests call live GitHub.
+
+1. Resolve policy before any GitHub effect. The resolver is read-only and fails
+   closed for malformed policy, ambiguous matches, unavailable approval labels,
+   and unapproved creation:
+
+   ```bash
+   scripts/resolve-delivery-policy.py --repository-root <repo> --mode autonomous \
+     > <external-run-root>/delivery-policy.json
+   ```
+
+2. Create the issue body and receipt paths under the external run artifact root,
+   then persist a typed `tracking_issue` intent. The intent must retain the
+   resolved policy, `repo`, `title`, `body_file`, `receipt_file`, `objective_id`,
+   `scope_digest`, `approval_marker`, all effective policy booleans,
+   `creation_policy`, `ensure_approval`, the resolved `policy_digest`, and
+   the stable identity marker. The state CLI verifies the policy digest,
+   effective fields, decision, run mode, repository root, and exact resolver
+   inputs by recomputing the side-effect-free resolver before accepting the
+   intent. A self-consistent forged policy is not sufficient. Use a stable
+   idempotency key such as
+   `tracking-issue:<objective-id>:<scope-digest>`:
+
+   ```bash
+   myrmex-state operation <run-id> intent --kind tracking_issue \
+     --idempotency-key tracking-issue:<objective-id>:<scope-digest> \
+     --intent-json '<resolved tracking issue intent JSON>' --expect-revision <n>
+   ```
+
+3. Invoke `scripts/github-tracking-issue-recovery.py` with the resolved
+   `creation_policy`, `approval_marker`, and `reuse_matching_approved` policy.
+   Pass `--ensure-approval` when the delivery gate requires an approved issue.
+   The helper discovers the exact stable marker before creating anything and
+   writes `ISSUE_CREATED_APPROVAL_PENDING` before attempting a label effect.
+
+4. Persist the helper's JSON artifact as both the observed effect and receipt,
+   then confirm only the canonical helper statuses `ISSUE_APPROVED` or
+   `ISSUE_REUSED`. The confirmed receipt's
+   repository, issue number, URL, approval marker, and identity marker must
+   match the typed intent:
+
+   ```bash
+   myrmex-state operation <run-id> observe --operation-id <issue-op> \
+     --effect-json '<issue-recovery JSON>' --expect-revision <n>
+   myrmex-state operation <run-id> receipt --operation-id <issue-op> \
+     --receipt-json '<issue-recovery JSON>' --expect-revision <n>
+   myrmex-state operation <run-id> confirm --operation-id <issue-op> \
+     --status confirmed --reason "approved issue receipt verified" --expect-revision <n>
+   ```
+
+5. Generate the PR body from that confirmed identity; do not hand-copy an issue
+   number. The command is pure with respect to run state and writes an atomic
+   body containing the exact persisted issue URL and a stable marker:
+
+   ```bash
+   myrmex-state delivery <run-id> pr-body \
+     --tracking-operation-id <issue-op> --template-file <template.md> \
+     --output-file <external-run-root>/pr-body.md
+   ```
+
+6. Persist a typed `pull_request` intent containing `repo`, `head`, `base`,
+   `title`, generated `body_file`, `receipt_file`, and
+   `tracking_issue_operation_id`, plus the generated body's mandatory
+   `body_digest`. The CLI rejects an unconfirmed issue, a mismatched issue URL,
+   a missing digest, a prefix/stale issue URL, or a body that does not contain
+   an exact canonical issue URL token or generated marker. The digest is
+   rechecked when an effect/receipt is recorded and when confirmation runs.
+
+7. Invoke the existing `scripts/github-pr-recovery.py` with the intent's exact
+   head/base/body/receipt paths. It queries the matching open PR before create,
+   writes `PR_CREATED_LABEL_PENDING` immediately after creation, and never
+   pushes a branch.
+
+8. Persist its artifact through `operation observe` and `operation receipt`,
+   then confirm only the canonical `PR_CREATED` receipt, and the effect and
+   receipt must carry the same exact PR number and URL. A failed label step is
+   resumed through discovery and the narrow label fallback; it is never a
+   reason to run `gh pr create` again.
+
+9. On interruption, run `myrmex-state reconcile <run-id>` first. For a pending
+   tracking issue or PR it returns a single reconcile action. Reuse the saved
+   operation ID, body, receipt, stable marker, and exact remote identity. This
+   makes resume idempotent without duplicate issue or PR creation.
+
 Frontier responses keep transport status separate from the substantive decision.
 `success` transport with `ACCEPT`, `REMEDIATE`, or `BLOCKED` is technically
 confirmed once the request ID, response message ID, effect, and receipt match.
@@ -231,14 +318,15 @@ receipt.
 
 ## Draft PR recovery
 
-Keep GitHub create and label operations separate. Record a typed
-`pull_request` operation intent before invoking `scripts/github-pr-recovery.py`,
-then store its artifact record through `operation observe`, `operation receipt`,
-and `operation confirm`. The helper deliberately no longer writes
-`myrmex-state` through a revision-less generic patch. It writes
-`PR_CREATED_LABEL_PENDING` immediately after creation and can use the
-issue-label REST fallback when `gh pr edit --add-label` lacks Projects scope,
-without creating a duplicate PR.
+Keep GitHub create and label operations separate. A confirmed approved
+`tracking_issue` operation and a body generated by `myrmex-state delivery` are
+prerequisites for the typed `pull_request` intent. Invoke
+`scripts/github-pr-recovery.py` only after that intent is persisted, then store
+its artifact through `operation observe`, `operation receipt`, and
+`operation confirm`. The helper deliberately no longer writes `myrmex-state`
+through a revision-less generic patch. It writes `PR_CREATED_LABEL_PENDING`
+immediately after creation and can use the issue-label REST fallback when
+`gh pr edit --add-label` lacks Projects scope, without creating a duplicate PR.
 
 ## Updating
 

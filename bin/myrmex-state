@@ -97,6 +97,13 @@ OPERATION_KINDS = {
 OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirmed", "failed", "abandoned"}
 TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
 PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
+DELIVERY_POLICY_SCHEMA = "myrmex.delivery-policy/v1"
+TRACKING_ISSUE_APPROVED_STATUSES = {"ISSUE_APPROVED", "ISSUE_REUSED"}
+PULL_REQUEST_SUCCESS_STATUSES = {"PR_CREATED"}
+TRACKING_POLICY_KEYS = (
+    "required", "reuse_matching_approved", "create_when_missing",
+    "approval_marker", "ask_on_ambiguous_match",
+)
 FRONTIER_DECISIONS = {"ACCEPT", "REMEDIATE", "BLOCKED"}
 FRONTIER_RESPONSE_TYPES = {
     "plan", "blocking_clarification", "objective_complete", "sub_objective_complete",
@@ -131,6 +138,10 @@ GIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 AUTHORIZATION_ID_RE = re.compile(r"auth-[0-9a-f]{24}")
 WORK_UNIT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 OPERATION_ID_RE = re.compile(r"op-[0-9a-f]{24}")
+GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GITHUB_ISSUE_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)")
+GITHUB_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+TRACKING_BODY_LINK_RE = re.compile(r"<!--\s*myrmex:tracking-issue-url=(https://github\.com/[^\s]+/issues/\d+)\s*-->")
 AUTHORIZATION_AUTHORITIES = {"user", "frontier"}
 AUTHORIZATION_STATUSES = {"open", "consumed", "expired", "revoked"}
 # `patch` is retained only for non-critical metadata while the state-machine
@@ -272,7 +283,8 @@ def sanitize_evidence(value: Any) -> Any:
     )
     token = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)", re.I)
     if isinstance(value, dict):
-        return {str(key): "[REDACTED]" if sensitive.search(str(key)) else sanitize_evidence(item)
+        safe_policy_input_keys = {"installation_profile", "repository_config", "run_authorization"}
+        return {str(key): "[REDACTED]" if sensitive.search(str(key)) and str(key) not in safe_policy_input_keys else sanitize_evidence(item)
                 for key, item in value.items()}
     if isinstance(value, list):
         return [sanitize_evidence(item) for item in value]
@@ -1739,6 +1751,384 @@ def operation_id(kind: str, idempotency_key: str) -> str:
     return "op-" + hashlib.sha256((kind + "\0" + idempotency_key).encode()).hexdigest()[:24]
 
 
+def require_nonempty_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{label} must be a non-empty string")
+    return value
+
+
+def require_delivery_repo(value: Any, label: str = "delivery repo") -> str:
+    repo = require_nonempty_string(value, label)
+    if not GITHUB_REPO_RE.fullmatch(repo):
+        raise SystemExit(f"{label} must be an owner/name GitHub repository")
+    return repo
+
+
+def require_delivery_sha(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise SystemExit(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def tracking_issue_identity_marker(objective_id: str, scope_digest: str) -> str:
+    return f"<!-- myrmex:tracking objective_id={objective_id} scope_digest={scope_digest} -->"
+
+
+def canonical_delivery_url(repo: str, resource: str, number: Any) -> str:
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise SystemExit(f"delivery {resource} number must be a positive integer")
+    expected = f"https://github.com/{repo}/{resource}/{number}"
+    pattern = GITHUB_ISSUE_URL_RE if resource == "issues" else GITHUB_PR_URL_RE
+    return expected if pattern.fullmatch(expected) else ""
+
+
+def validate_delivery_url(value: Any, repo: str, resource: str, number: Any, label: str) -> str:
+    url = require_nonempty_string(value, label)
+    expected = canonical_delivery_url(repo, resource, number)
+    if url != expected:
+        raise SystemExit(f"{label} does not match the persisted {resource[:-1]} identity")
+    return url
+
+
+def delivery_operation_issue_identity(
+    operation: dict[str, Any], *, require_confirmed: bool = True,
+) -> tuple[str, int, str, str]:
+    """Return the exact approved issue identity from a confirmed operation."""
+    valid_statuses = {"confirmed"} if require_confirmed else {"receipt-recorded", "confirmed"}
+    if operation.get("kind") != "tracking_issue" or operation.get("status") not in valid_statuses:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_NOT_CONFIRMED")
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        raise SystemExit("TRACKING_ISSUE_INTENT_INVALID")
+    repo = require_delivery_repo(intent.get("repo"), "tracking issue intent repo")
+    objective_id = require_nonempty_string(intent.get("objective_id"), "tracking issue objective_id")
+    scope_digest = require_delivery_sha(intent.get("scope_digest"), "tracking issue scope_digest")
+    identity = tracking_issue_identity_marker(objective_id, scope_digest)
+    if intent.get("identity_marker", identity) != identity:
+        raise SystemExit("TRACKING_ISSUE_IDENTITY_MARKER_MISMATCH")
+    receipt = operation.get("receipt")
+    effect = operation.get("effect")
+    if not isinstance(receipt, dict) or not isinstance(effect, dict):
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_NOT_CONFIRMED")
+    status = receipt_status(receipt)
+    if status not in TRACKING_ISSUE_APPROVED_STATUSES:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_NOT_APPROVED")
+    if receipt.get("approved") is not True:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_NOT_APPROVED")
+    if receipt.get("approval_marker") != intent.get("approval_marker"):
+        raise SystemExit("TRACKING_ISSUE_APPROVAL_MARKER_MISMATCH")
+    number = receipt.get("number")
+    if number is None:
+        number = effect.get("number")
+    url = receipt.get("url")
+    if url is None:
+        url = effect.get("url")
+    url = validate_delivery_url(url, repo, "issues", number, "tracking issue URL")
+    if receipt.get("number") is not None and receipt.get("number") != number:
+        raise SystemExit("TRACKING_ISSUE_RECEIPT_IDENTITY_MISMATCH")
+    if effect.get("number") is not None and effect.get("number") != number:
+        raise SystemExit("TRACKING_ISSUE_EFFECT_IDENTITY_MISMATCH")
+    if receipt.get("url") is not None and receipt.get("url") != url:
+        raise SystemExit("TRACKING_ISSUE_RECEIPT_IDENTITY_MISMATCH")
+    if effect.get("url") is not None and effect.get("url") != url:
+        raise SystemExit("TRACKING_ISSUE_EFFECT_IDENTITY_MISMATCH")
+    return repo, int(number), url, identity
+
+
+def delivery_policy_digest(policy: dict[str, Any]) -> str:
+    payload = {key: value for key, value in policy.items() if key != "policy_digest"}
+    return hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+def recompute_delivery_policy(data: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    inputs = policy.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != {"run_authorization", "repository_config", "installation_profile"}:
+        raise SystemExit("TRACKING_ISSUE_POLICY_INPUTS_INVALID")
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "scripts" / "resolve-delivery-policy.py"),
+        "--repository-root", str(data["repository_root"]),
+        "--mode", str(policy.get("mode")),
+    ]
+    for key, option in (
+        ("run_authorization", "--run-authorization-file"),
+        ("repository_config", "--repository-config"),
+        ("installation_profile", "--installation-profile"),
+    ):
+        value = inputs.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value or not Path(value).is_absolute() or str(Path(value).resolve()) != value:
+            raise SystemExit("TRACKING_ISSUE_POLICY_INPUT_PATH_INVALID")
+        command.extend([option, value])
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("TRACKING_ISSUE_POLICY_RECOMPUTE_FAILED") from exc
+    if result.returncode != 0:
+        raise SystemExit("TRACKING_ISSUE_POLICY_RECOMPUTE_FAILED")
+    try:
+        recomputed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("TRACKING_ISSUE_POLICY_RECOMPUTE_MALFORMED") from exc
+    if not isinstance(recomputed, dict):
+        raise SystemExit("TRACKING_ISSUE_POLICY_RECOMPUTE_MALFORMED")
+    if recomputed != policy:
+        raise SystemExit("TRACKING_ISSUE_POLICY_RESOLUTION_MISMATCH")
+    return recomputed
+
+
+def validate_resolved_delivery_policy(data: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    policy = intent.get("policy")
+    if not isinstance(policy, dict) or policy.get("schema") != DELIVERY_POLICY_SCHEMA:
+        raise SystemExit("tracking_issue intent requires a resolved delivery policy")
+    expected_policy_keys = {
+        "schema", "repository_root", "mode", "delivery", "decision", "policy_digest", "provenance", "inputs",
+    }
+    if set(policy) != expected_policy_keys:
+        raise SystemExit("TRACKING_ISSUE_POLICY_FIELDS_INVALID")
+    if policy.get("repository_root") != data.get("repository_root"):
+        raise SystemExit("TRACKING_ISSUE_POLICY_REPOSITORY_MISMATCH")
+    if policy.get("mode") != data.get("mode"):
+        raise SystemExit("TRACKING_ISSUE_POLICY_MODE_MISMATCH")
+    policy_digest = require_delivery_sha(intent.get("policy_digest"), "tracking issue policy_digest")
+    if policy.get("policy_digest") != policy_digest or delivery_policy_digest(policy) != policy_digest:
+        raise SystemExit("TRACKING_ISSUE_POLICY_DIGEST_MISMATCH")
+    recompute_delivery_policy(data, policy)
+    delivery = policy.get("delivery")
+    effective = delivery.get("tracking_issue") if isinstance(delivery, dict) else None
+    if not isinstance(effective, dict) or set(TRACKING_POLICY_KEYS) - set(effective):
+        raise SystemExit("TRACKING_ISSUE_POLICY_FIELDS_MISSING")
+    if set(effective) != set(TRACKING_POLICY_KEYS):
+        raise SystemExit("TRACKING_ISSUE_POLICY_FIELDS_UNEXPECTED")
+    for key in TRACKING_POLICY_KEYS:
+        if key == "approval_marker":
+            marker = require_nonempty_string(effective.get(key), f"resolved policy {key}")
+            if marker != marker.strip() or len(marker) > 128 or any(char in marker for char in "\r\n\0"):
+                raise SystemExit("TRACKING_ISSUE_POLICY_MARKER_INVALID")
+        elif type(effective.get(key)) is not bool:
+            raise SystemExit(f"resolved policy {key} must be boolean")
+    decision = policy.get("decision")
+    if not isinstance(decision, dict):
+        raise SystemExit("TRACKING_ISSUE_POLICY_DECISION_MISSING")
+    if set(decision) != {"on_missing_tracking_issue", "on_ambiguous_match", "creation_policy"}:
+        raise SystemExit("TRACKING_ISSUE_POLICY_DECISION_FIELDS_INVALID")
+    mode = policy["mode"]
+    expected_missing = "not-required" if not effective["required"] else (
+        "create" if mode == "autonomous" and effective["create_when_missing"] else "ask"
+    )
+    expected_creation = "deny" if not effective["required"] else (
+        "authorized" if expected_missing == "create" else "ask"
+    )
+    expected_decision = {
+        "on_missing_tracking_issue": expected_missing,
+        "on_ambiguous_match": "ask" if effective["ask_on_ambiguous_match"] else "block",
+        "creation_policy": expected_creation,
+    }
+    if decision != expected_decision:
+        raise SystemExit("TRACKING_ISSUE_POLICY_DECISION_MISMATCH")
+    intent_fields = {
+        "required": effective["required"],
+        "reuse_matching_approved": effective["reuse_matching_approved"],
+        "create_when_missing": effective["create_when_missing"],
+        "approval_marker": effective["approval_marker"],
+        "ask_on_ambiguous_match": effective["ask_on_ambiguous_match"],
+        "creation_policy": decision["creation_policy"],
+    }
+    if any(intent.get(key) != value for key, value in intent_fields.items()):
+        raise SystemExit("TRACKING_ISSUE_POLICY_INTENT_MISMATCH")
+    if intent.get("ensure_approval") is not effective["required"]:
+        raise SystemExit("TRACKING_ISSUE_POLICY_APPROVAL_MISMATCH")
+    return policy
+
+
+def validate_tracking_issue_intent(data: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(intent)
+    if type(normalized.get("required")) is not bool:
+        raise SystemExit("tracking_issue intent requires boolean required")
+    repo = require_delivery_repo(normalized.get("repo"), "tracking issue intent repo")
+    title = require_nonempty_string(normalized.get("title"), "tracking issue intent title")
+    body_file = require_nonempty_string(normalized.get("body_file"), "tracking issue intent body_file")
+    receipt_file = require_nonempty_string(normalized.get("receipt_file"), "tracking issue intent receipt_file")
+    objective_id = require_nonempty_string(normalized.get("objective_id"), "tracking issue intent objective_id")
+    if not WORK_UNIT_ID_RE.fullmatch(objective_id):
+        raise SystemExit("tracking issue intent objective_id contains unsafe marker characters")
+    scope_digest = require_delivery_sha(normalized.get("scope_digest"), "tracking issue intent scope_digest")
+    approval_marker = require_nonempty_string(normalized.get("approval_marker"), "tracking issue intent approval_marker")
+    if any(char in approval_marker for char in "\r\n\0") or approval_marker != approval_marker.strip() or len(approval_marker) > 128:
+        raise SystemExit("tracking issue intent approval_marker is invalid")
+    creation_policy = normalized.get("creation_policy")
+    if creation_policy not in POLICIES:
+        raise SystemExit("tracking issue intent creation_policy must be deny, ask, or authorized")
+    if type(normalized.get("ensure_approval")) is not bool:
+        raise SystemExit("tracking_issue intent requires boolean ensure_approval")
+    identity = tracking_issue_identity_marker(objective_id, scope_digest)
+    if normalized.get("identity_marker", identity) != identity:
+        raise SystemExit("tracking_issue intent identity_marker does not match objective scope")
+    normalized.update({
+        "repo": repo,
+        "title": title,
+        "body_file": body_file,
+        "receipt_file": receipt_file,
+        "objective_id": objective_id,
+        "scope_digest": scope_digest,
+        "approval_marker": approval_marker,
+        "identity_marker": identity,
+    })
+    policy = validate_resolved_delivery_policy(data, normalized)
+    normalized["policy"] = policy
+    return normalized
+
+
+def exact_issue_url_token(body: str, issue_url: str) -> bool:
+    pattern = re.compile(r"(?<![A-Za-z0-9._-])" + re.escape(issue_url) + r"(?![A-Za-z0-9._/?#-])")
+    return pattern.search(body) is not None
+
+
+def validate_pull_request_intent(data: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(intent)
+    if type(normalized.get("required")) is not bool:
+        raise SystemExit("pull_request intent requires boolean required")
+    repo = require_delivery_repo(normalized.get("repo"), "pull request intent repo")
+    head = require_nonempty_string(normalized.get("head"), "pull request intent head")
+    base = require_nonempty_string(normalized.get("base"), "pull request intent base")
+    title = require_nonempty_string(normalized.get("title"), "pull request intent title")
+    body_file = require_nonempty_string(normalized.get("body_file"), "pull request intent body_file")
+    receipt_file = require_nonempty_string(normalized.get("receipt_file"), "pull request intent receipt_file")
+    tracking_operation_id = normalized.get("tracking_issue_operation_id")
+    if not isinstance(tracking_operation_id, str) or not OPERATION_ID_RE.fullmatch(tracking_operation_id):
+        raise SystemExit("pull_request intent requires tracking_issue_operation_id")
+    tracking_operation = find_operation(data, tracking_operation_id)
+    tracking_repo, issue_number, issue_url, identity = delivery_operation_issue_identity(tracking_operation)
+    if tracking_repo != repo:
+        raise SystemExit("PULL_REQUEST_TRACKING_REPOSITORY_MISMATCH")
+    if "tracking_issue_number" in normalized and normalized["tracking_issue_number"] != issue_number:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_IDENTITY_MISMATCH")
+    if "tracking_issue_url" in normalized and normalized["tracking_issue_url"] != issue_url:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_IDENTITY_MISMATCH")
+    if "tracking_issue_identity_marker" in normalized and normalized["tracking_issue_identity_marker"] != identity:
+        raise SystemExit("PULL_REQUEST_TRACKING_ISSUE_IDENTITY_MISMATCH")
+    try:
+        body = Path(body_file).expanduser().resolve().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"pull request body_file cannot be read: {body_file}") from exc
+    markers = TRACKING_BODY_LINK_RE.findall(body)
+    if markers and any(marker != issue_url for marker in markers):
+        raise SystemExit("PULL_REQUEST_BODY_TRACKING_ISSUE_MISMATCH")
+    if not exact_issue_url_token(body, issue_url):
+        raise SystemExit("PULL_REQUEST_BODY_MISSING_TRACKING_ISSUE")
+    body_digest = normalized.get("body_digest")
+    if body_digest is None:
+        raise SystemExit("pull_request intent requires body_digest")
+    require_delivery_sha(body_digest, "pull request intent body_digest")
+    if body_digest != hashlib.sha256(body.encode()).hexdigest():
+        raise SystemExit("PULL_REQUEST_BODY_DIGEST_MISMATCH")
+    label = normalized.get("label")
+    if label is not None:
+        require_nonempty_string(label, "pull request intent label")
+    normalized.update({
+        "repo": repo,
+        "head": head,
+        "base": base,
+        "title": title,
+        "body_file": body_file,
+        "receipt_file": receipt_file,
+        "tracking_issue_number": issue_number,
+        "tracking_issue_url": issue_url,
+        "tracking_issue_identity_marker": identity,
+    })
+    return normalized
+
+
+def validate_pull_request_body(intent: dict[str, Any], label: str) -> str:
+    body_file = require_nonempty_string(intent.get("body_file"), "pull request intent body_file")
+    body_digest = require_delivery_sha(intent.get("body_digest"), "pull request intent body_digest")
+    issue_url = require_nonempty_string(intent.get("tracking_issue_url"), "pull request tracking issue URL")
+    try:
+        body = Path(body_file).expanduser().resolve().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"pull request body_file cannot be read during {label}: {body_file}") from exc
+    if hashlib.sha256(body.encode()).hexdigest() != body_digest:
+        raise SystemExit(f"PULL_REQUEST_BODY_DIGEST_MISMATCH_DURING_{label.upper()}")
+    markers = TRACKING_BODY_LINK_RE.findall(body)
+    if any(marker != issue_url for marker in markers) or not exact_issue_url_token(body, issue_url):
+        raise SystemExit(f"PULL_REQUEST_BODY_TRACKING_ISSUE_MISMATCH_DURING_{label.upper()}")
+    return body
+
+
+def pull_request_identity(operation: dict[str, Any], payload: dict[str, Any], label: str) -> tuple[int, str]:
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        raise SystemExit("pull_request operation intent is invalid")
+    number = payload.get("number")
+    url = validate_delivery_url(payload.get("url"), intent["repo"], "pull", number, f"pull request {label} URL")
+    return int(number), url
+
+
+def validate_pull_request_effect_receipt_identity(operation: dict[str, Any], payload: dict[str, Any]) -> None:
+    effect = operation.get("effect")
+    if not isinstance(effect, dict):
+        return
+    effect_identity = pull_request_identity(operation, effect, "effect")
+    payload_identity = pull_request_identity(operation, payload, "receipt")
+    if effect_identity != payload_identity:
+        raise SystemExit("PULL_REQUEST_EFFECT_RECEIPT_IDENTITY_MISMATCH")
+
+
+def validate_delivery_payload(operation: dict[str, Any], payload: dict[str, Any], label: str) -> None:
+    """Bind helper artifacts to the typed operation intent and issue identity."""
+    kind = operation.get("kind")
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        raise SystemExit(f"{kind} operation intent is invalid")
+    if kind == "tracking_issue":
+        marker = intent.get("identity_marker")
+        if payload.get("identity_marker") != marker:
+            raise SystemExit(f"tracking issue {label} identity marker mismatch")
+        if payload.get("repo") != intent.get("repo"):
+            raise SystemExit(f"tracking issue {label} repository mismatch")
+        if payload.get("approval_marker") != intent.get("approval_marker"):
+            raise SystemExit(f"tracking issue {label} approval marker mismatch")
+        number = payload.get("number")
+        if number is not None:
+            validate_delivery_url(payload.get("url"), intent["repo"], "issues", number, f"tracking issue {label} URL")
+    elif kind == "pull_request":
+        validate_pull_request_body(intent, label)
+        if payload.get("repo") != intent.get("repo"):
+            raise SystemExit(f"pull request {label} repository mismatch")
+        if payload.get("head") != intent.get("head") or payload.get("base") != intent.get("base"):
+            raise SystemExit(f"pull request {label} branch identity mismatch")
+        pull_request_identity(operation, payload, label)
+
+
+def validate_delivery_confirmation(operation: dict[str, Any], terminal_status: str) -> None:
+    if terminal_status != "confirmed":
+        return
+    kind = operation.get("kind")
+    if kind == "tracking_issue":
+        delivery_operation_issue_identity(operation, require_confirmed=False)
+    elif kind == "pull_request":
+        intent = operation.get("intent")
+        effect = operation.get("effect")
+        receipt = operation.get("receipt")
+        if not isinstance(intent, dict) or not isinstance(effect, dict) or not isinstance(receipt, dict):
+            raise SystemExit("PULL_REQUEST_CONFIRMATION_REQUIRES_TYPED_RECEIPT")
+        if receipt_status(receipt) not in PULL_REQUEST_SUCCESS_STATUSES:
+            raise SystemExit("PULL_REQUEST_RECEIPT_NOT_SUCCESSFUL")
+        if receipt.get("repo") != intent.get("repo") or receipt.get("head") != intent.get("head") or receipt.get("base") != intent.get("base"):
+            raise SystemExit("PULL_REQUEST_RECEIPT_IDENTITY_MISMATCH")
+        number = receipt.get("number") if receipt.get("number") is not None else effect.get("number")
+        url = receipt.get("url") if receipt.get("url") is not None else effect.get("url")
+        validate_delivery_url(url, intent["repo"], "pull", number, "pull request URL")
+        validate_delivery_payload(operation, effect, "effect")
+        validate_delivery_payload(operation, receipt, "receipt")
+        validate_pull_request_effect_receipt_identity(operation, receipt)
+
+
 def find_operation(data: dict[str, Any], operation_id_value: str) -> dict[str, Any]:
     if not isinstance(operation_id_value, str) or not OPERATION_ID_RE.fullmatch(operation_id_value):
         raise SystemExit("--operation-id must be a valid operation ID")
@@ -1888,6 +2278,10 @@ def cmd_operation(args: argparse.Namespace) -> int:
                 raise SystemExit("AUTHORIZATION_EXPIRED")
         require_operation_route(data, args.kind)
         intent = parse_object_json(args.intent_json, "--intent-json")
+        if args.kind == "tracking_issue":
+            intent = validate_tracking_issue_intent(data, intent)
+        elif args.kind == "pull_request":
+            intent = validate_pull_request_intent(data, intent)
         if args.kind == "local_commit":
             candidate_operation = {
                 "kind": "local_commit", "intent": intent, "idempotency_key": args.idempotency_key,
@@ -1913,10 +2307,16 @@ def cmd_operation(args: argparse.Namespace) -> int:
     if args.operation_id is None:
         raise SystemExit(f"operation {action} requires --operation-id")
     operation = find_operation(data, args.operation_id)
+    if operation.get("kind") == "tracking_issue":
+        validate_tracking_issue_intent(data, operation["intent"])
+    elif operation.get("kind") == "pull_request":
+        validate_pull_request_intent(data, operation["intent"])
     if action == "observe":
         if args.effect_json is None:
             raise SystemExit("operation observe requires --effect-json")
         effect = parse_object_json(args.effect_json, "--effect-json")
+        if operation.get("kind") in {"tracking_issue", "pull_request"}:
+            validate_delivery_payload(operation, effect, "effect")
         if operation["status"] in TERMINAL_OPERATION_STATUSES:
             if operation.get("effect") == effect:
                 print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
@@ -1944,6 +2344,10 @@ def cmd_operation(args: argparse.Namespace) -> int:
         if args.receipt_json is None:
             raise SystemExit("operation receipt requires --receipt-json")
         receipt = parse_object_json(args.receipt_json, "--receipt-json")
+        if operation.get("kind") in {"tracking_issue", "pull_request"}:
+            validate_delivery_payload(operation, receipt, "receipt")
+        if operation.get("kind") == "pull_request":
+            validate_pull_request_effect_receipt_identity(operation, receipt)
         if operation["status"] in TERMINAL_OPERATION_STATUSES:
             if operation.get("receipt") == receipt:
                 print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
@@ -1974,6 +2378,8 @@ def cmd_operation(args: argparse.Namespace) -> int:
         raise SystemExit("operation confirm requires --status confirmed, failed, or abandoned")
     if not isinstance(reason, str) or not reason.strip():
         raise SystemExit("operation confirm requires --reason")
+    if operation.get("kind") in {"tracking_issue", "pull_request"}:
+        validate_delivery_confirmation(operation, terminal_status)
     frontier_outcome = None
     if operation.get("kind") == "frontier_exchange":
         frontier_outcome = frontier_typed_lifecycle_outcome(operation)
@@ -4091,8 +4497,8 @@ RECEIPT_ALIASES = {
     "parent_gate": ("parent_gate", "parent_objective_gate"),
 }
 RECEIPT_SUCCESS = {
-    "tracking_issue": {"ISSUE_APPROVED", "ISSUE_REUSED", "APPROVED", "REUSED", "SUCCESS", "CONFIRMED"},
-    "pull_request": {"PR_CREATED", "SUCCESS", "CONFIRMED"},
+    "tracking_issue": {"ISSUE_APPROVED", "ISSUE_REUSED"},
+    "pull_request": {"PR_CREATED"},
     "ci": {"SUCCESS", "PASSED", "CI_PASSED", "CONFIRMED", "COMPLETED"},
     "local_verification": {"SUCCESS", "PASSED", "VERIFIED", "CONFIRMED", "COMPLETED"},
     "parent_gate": {"PARENT_OBJECTIVE_COMPLETE"},
@@ -4425,6 +4831,66 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     }
     print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def cmd_delivery(args: argparse.Namespace) -> int:
+    """Generate delivery text from confirmed local identities without GitHub effects."""
+    data = read_state(args.run_id)
+    require_v2(data, "delivery")
+    validate_state(data)
+    if args.delivery_action != "pr-body":
+        raise SystemExit("unsupported delivery action")
+    tracking_operation = find_operation(data, args.tracking_operation_id)
+    repo, issue_number, issue_url, identity = delivery_operation_issue_identity(tracking_operation)
+    try:
+        template = Path(args.template_file).expanduser().resolve().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"pull request template cannot be read: {args.template_file}") from exc
+    existing_markers = TRACKING_BODY_LINK_RE.findall(template)
+    if any(marker != issue_url for marker in existing_markers):
+        raise SystemExit("PULL_REQUEST_BODY_TRACKING_ISSUE_MISMATCH")
+    if existing_markers:
+        body = template
+    else:
+        suffix = (
+            "\n\n## Tracking issue\n"
+            f"[Tracking issue #{issue_number}]({issue_url})\n"
+            f"<!-- myrmex:tracking-issue-url={issue_url} -->\n"
+        )
+        body = template.rstrip() + suffix
+    output = Path(args.output_file).expanduser().resolve()
+    atomic_text(output, body)
+    result = {
+        "schema": "myrmex.delivery-artifact/v1",
+        "kind": "pull_request_body",
+        "body_file": str(output),
+        "body_digest": hashlib.sha256(body.encode()).hexdigest(),
+        "tracking_issue_operation_id": tracking_operation["operation_id"],
+        "tracking_issue_identity_marker": identity,
+        "tracking_issue_number": issue_number,
+        "tracking_issue_url": issue_url,
+        "repo": repo,
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
 
 def cmd_complete(args: argparse.Namespace) -> int:
     """Atomically persist terminal state, then record completion before unlocking."""
@@ -4761,6 +5227,17 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile", help="derive one safe recovery action without side effects")
     reconcile.add_argument("run_id")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    delivery = sub.add_parser("delivery", help="derive delivery artifacts from confirmed typed identities")
+    delivery.add_argument("run_id")
+    delivery.add_argument("delivery_action", choices=["pr-body"])
+    delivery.add_argument(
+        "--tracking-operation-id", "--tracking-issue-operation-id",
+        dest="tracking_operation_id", required=True,
+    )
+    delivery.add_argument("--template-file", "--body-file", dest="template_file", required=True)
+    delivery.add_argument("--output-file", required=True)
+    delivery.set_defaults(func=cmd_delivery)
 
     event = sub.add_parser("event")
     event.add_argument("run_id")
