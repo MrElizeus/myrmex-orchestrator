@@ -37,6 +37,12 @@ automatically.
 - One writer per work unit.
 - Worker has no commit/push capability.
 - Verifier and browser are read-only with respect to source.
+- Frontier transport is validated independently from the model decision. Only
+  a matching request ID, response message ID, effect, and receipt can produce
+  a technically confirmed exchange; `REMEDIATE` and `BLOCKED` are decisions,
+  not transport failures. Recovery of a legacy failed exchange is typed,
+  revision-checked, identity-bound, append-only, and cannot rewrite its
+  original terminal evidence.
 
 ## Delivery
 

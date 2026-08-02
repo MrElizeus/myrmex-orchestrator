@@ -1011,6 +1011,164 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "transport_status": {
+            "enum": [
+              "success",
+              "transport_error",
+              "timeout",
+              "malformed",
+              "request_mismatch",
+              "response_identity_mismatch"
+            ]
+          },
+          "frontier_decision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ACCEPT",
+              "REMEDIATE",
+              "BLOCKED",
+              null
+            ]
+          },
+          "effective_status": {
+            "enum": [
+              "confirmed",
+              "failed",
+              "abandoned"
+            ]
+          },
+          "effective_transport_status": {
+            "enum": [
+              "success",
+              "transport_error",
+              "timeout",
+              "malformed",
+              "request_mismatch",
+              "response_identity_mismatch"
+            ]
+          },
+          "effective_frontier_decision": {
+            "enum": [
+              "ACCEPT",
+              "REMEDIATE",
+              "BLOCKED"
+            ]
+          },
+          "effective_outcome": {
+            "type": "object",
+            "required": [
+              "transport_status",
+              "frontier_decision",
+              "request_id",
+              "message_id",
+              "effect",
+              "receipt"
+            ],
+            "properties": {
+              "transport_status": {
+                "enum": [
+                  "success",
+                  "transport_error",
+                  "timeout",
+                  "malformed",
+                  "request_mismatch",
+                  "response_identity_mismatch"
+                ]
+              },
+              "frontier_decision": {
+                "enum": [
+                  "ACCEPT",
+                  "REMEDIATE",
+                  "BLOCKED"
+                ]
+              },
+              "request_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "effect": {
+                "type": "object"
+              },
+              "receipt": {
+                "type": "object"
+              }
+            },
+            "additionalProperties": true
+          },
+          "recovery_history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "recovery_id",
+                "transport_status",
+                "frontier_decision",
+                "request_id",
+                "message_id",
+                "effective_status",
+                "effect",
+                "receipt",
+                "recorded_at"
+              ],
+              "properties": {
+                "recovery_id": {
+                  "type": "string",
+                  "pattern": "^recovery-[0-9a-f]{24}$"
+                },
+                "transport_status": {
+                  "const": "success"
+                },
+                "frontier_decision": {
+                  "enum": [
+                    "ACCEPT",
+                    "REMEDIATE",
+                    "BLOCKED"
+                  ]
+                },
+                "request_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "task_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "scope": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "effective_status": {
+                  "const": "confirmed"
+                },
+                "effect": {
+                  "type": "object"
+                },
+                "receipt": {
+                  "type": "object"
+                },
+                "recorded_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "additionalProperties": true
+            }
           }
         },
         "allOf": [

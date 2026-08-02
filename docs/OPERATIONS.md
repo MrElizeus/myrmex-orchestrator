@@ -48,6 +48,10 @@ myrmex-state transition <run-id> --to-phase collecting-context --reason "context
 myrmex-state route set <run-id> --policy direct-only --authority user --request-id <request-id> --expect-revision <n>
 myrmex-state reconcile <run-id>
 myrmex-state frontier <run-id> start --request-id <request-id> --task-id <task-id> --expect-revision <n>
+myrmex-state frontier <run-id> result --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
+  --transport-status success --frontier-decision ACCEPT --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
+myrmex-state frontier <run-id> recover --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
+  --transport-status success --frontier-decision REMEDIATE --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
 myrmex-state delegation-preflight <run-id> --agent myrmex-worker --role writer --reason "bounded work" --task-id <task-id> --work-unit-id WU-03 --workspace <repo> --expect-revision <n>
 myrmex-state operation <run-id> intent --kind pull_request --idempotency-key <stable-key> --intent-json '{"required":true}' --expect-revision <n>
 myrmex-state operation <run-id> observe --operation-id op-... --effect-json '{...}' --expect-revision <n>
@@ -101,6 +105,19 @@ recording the WU/task identity before a Task launch. `myrmex-state patch` is
 limited to non-critical metadata only. It cannot change phase, status,
 blockers, execution or Git policy, receipts, budgets/counters, work units,
 remediation authority, pending operations, or delegation identity.
+
+Frontier responses keep transport status separate from the substantive decision.
+`success` transport with `ACCEPT`, `REMEDIATE`, or `BLOCKED` is technically
+confirmed once the request ID, response message ID, effect, and receipt match.
+Transport errors, timeouts, malformed responses, request mismatches, and
+response-identity mismatches are recorded as failed and remain completion
+blockers. `frontier recover` is the typed path for a legacy failed Frontier
+operation: it appends immutable recovery evidence and an effective confirmed
+outcome without rewriting the original terminal record. An exact replay is a
+byte-stable no-op; conflicting identity/payload or an unexpected revision is
+rejected without mutation.
+The generic `operation observe/receipt/confirm` lifecycle cannot confirm a
+Frontier exchange unless those same typed fields and identities are present.
 
 Correction capacity is scoped to each work unit: `--max-corrections-per-work-unit`
 defaults to two, while `--max-total-corrections` is an optional, independent

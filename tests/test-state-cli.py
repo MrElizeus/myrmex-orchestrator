@@ -592,25 +592,27 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert recovery_path.read_bytes() == recovery_before
     frontier_intent = json.loads(run(
         "frontier", recovery_run, "start", "--request-id", "req-frontier-ledger-1", "--task-id", "frontier-task-1",
-        "--intent-json", '{"purpose":"plan"}', "--expect-revision", "0", env=env,
+        "--message-id", "msg-frontier-ledger-1", "--intent-json", '{"purpose":"plan"}',
+        "--expect-revision", "0", env=env,
     ).stdout)
     frontier_operation = frontier_intent["pending_operations"][0]["operation_id"]
     assert json.loads(run("reconcile", recovery_run, env=env).stdout)["action"] == "RECOVER_FRONTIER_EXCHANGE"
     run(
         "operation", recovery_run, "observe", "--operation-id", frontier_operation,
-        "--effect-json", '{"transport":"browser","request_id":"req-frontier-ledger-1"}',
+        "--effect-json", '{"transport":"browser","transport_status":"success","frontier_decision":"ACCEPT","request_id":"req-frontier-ledger-1","message_id":"msg-frontier-ledger-1"}',
         "--expect-revision", "1", env=env,
     )
     assert json.loads(run("reconcile", recovery_run, env=env).stdout)["action"] == "WAIT_FRONTIER"
     run(
         "operation", recovery_run, "receipt", "--operation-id", frontier_operation,
-        "--receipt-json", '{"status":"PLAN_RECEIVED"}', "--expect-revision", "2", env=env,
+        "--receipt-json", '{"status":"PLAN_RECEIVED","transport_status":"success","frontier_decision":"ACCEPT","request_id":"req-frontier-ledger-1","message_id":"msg-frontier-ledger-1"}',
+        "--expect-revision", "2", env=env,
     )
     # Re-observing an already-discovered effect is idempotent and does not
     # regress a receipt-recorded operation or consume a revision.
     same_effect = json.loads(run(
         "operation", recovery_run, "observe", "--operation-id", frontier_operation,
-        "--effect-json", '{"transport":"browser","request_id":"req-frontier-ledger-1"}',
+        "--effect-json", '{"transport":"browser","transport_status":"success","frontier_decision":"ACCEPT","request_id":"req-frontier-ledger-1","message_id":"msg-frontier-ledger-1"}',
         "--expect-revision", "3", env=env,
     ).stdout)
     assert same_effect["revision"] == 3 and same_effect["pending_operations"][0]["status"] == "receipt-recorded"

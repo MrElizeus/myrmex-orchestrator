@@ -96,6 +96,26 @@ OPERATION_KINDS = {
 OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirmed", "failed", "abandoned"}
 TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
 PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
+FRONTIER_DECISIONS = {"ACCEPT", "REMEDIATE", "BLOCKED"}
+FRONTIER_TRANSPORT_STATUSES = {
+    "success", "transport_error", "timeout", "malformed", "request_mismatch",
+    "response_identity_mismatch",
+}
+FRONTIER_TRANSPORT_ALIASES = {
+    "ok": "success",
+    "successful": "success",
+    "error": "transport_error",
+    "failed": "transport_error",
+    "transport_failure": "transport_error",
+    "transport-failure": "transport_error",
+    "transport-error": "transport_error",
+    "request-mismatch": "request_mismatch",
+    "malformed_response": "malformed",
+    "malformed-response": "malformed",
+    "response_mismatch": "response_identity_mismatch",
+    "response-mismatch": "response_identity_mismatch",
+    "identity_mismatch": "response_identity_mismatch",
+}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 AUTHORIZATION_ID_RE = re.compile(r"auth-[0-9a-f]{24}")
@@ -135,6 +155,8 @@ PROTECTED_PATCH_PATHS = {
     "correction",
     "authorizations",
     "pending_operations",
+    "recovery_history",
+    "effective_outcome",
     "delegation_ledger",
     "delegation_batches",
 }
@@ -490,6 +512,115 @@ def validate_execution(data: dict[str, Any], *, required: bool) -> None:
         raise SystemExit("execution locked must be boolean")
 
 
+def normalize_frontier_transport_status(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("Frontier transport_status must be a non-empty string")
+    normalized = value.strip().lower().replace(" ", "_")
+    normalized = FRONTIER_TRANSPORT_ALIASES.get(normalized, normalized)
+    if normalized not in FRONTIER_TRANSPORT_STATUSES:
+        raise SystemExit(f"invalid Frontier transport_status: {value!r}")
+    return normalized
+
+
+def normalize_frontier_decision(value: Any, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("Frontier frontier_decision must be ACCEPT, REMEDIATE, or BLOCKED")
+    normalized = value.strip().upper().replace("-", "_")
+    if normalized not in FRONTIER_DECISIONS:
+        raise SystemExit(f"invalid Frontier frontier_decision: {value!r}")
+    return normalized
+
+
+def frontier_message_id(source: Any) -> str | None:
+    if not isinstance(source, dict):
+        return None
+    values = [source.get(key) for key in ("message_id", "response_message_id", "response_id") if source.get(key) is not None]
+    if not values:
+        return None
+    if not all(isinstance(value, str) and value for value in values):
+        return "<invalid>"
+    if len(set(values)) != 1:
+        return "<conflict>"
+    return values[0]
+
+
+def frontier_operation_identity(operation: dict[str, Any]) -> dict[str, str | None]:
+    """Extract immutable Frontier identity without changing historical records."""
+    sources = [operation.get("intent"), operation.get("effect"), operation.get("receipt")]
+    request_id: str | None = None
+    message_id: str | None = None
+    task_id: str | None = None
+    scope: str | None = None
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if request_id is None and isinstance(source.get("request_id"), str) and source["request_id"]:
+            request_id = source["request_id"]
+        source_message = frontier_message_id(source)
+        if message_id is None and source_message not in {None, "<invalid>", "<conflict>"}:
+            message_id = source_message
+        if task_id is None and isinstance(source.get("task_id"), str) and source["task_id"]:
+            task_id = source["task_id"]
+        if scope is None and isinstance(source.get("scope"), str) and source["scope"]:
+            scope = source["scope"]
+    return {"request_id": request_id, "message_id": message_id, "task_id": task_id, "scope": scope}
+
+
+def validate_frontier_typed_fields(operation: dict[str, Any]) -> None:
+    """Validate additive Frontier transport/decision and recovery evidence."""
+    if operation.get("kind") != "frontier_exchange":
+        return
+    for field in ("transport_status", "effective_transport_status"):
+        if field in operation and operation[field] is not None:
+            normalize_frontier_transport_status(operation[field])
+    for field in ("frontier_decision", "effective_frontier_decision"):
+        if field in operation and operation[field] is not None:
+            normalize_frontier_decision(operation[field])
+    effective_status = operation.get("effective_status")
+    if effective_status is not None and effective_status not in TERMINAL_OPERATION_STATUSES:
+        raise SystemExit("Frontier effective_status must be a terminal operation status")
+    history = operation.get("recovery_history", [])
+    if not isinstance(history, list):
+        raise SystemExit("Frontier recovery_history must be an array")
+    recovery_ids: set[str] = set()
+    for recovery in history:
+        if not isinstance(recovery, dict):
+            raise SystemExit("Frontier recovery entry must be an object")
+        recovery_id = recovery.get("recovery_id")
+        if not isinstance(recovery_id, str) or not re.fullmatch(r"recovery-[0-9a-f]{24}", recovery_id):
+            raise SystemExit("Frontier recovery entry has an invalid recovery_id")
+        if recovery_id in recovery_ids:
+            raise SystemExit("Frontier recovery IDs must be unique")
+        recovery_ids.add(recovery_id)
+        normalize_frontier_transport_status(recovery.get("transport_status"))
+        normalize_frontier_decision(recovery.get("frontier_decision"))
+        if recovery.get("effective_status") not in TERMINAL_OPERATION_STATUSES:
+            raise SystemExit("Frontier recovery effective_status must be terminal")
+        for field in ("request_id", "message_id", "recorded_at"):
+            if not isinstance(recovery.get(field), str) or not recovery[field]:
+                raise SystemExit(f"Frontier recovery {field} is required")
+        for field in ("effect", "receipt"):
+            if not isinstance(recovery.get(field), dict):
+                raise SystemExit(f"Frontier recovery {field} must be an object")
+    if history and operation.get("effective_status") != history[-1].get("effective_status"):
+        raise SystemExit("Frontier effective_status must match the latest recovery")
+    effective_outcome = operation.get("effective_outcome")
+    if effective_outcome is not None:
+        if not isinstance(effective_outcome, dict):
+            raise SystemExit("Frontier effective_outcome must be an object")
+        for field in ("transport_status", "frontier_decision", "request_id", "message_id", "effect", "receipt"):
+            if field not in effective_outcome:
+                raise SystemExit(f"Frontier effective_outcome missing {field}")
+        normalize_frontier_transport_status(effective_outcome["transport_status"])
+        normalize_frontier_decision(effective_outcome["frontier_decision"])
+        if not isinstance(effective_outcome["request_id"], str) or not isinstance(effective_outcome["message_id"], str):
+            raise SystemExit("Frontier effective_outcome identity must be strings")
+        if not isinstance(effective_outcome["effect"], dict) or not isinstance(effective_outcome["receipt"], dict):
+            raise SystemExit("Frontier effective_outcome evidence must be objects")
+
+
 def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None:
     """Validate the durable side-effect ledger without interpreting effects.
 
@@ -552,6 +683,7 @@ def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None
         reason = operation.get("terminal_reason")
         if reason is not None and not isinstance(reason, str):
             raise SystemExit("pending operation terminal_reason must be a string or null")
+        validate_frontier_typed_fields(operation)
 
 
 def validate_common_state(data: dict[str, Any]) -> None:
@@ -1452,6 +1584,25 @@ def cmd_operation(args: argparse.Namespace) -> int:
         raise SystemExit("operation confirm requires --status confirmed, failed, or abandoned")
     if not isinstance(reason, str) or not reason.strip():
         raise SystemExit("operation confirm requires --reason")
+    frontier_outcome = None
+    if operation.get("kind") == "frontier_exchange":
+        frontier_outcome = frontier_typed_lifecycle_outcome(operation)
+        if frontier_outcome is None:
+            raise SystemExit("FRONTIER_TYPED_CONFIRMATION_REQUIRED")
+    if frontier_outcome is not None:
+        frontier_status, frontier_decision, frontier_errors = frontier_outcome
+        if frontier_status == "success" and not frontier_errors:
+            if terminal_status != "confirmed":
+                raise SystemExit("typed Frontier success requires --status confirmed")
+            operation["transport_status"] = frontier_status
+            operation["frontier_decision"] = frontier_decision
+        else:
+            terminal_status = "failed"
+            operation["transport_status"] = frontier_status
+            operation["frontier_decision"] = None
+            reason = reason + ": Frontier transport " + frontier_status
+            if frontier_errors:
+                reason += ": " + "; ".join(sorted(set(frontier_errors)))
     if operation["status"] in TERMINAL_OPERATION_STATUSES:
         if operation["status"] == terminal_status and operation.get("terminal_reason") == reason:
             print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
@@ -1712,6 +1863,10 @@ def cmd_authorization(args: argparse.Namespace) -> int:
 
 def cmd_frontier(args: argparse.Namespace) -> int:
     """Persist a Frontier exchange intent before browser transport is invoked."""
+    if args.frontier_action == "result":
+        return cmd_frontier_result(args)
+    if args.frontier_action == "recover":
+        return cmd_frontier_recover(args)
     data = read_state(args.run_id)
     require_v2(data, "frontier")
     ensure_v2_defaults(data)
@@ -1723,6 +1878,11 @@ def cmd_frontier(args: argparse.Namespace) -> int:
         raise SystemExit("--task-id must be a non-empty string")
     intent = parse_object_json(args.intent_json, "--intent-json")
     intent.update({"request_id": args.request_id, "task_id": args.task_id})
+    intent.setdefault("scope", data["scope"])
+    if args.message_id is not None:
+        intent["message_id"] = args.message_id
+    if args.scope is not None:
+        intent["scope"] = args.scope
     if args.chat_url is not None:
         intent["chat_url"] = args.chat_url
     key = args.idempotency_key or f"frontier:{args.request_id}"
@@ -1740,6 +1900,331 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     append_event(args.run_id, "frontier.intent_recorded", None, {
         "operation_id": operation["operation_id"], "request_id": args.request_id,
         "task_id": args.task_id, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def frontier_response_objects(args: argparse.Namespace, *, recovery: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    if recovery and (args.effect_json is None or args.receipt_json is None):
+        raise SystemExit("Frontier recovery requires both --effect-json and --receipt-json")
+    effect = parse_object_json(args.effect_json, "--effect-json") if args.effect_json is not None else {}
+    receipt = parse_object_json(args.receipt_json, "--receipt-json") if args.receipt_json is not None else {}
+    return effect, receipt
+
+
+def frontier_identity_errors(
+    source: dict[str, Any], *, request_id: str, message_id: str | None,
+    task_id: str | None, scope: str | None, transport_status: str, decision: str | None,
+    label: str,
+) -> list[str]:
+    errors: list[str] = []
+    source_request = source.get("request_id")
+    if source_request is not None and source_request != request_id:
+        errors.append(f"{label} request_id mismatch")
+    source_message = frontier_message_id(source)
+    if source_message in {"<invalid>", "<conflict>"}:
+        errors.append(f"{label} message identity is malformed")
+    elif source_message is not None and source_message != message_id:
+        errors.append(f"{label} message_id mismatch")
+    if task_id is not None and source.get("task_id") is not None and source.get("task_id") != task_id:
+        errors.append(f"{label} task_id scope mismatch")
+    if scope is not None and source.get("scope") is not None and source.get("scope") != scope:
+        errors.append(f"{label} scope mismatch")
+    if "transport_status" in source:
+        try:
+            if normalize_frontier_transport_status(source["transport_status"]) != transport_status:
+                errors.append(f"{label} transport_status mismatch")
+        except SystemExit:
+            errors.append(f"{label} transport_status is malformed")
+    if "frontier_decision" in source:
+        try:
+            source_decision = normalize_frontier_decision(source["frontier_decision"], allow_none=True)
+        except SystemExit:
+            errors.append(f"{label} frontier_decision is malformed")
+        else:
+            if source_decision != decision:
+                errors.append(f"{label} frontier_decision mismatch")
+    return errors
+
+
+def build_frontier_response(
+    data: dict[str, Any], operation: dict[str, Any], args: argparse.Namespace, *, recovery: bool,
+) -> tuple[str, str | None, str, str | None, dict[str, Any], dict[str, Any], list[str]]:
+    requested_status = normalize_frontier_transport_status(args.transport_status)
+    requested_decision = normalize_frontier_decision(args.frontier_decision, allow_none=True)
+    effect_raw, receipt_raw = frontier_response_objects(args, recovery=recovery)
+    request_id = args.request_id
+    message_id = args.message_id or frontier_message_id(effect_raw) or frontier_message_id(receipt_raw)
+    task_id = args.task_id
+    scope = args.scope
+    expected = frontier_operation_identity(operation)
+    errors: list[str] = []
+
+    if expected["request_id"] is not None and request_id != expected["request_id"]:
+        errors.append("request_id does not match the Frontier operation")
+    if expected["message_id"] is not None and message_id != expected["message_id"]:
+        errors.append("message_id does not match the Frontier operation")
+    if expected["task_id"] is not None and task_id is not None and task_id != expected["task_id"]:
+        errors.append("task_id scope does not match the Frontier operation")
+    if expected["scope"] is not None and scope is not None and scope != expected["scope"]:
+        errors.append("scope does not match the Frontier operation")
+    if task_id is None:
+        task_id = expected["task_id"]
+    if scope is None:
+        scope = expected["scope"]
+
+    if requested_status == "success" and requested_decision is None:
+        errors.append("successful Frontier transport requires frontier_decision")
+    if requested_status == "success" and not message_id:
+        errors.append("successful Frontier transport requires message_id")
+    if not isinstance(request_id, str) or not request_id:
+        errors.append("request_id is required")
+    for source, label in ((effect_raw, "effect"), (receipt_raw, "receipt")):
+        if args.effect_json is not None or label == "receipt":
+            errors.extend(frontier_identity_errors(
+                source, request_id=request_id, message_id=message_id, task_id=task_id,
+                scope=scope, transport_status=requested_status, decision=requested_decision, label=label,
+            ))
+    if requested_status == "success" and (args.effect_json is None or args.receipt_json is None):
+        errors.append("successful Frontier transport requires effect and receipt")
+    if requested_status == "success" and effect_raw != {} and receipt_raw != {}:
+        effect_message = frontier_message_id(effect_raw)
+        receipt_message = frontier_message_id(receipt_raw)
+        if effect_message != receipt_message:
+            errors.append("effect and receipt response identity mismatch")
+        if effect_raw.get("request_id") is not None and receipt_raw.get("request_id") is not None \
+                and effect_raw.get("request_id") != receipt_raw.get("request_id"):
+            errors.append("effect and receipt request_id mismatch")
+
+    status = requested_status
+    decision = requested_decision if not errors else None
+    if errors and requested_status == "success":
+        if any("request_id" in error or "scope" in error or "task_id" in error for error in errors):
+            status = "request_mismatch"
+        elif any("message" in error or "response identity" in error for error in errors):
+            status = "response_identity_mismatch"
+        else:
+            status = "malformed"
+
+    if errors:
+        effect = {
+            "transport_status": status, "frontier_decision": None,
+            "request_id": request_id, "message_id": message_id,
+            "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
+            "response": effect_raw,
+        }
+        receipt = {
+            "transport_status": status, "frontier_decision": None,
+            "request_id": request_id, "message_id": message_id,
+            "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
+            "response": receipt_raw,
+        }
+    else:
+        def complete(source: dict[str, Any]) -> dict[str, Any]:
+            result = dict(source)
+            result.update({
+                "transport_status": status, "frontier_decision": decision,
+                "request_id": request_id, "message_id": message_id,
+            })
+            if task_id is not None:
+                result["task_id"] = task_id
+            if scope is not None:
+                result["scope"] = scope
+            return result
+
+        effect = complete(effect_raw)
+        receipt = complete(receipt_raw)
+    return status, decision, request_id, message_id, effect, receipt, errors
+
+
+def frontier_recovery_projection(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in entry.items() if key != "recorded_at"}
+
+
+def frontier_recovery_entry(
+    operation: dict[str, Any], *, status: str, decision: str, request_id: str, message_id: str,
+    task_id: str | None, scope: str | None, effect: dict[str, Any], receipt: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = {
+        "transport_status": status,
+        "frontier_decision": decision,
+        "request_id": request_id,
+        "message_id": message_id,
+        "task_id": task_id,
+        "scope": scope,
+        "effective_status": "confirmed",
+        "effect": effect,
+        "receipt": receipt,
+    }
+    encoded = json.dumps({"operation_id": operation["operation_id"], **evidence}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "recovery_id": "recovery-" + hashlib.sha256(encoded.encode()).hexdigest()[:24],
+        **evidence,
+        "recorded_at": utcnow(),
+    }
+
+
+def frontier_typed_lifecycle_outcome(operation: dict[str, Any]) -> tuple[str, str | None, list[str]] | None:
+    """Interpret typed fields on the generic lifecycle without breaking old v2 records."""
+    effect = operation.get("effect")
+    receipt = operation.get("receipt")
+    sources = [source for source in (effect, receipt) if isinstance(source, dict)]
+    if not any("transport_status" in source or "frontier_decision" in source for source in sources):
+        return None
+    errors: list[str] = []
+    status: str | None = None
+    decision: str | None = None
+    expected = frontier_operation_identity(operation)
+    for source, label in ((effect, "effect"), (receipt, "receipt")):
+        if not isinstance(source, dict):
+            errors.append(f"{label} is missing")
+            continue
+        try:
+            source_status = normalize_frontier_transport_status(source.get("transport_status"))
+        except SystemExit:
+            errors.append(f"{label} transport_status is malformed")
+            continue
+        if status is None:
+            status = source_status
+        elif status != source_status:
+            errors.append("effect and receipt transport_status mismatch")
+        source_message = frontier_message_id(source)
+        if source.get("request_id") != expected["request_id"]:
+            errors.append(f"{label} request_id mismatch")
+        if source_message in {None, "<invalid>", "<conflict>"}:
+            errors.append(f"{label} message identity is missing or malformed")
+        elif expected["message_id"] is not None and source_message != expected["message_id"]:
+            errors.append(f"{label} message_id mismatch")
+        try:
+            source_decision = normalize_frontier_decision(source.get("frontier_decision"), allow_none=True)
+        except SystemExit:
+            errors.append(f"{label} frontier_decision is malformed")
+            source_decision = None
+        if decision is None:
+            decision = source_decision
+        elif decision != source_decision:
+            errors.append("effect and receipt frontier_decision mismatch")
+    if status == "success" and decision is None:
+        errors.append("successful Frontier transport requires frontier_decision")
+    if status is None:
+        status = "malformed"
+    if errors and any("request_id" in error for error in errors):
+        status = "request_mismatch"
+    elif errors and any("message" in error for error in errors):
+        status = "response_identity_mismatch"
+    elif errors:
+        status = "malformed"
+    return status, decision if status == "success" and not errors else None, errors
+
+
+def cmd_frontier_result(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "frontier result")
+    ensure_v2_defaults(data)
+    require_nonterminal_run(data, "frontier result")
+    if not args.operation_id:
+        raise SystemExit("Frontier result requires --operation-id")
+    operation = find_operation(data, args.operation_id)
+    if operation.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_OPERATION_KIND_MISMATCH")
+    status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
+        data, operation, args, recovery=False,
+    )
+    terminal_status = "confirmed" if status == "success" and not errors else "failed"
+    reason = None if terminal_status == "confirmed" else "Frontier transport " + status
+    if errors:
+        reason += ": " + "; ".join(sorted(set(errors)))
+    if operation.get("status") in TERMINAL_OPERATION_STATUSES:
+        if (
+            operation.get("status") == terminal_status
+            and operation.get("effect") == effect
+            and operation.get("receipt") == receipt
+            and operation.get("transport_status") == status
+            and operation.get("frontier_decision") == decision
+        ):
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("FRONTIER_RESULT_OPERATION_CONFLICT")
+    if operation.get("effect") is not None and operation["effect"] != effect:
+        raise SystemExit("FRONTIER_RESULT_EFFECT_CONFLICT")
+    if operation.get("receipt") is not None and operation["receipt"] != receipt:
+        raise SystemExit("FRONTIER_RESULT_RECEIPT_CONFLICT")
+    now = utcnow()
+    operation["effect"] = effect
+    operation["receipt"] = receipt
+    operation["transport_status"] = status
+    operation["frontier_decision"] = decision
+    operation["status"] = terminal_status
+    operation["terminal_reason"] = reason
+    operation["confirmed_at"] = now
+    operation["updated_at"] = now
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "frontier.result_recorded", reason, {
+        "operation_id": operation["operation_id"], "transport_status": status,
+        "frontier_decision": decision, "request_id": request_id,
+        "message_id": message_id, "status": terminal_status, "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_frontier_recover(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "frontier recover")
+    ensure_v2_defaults(data)
+    require_nonterminal_run(data, "frontier recover")
+    if not args.operation_id:
+        raise SystemExit("Frontier recovery requires --operation-id")
+    operation = find_operation(data, args.operation_id)
+    if operation.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_RECOVERY_WRONG_KIND")
+    if operation.get("status") != "failed":
+        raise SystemExit("FRONTIER_RECOVERY_REQUIRES_LEGACY_FAILED_OPERATION")
+    identity = frontier_operation_identity(operation)
+    if not identity["request_id"] or not identity["message_id"]:
+        raise SystemExit("FRONTIER_RECOVERY_MISSING_ORIGINAL_IDENTITY")
+    for source_name in ("effect", "receipt"):
+        source = operation.get(source_name)
+        if not isinstance(source, dict):
+            continue
+        if source.get("request_id") not in {None, identity["request_id"]}:
+            raise SystemExit("FRONTIER_RECOVERY_ORIGINAL_REQUEST_ID_CONFLICT")
+        source_message = frontier_message_id(source)
+        if source_message not in {None, identity["message_id"]}:
+            raise SystemExit("FRONTIER_RECOVERY_ORIGINAL_MESSAGE_ID_CONFLICT")
+    status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
+        data, operation, args, recovery=True,
+    )
+    if status != "success" or decision is None or errors or message_id is None:
+        raise SystemExit("FRONTIER_RECOVERY_EVIDENCE_INVALID: " + "; ".join(sorted(set(errors or ["transport is not successful"]))))
+    task_id = args.task_id or identity["task_id"]
+    scope = args.scope or identity["scope"]
+    entry = frontier_recovery_entry(
+        operation, status=status, decision=decision, request_id=request_id, message_id=message_id,
+        task_id=task_id, scope=scope, effect=effect, receipt=receipt,
+    )
+    history = operation.setdefault("recovery_history", [])
+    if history:
+        existing = history[-1]
+        if frontier_recovery_projection(existing) == frontier_recovery_projection(entry):
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("FRONTIER_RECOVERY_CONFLICT")
+    operation["recovery_history"] = [entry]
+    operation["effective_status"] = "confirmed"
+    operation["effective_transport_status"] = status
+    operation["effective_frontier_decision"] = decision
+    operation["effective_outcome"] = {
+        "transport_status": status, "frontier_decision": decision,
+        "request_id": request_id, "message_id": message_id,
+        "effect": effect, "receipt": receipt,
+    }
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "frontier.operation_recovered", "legacy failed Frontier operation recovered", {
+        "operation_id": operation["operation_id"], "recovery_id": entry["recovery_id"],
+        "transport_status": status, "frontier_decision": decision,
+        "request_id": request_id, "message_id": message_id, "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
@@ -2771,6 +3256,13 @@ def operation_is_required(operation: dict[str, Any]) -> bool:
     return not (isinstance(intent, dict) and intent.get("required") is False)
 
 
+def operation_effective_status(operation: dict[str, Any]) -> str | None:
+    """Return the technical outcome while retaining the original terminal status."""
+    if operation.get("kind") == "frontier_exchange" and operation.get("effective_status") is not None:
+        return str(operation["effective_status"])
+    return operation.get("status")
+
+
 def open_work_units(data: dict[str, Any]) -> list[str]:
     work_units = data.get("work_units", {})
     if not isinstance(work_units, dict):
@@ -2825,8 +3317,9 @@ def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
                 continue
             kind = operation.get("kind")
             status = operation.get("status")
+            effective_status = operation_effective_status(operation)
             operation_id_value = str(operation.get("operation_id") or "<unnamed-operation>")
-            if status != "confirmed":
+            if effective_status != "confirmed":
                 # A pending record is reported separately, but a terminal
                 # failed/abandoned effect must remain visible in the terminal
                 # gate as well.
@@ -2969,6 +3462,21 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     if pending:
         action, reason = operation_reconcile_action(pending[0])
         return action, reason, [str(operation["operation_id"]) for operation in pending]
+
+    failed_frontier = [
+        operation for operation in data.get("pending_operations", [])
+        if isinstance(operation, dict)
+        and operation.get("kind") == "frontier_exchange"
+        and operation.get("status") == "failed"
+        and operation_effective_status(operation) != "confirmed"
+    ]
+    if failed_frontier:
+        operation = failed_frontier[0]
+        return (
+            "RECOVER_FRONTIER_EXCHANGE",
+            f"Frontier exchange {operation.get('operation_id', '<unnamed-operation>')} is failed",
+            [str(operation.get("operation_id") or "<unnamed-operation>")],
+        )
 
     frontier_operations = [
         operation for operation in data.get("pending_operations", [])
@@ -3243,14 +3751,22 @@ def build_parser() -> argparse.ArgumentParser:
     authorization.add_argument("--expect-revision", type=int, required=True)
     authorization.set_defaults(func=cmd_authorization)
 
-    frontier = sub.add_parser("frontier", help="record a Frontier exchange intent before browser transport")
+    frontier = sub.add_parser("frontier", help="record and recover typed Frontier exchange outcomes")
     frontier.add_argument("run_id")
-    frontier.add_argument("frontier_action", choices=["start"])
+    frontier.add_argument("frontier_action", choices=["start", "result", "recover"])
     frontier.add_argument("--request-id", required=True)
-    frontier.add_argument("--task-id", required=True)
+    frontier.add_argument("--task-id")
     frontier.add_argument("--idempotency-key")
     frontier.add_argument("--intent-json", default="{}")
     frontier.add_argument("--chat-url")
+    frontier.add_argument("--message-id")
+    frontier.add_argument("--response-message-id", dest="message_id")
+    frontier.add_argument("--operation-id")
+    frontier.add_argument("--transport-status")
+    frontier.add_argument("--frontier-decision")
+    frontier.add_argument("--effect-json")
+    frontier.add_argument("--receipt-json")
+    frontier.add_argument("--scope")
     frontier.add_argument("--expect-revision", type=int, required=True)
     frontier.set_defaults(func=cmd_frontier)
 
