@@ -278,16 +278,15 @@ def require_v2(data: dict[str, Any], command: str) -> None:
 def sanitize_evidence(value: Any) -> Any:
     """Keep evidence useful without storing credentials or browser contents."""
     sensitive = re.compile(
-        r"(?:api[_-]?key|token|secret|password|authorization(?!_id)|cookie|"
-        r"auth(?:entication)?[_-]?headers?|session(?:[_-]?token)?|"
+        r"(?:api[_-]?key|client[_-]?secret|access[_-]?token|token|secret|password|"
+        r"authorization|cookie|auth(?:entication)?[_-]?headers?|session(?:[_-]?token)?|"
         r"storage[_-]?state|raw[_-]?(?:profile|response)|profile(?:[_-]?(?:content|contents))?|"
-        r"credential|headers?)",
+        r"credential|private[_-]?key|headers?)",
         re.I,
     )
     token = re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)", re.I)
     if isinstance(value, dict):
-        safe_policy_input_keys = {"installation_profile", "repository_config", "run_authorization"}
-        return {str(key): "[REDACTED]" if sensitive.search(str(key)) and str(key) not in safe_policy_input_keys else sanitize_evidence(item)
+        return {str(key): "[REDACTED]" if sensitive.fullmatch(str(key)) else sanitize_evidence(item)
                 for key, item in value.items()}
     if isinstance(value, list):
         return [sanitize_evidence(item) for item in value]

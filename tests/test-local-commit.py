@@ -513,6 +513,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     governed_fixture = Path(td) / "governed-fixture"
     governed_fixture.mkdir()
     governed_repo, governed_env, governed_branch, governed_base = setup_repo(str(governed_fixture))
+    git(governed_repo, "checkout", "-qb", "fix/memory-secret-metric-hardening")
     governed_run, governed_branch, governed_base, accepted_operation, legacy_governed_auth, governed_digest = create_governed_parent(
         governed_env, governed_repo, "governed-local-commit",
     )

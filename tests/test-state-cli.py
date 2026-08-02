@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import os
 import subprocess
 import tempfile
@@ -11,6 +13,45 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / "bin" / "myrmex-state"
 POLICY_RESOLVER = ROOT / "scripts" / "resolve-delivery-policy.py"
+
+state_loader = SourceFileLoader("myrmex_state", str(STATE))
+state_spec = importlib.util.spec_from_loader("myrmex_state", state_loader)
+assert state_spec is not None and state_spec.loader is not None
+state_module = importlib.util.module_from_spec(state_spec)
+state_spec.loader.exec_module(state_module)
+canonical_sensitive = {
+    key: f"{key}-value"
+    for key in (
+        "secret", "client_secret", "token", "access_token", "authorization",
+        "password", "credential", "cookie", "api_key", "private_key",
+    )
+}
+sanitized_evidence = state_module.sanitize_evidence({
+    **canonical_sensitive,
+    "authorization_id": "auth-012345678901234567890123",
+    "ordinary": "ordinary secret text",
+    "message": "Bearer abcdefghijklmnopqrstuvwxyz",
+    "identifier-map-secret": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    "refs/heads/fix/memory-secret-metric-hardening": {
+        "before": ["deadbeef", ""],
+    },
+    "refs/remotes/origin/memory-secret-metric-hardening": {"token": "nested-token"},
+    "/tmp/memory-secret-metric-hardening": {"password": "nested-password"},
+    "https://example.invalid/memory-secret-metric-hardening": {"private_key": "nested-key"},
+})
+assert all(sanitized_evidence[key] == "[REDACTED]" for key in canonical_sensitive)
+assert sanitized_evidence["authorization_id"] == "auth-012345678901234567890123"
+assert sanitized_evidence["ordinary"] == "ordinary secret text"
+assert sanitized_evidence["message"] == "[REDACTED]"
+assert sanitized_evidence["identifier-map-secret"] == "[REDACTED]"
+assert sanitized_evidence["refs/heads/fix/memory-secret-metric-hardening"] == {
+    "before": ["deadbeef", ""],
+}
+assert sanitized_evidence["refs/remotes/origin/memory-secret-metric-hardening"] == {"token": "[REDACTED]"}
+assert sanitized_evidence["/tmp/memory-secret-metric-hardening"] == {"password": "[REDACTED]"}
+assert sanitized_evidence["https://example.invalid/memory-secret-metric-hardening"] == {
+    "private_key": "[REDACTED]",
+}
 
 
 def run(*args: str, env: dict[str, str], ok: bool = True) -> subprocess.CompletedProcess[str]:
