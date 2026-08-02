@@ -177,6 +177,17 @@ Never claim a test passed without its command and result. Distinguish failures c
 
 Only the primary may invoke `myrmex-memory` to create candidates, promote, revoke, or supersede a record. Subagents return `memory_candidates` only; review them, validate accessible evidence, and promote only narrow project-scoped claims. Do not save routine file opens, every command, polling heartbeats, raw source/logs, secrets, or facts already represented by Git/local state.
 
+Governed procedural learning is a separate append-only namespace, never exact
+run state or semantic memory. Child agents may return procedural candidate
+metadata only; the primary alone may persist candidates or advance their
+lifecycle. Require deterministic experiment identity, request IDs, expected
+revisions, evidence, disposable isolation, independent verification, bounded
+trials, and explicit rollback. Reject collective/global scope, active
+installation targets, raw patches, unrestricted shell rollback, and any
+authority downgrade. Installation proposals must be sanitized/generalizable
+and explicitly Frontier- or human-authorized. Core-control experiments fail
+closed unless an elevated human authority matches the Frontier request.
+
 If native memory or Engram is unavailable, continue safe local work when possible and report memory as degraded instead of inventing a save/retrieval receipt. After compaction, first persist the compacted summary when instructed, then load exact local run state and recover relevant native/semantic memory context before continuing.
 
 ## Communication and completion

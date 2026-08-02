@@ -20,6 +20,25 @@ logged, hashed into public evidence, or persisted. Legacy records remain
 readable. Child agents return `memory_candidates`; only the primary persists
 or changes their lifecycle.
 
+Procedural learning is a distinct local append-only namespace governed by
+`procedural-experiment-v1` (`myrmex.procedural-experiment/v1`). It is not semantic memory, exact run state,
+model training, or an active-installation mutation channel. The primary is the
+sole durable writer; child agents can supply candidate metadata only. Records
+are revision-checked and request-idempotent, and conflicting replays fail
+closed before mutation.
+
+The procedural gate requires evidence, an explicit rollback artifact, a
+deterministic opaque experiment ID, disposable isolation, child-agent-only
+candidates, passing tests, independent verifier identities, and a bounded
+trial. Bounds must include a positive run/work-unit limit or expiry. Raw
+patches and unrestricted shell rollback are never stored. Installation scope
+must be sanitized/generalizable with Frontier or human authority; collective or
+global sharing and active-installation target paths are rejected. Core-control
+experiments cannot be downgraded and require elevated human trial authority
+with the matching Frontier request. Promotion requires a successful bounded
+trial and Frontier/human authority; regression or inconclusive results require
+rollback evidence and revert.
+
 Installation scope is a stricter local privacy boundary, not a sharing channel:
 it requires a sanitized claim, null project identity/repository reference, and
 tool/model applicability. Project-private material needs an explicit rewritten

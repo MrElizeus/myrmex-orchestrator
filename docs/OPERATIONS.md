@@ -347,6 +347,40 @@ memory or optional Engram fails, continue safe local work when persistence is
 not itself required and report `memory: degraded` rather than claiming a
 receipt.
 
+### Governed procedural learning
+
+Procedural experiments use `myrmex.procedural-experiment/v1` in a separate
+append-only namespace below the configured local memory root. They do not alter
+`myrmex-state`, ordinary semantic memory, the active installation, or Git.
+Only the primary writes durable records; child agents return candidate metadata
+for primary review.
+
+The required lifecycle is `proposed`, `isolated_candidate`, `tests_passed`,
+`verifier_passed`, `bounded_trial_active`, then `promoted` or `reverted`.
+Pre-terminal stages can be `rejected`. Every mutation supplies a request ID,
+expected revision, authority identity, and primary writer. Replays with the
+same request and payload are byte-stable no-ops; conflicting request reuse,
+stale revisions, invalid transitions, and failed gates are rejected before
+append.
+
+Proposals require a weakness, expected benefit, target paths, evidence with at
+least one run/commit/artifact/verifier/Frontier identity, explicit rollback
+artifact, authority, version, kind, and risk class. Candidate artifacts are
+digest-only and must be child-agent output from disposable isolation with
+changed paths contained by the proposal. Tests and independent verifier
+receipts must pass before activation. A trial must be bounded by a positive
+`max_runs`, `max_work_units`, or expiry. Successful outcomes require
+Frontier/human promotion authority and matching candidate/evidence identities;
+regression or inconclusive outcomes require rollback evidence. Core-control
+trials require elevated human authority plus a matching Frontier request.
+Installation records must be sanitized/generalizable, and collective/global
+scope is never accepted.
+
+```bash
+myrmex-memory procedural list --repository-root <repo>
+myrmex-memory procedural show <experiment-id> --repository-root <repo>
+```
+
 ## Draft PR recovery
 
 Keep GitHub create and label operations separate. A confirmed approved

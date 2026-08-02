@@ -52,6 +52,7 @@ REQUIRED_CONTRACTS = {
     "frontier-state-v2.schema.json",
     "memory-v1.schema.json",
     "work-unit-metric-v1.schema.json",
+    "procedural-experiment-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }
 REQUIRED_FRONTIER_REFS = {
@@ -286,6 +287,7 @@ def main() -> int:
         "frontier-state-v2.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json"],
         "memory-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/memory-v1.schema.json"],
         "work-unit-metric-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/work-unit-metric-v1.schema.json"],
+        "procedural-experiment-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/procedural-experiment-v1.schema.json"],
     }
     for canonical, copies in canonical_copies.items():
         source = ROOT / "contracts" / canonical
@@ -382,6 +384,10 @@ def main() -> int:
     require_text(ROOT / "docs/SECURITY.md", [
         "typed side-effect boundary", "policy digest", "recomputes", "mandatory digest", "ISSUE_APPROVED", "PR_CREATED_LABEL_PENDING",
         "SUB_OBJECTIVE_COMPLETE", "candidate diff digest", "Generic patches",
+        "procedural-experiment-v1", "bounded", "active-installation",
+    ], errors)
+    require_text(ROOT / "skills/myrmex-memory/SKILL.md", [
+        "Governed procedural learning", "procedural list", "child-agent", "bounded",
     ], errors)
     if (ROOT / ".github").exists() and not (ROOT / ".github" / "workflows" / "ci.yml").is_file():
         errors.append("missing GitHub CI workflow: .github/workflows/ci.yml")

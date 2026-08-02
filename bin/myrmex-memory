@@ -9,6 +9,7 @@ MCP dependency; Engram is an optional adapter used by the primary agent.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import hmac
@@ -62,6 +63,26 @@ VERIFICATION_VERDICTS = {"pass", "fail", "blocked", "unknown"}
 METRIC_RECOVERY_EVENTS = {"reconcile", "receipt-replayed", "operation-recovered", "result-collected", "retry-resumed", "none"}
 TEST_OUTCOMES = {"passed", "failed", "skipped", "cancelled", "unknown"}
 METRIC_TEST_CATEGORIES = {"unit", "integration", "e2e", "lint", "typecheck", "build", "smoke", "other"}
+PROCEDURAL_SCHEMA = "myrmex.procedural-experiment/v1"
+PROCEDURAL_EVENT_SCHEMA = "myrmex.procedural-event/v1"
+PROCEDURAL_STATUSES = {
+    "proposed", "isolated_candidate", "tests_passed", "verifier_passed",
+    "bounded_trial_active", "promoted", "reverted", "rejected",
+}
+PROCEDURAL_KINDS = {
+    "prompt", "skill", "heuristic", "receipt_template", "recovery_strategy",
+    "validator", "model_selection_policy",
+}
+PROCEDURAL_RISK_CLASSES = {"procedural", "core_control"}
+PROCEDURAL_AUTHORITIES = {"primary", "frontier", "human"}
+PROCEDURAL_OUTCOMES = {"success", "regression", "inconclusive"}
+PROCEDURAL_ID_RE = re.compile(r"^exp_[0-9a-f]{64}$")
+PROCEDURAL_SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
+PROCEDURAL_REQUEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+PROCEDURAL_TARGET_BLOCK_RE = re.compile(
+    r"(?:^~(?:/|$)|^/|(?:^|/)(?:\.config|\.local|active-installation|active_installation)(?:/|$)|/home/|/Users/)",
+    re.I,
+)
 
 
 class MemoryError(Exception):
@@ -1135,6 +1156,727 @@ def emit(value: Any) -> int:
     return 0
 
 
+def procedural_paths(scope: str, identity: str | None) -> dict[str, Path]:
+    if scope == PROJECT_SCOPE:
+        if identity is None:
+            fail("project procedural learning requires a project identity")
+        root = memory_home() / "procedural" / "projects" / sha256_bytes(identity.encode("utf-8"))
+    elif scope == INSTALLATION_SCOPE:
+        root = memory_home() / "procedural" / "installation"
+    else:
+        fail("collective/global procedural sharing is not supported")
+    return {"root": root, "events": root / "experiments.jsonl", "lock": root / "lock"}
+
+
+@contextmanager
+def procedural_lock(scope: str, identity: str | None, *, create: bool) -> Iterator[dict[str, Path]]:
+    with lock_paths(procedural_paths(scope, identity), create=create, label=f"procedural {scope}") as paths:
+        yield paths
+
+
+def procedural_digest(value: Any) -> str:
+    return "sha256:" + sha256_bytes(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def procedural_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not PROCEDURAL_SHA256_RE.fullmatch(value):
+        fail(f"{label} must be a sha256 digest")
+    return value if value.startswith("sha256:") else "sha256:" + value
+
+
+def procedural_text(value: Any, label: str, *, maximum: int = 4000) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        fail(f"{label} must be a non-empty string")
+    text = value.strip()
+    reject_sensitive_text(text, label)
+    return text
+
+
+def procedural_request(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not PROCEDURAL_REQUEST_RE.fullmatch(value):
+        fail(f"{label} must be a safe request identity")
+    reject_sensitive_text(value, label)
+    return value
+
+
+def normalize_procedural_path(value: Any, label: str = "procedural path") -> str:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        fail(f"{label} must be a non-empty relative path")
+    if PROCEDURAL_TARGET_BLOCK_RE.search(value) or Path(value).is_absolute() or ".." in Path(value).parts:
+        fail("PROCEDURAL_TARGET_REJECTED: active-installation or escaping paths are forbidden")
+    reject_sensitive_text(value, label)
+    return Path(value).as_posix()
+
+
+def procedural_evidence_item(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("procedural evidence items must be objects")
+    allowed = {"run_id", "commit_sha", "artifact_sha256", "verifier_request_id", "frontier_request_id"}
+    if set(value) - allowed:
+        fail("unknown procedural evidence fields")
+    item = {key: None for key in allowed}
+    for key in allowed:
+        if value.get(key) is not None:
+            item[key] = procedural_text(value[key], f"procedural evidence {key}", maximum=256)
+            if key in {"artifact_sha256"}:
+                item[key] = procedural_sha256(value[key], f"procedural evidence {key}")
+            if key == "commit_sha" and not SHA_RE.fullmatch(value[key]):
+                fail("procedural evidence commit_sha must be a lowercase git SHA")
+    if not any(item[key] is not None for key in allowed):
+        fail("procedural evidence requires run_id, commit_sha, artifact_sha256, verifier_request_id, or frontier_request_id")
+    return item
+
+
+def procedural_evidence(value: Any, label: str = "procedural evidence") -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        value = parse_json(value, label)
+    if not isinstance(value, list) or not value:
+        fail(f"{label} must be a non-empty array")
+    return [procedural_evidence_item(item) for item in value]
+
+
+def procedural_authority(value: Any, label: str = "authority", *, allow_frontier_request: bool = False) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    allowed = {"kind", "request_id", "elevated"}
+    if allow_frontier_request:
+        allowed.add("frontier_request_id")
+    if set(value) - allowed or not {"kind", "request_id", "elevated"}.issubset(value):
+        fail(f"{label} must contain kind, request_id, and elevated")
+    if value["kind"] not in PROCEDURAL_AUTHORITIES:
+        fail("invalid procedural authority kind")
+    request_id = procedural_request(value["request_id"], f"{label} request_id")
+    if not isinstance(value["elevated"], bool):
+        fail(f"{label} elevated must be boolean")
+    result = {"kind": value["kind"], "request_id": request_id, "elevated": value["elevated"]}
+    if allow_frontier_request and value.get("frontier_request_id") is not None:
+        result["frontier_request_id"] = procedural_request(value["frontier_request_id"], f"{label} frontier_request_id")
+    return result
+
+
+def procedural_rollback(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"description", "restore_artifact_sha256"}:
+        fail("rollback must contain description and restore_artifact_sha256")
+    description = procedural_text(value["description"], "rollback description", maximum=2000)
+    if re.search(r"(?:\$\(|`|\|\||&&|;|\brm\s+-rf\b|\bsudo\b|\b(?:ba)?sh\s+-c\b)", description, re.I):
+        fail("PROCEDURAL_ROLLBACK_REJECTED: unrestricted shell commands are not allowed")
+    return {
+        "description": description,
+        "restore_artifact_sha256": procedural_sha256(value["restore_artifact_sha256"], "rollback restore_artifact_sha256"),
+    }
+
+
+def procedural_proposal(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("proposal must be an object")
+    required = {"kind", "version", "weakness", "expected_benefit", "target_paths", "evidence", "authority", "rollback", "risk_class"}
+    if set(value) != required:
+        fail("proposal must contain exactly kind, version, weakness, expected_benefit, target_paths, evidence, authority, rollback, and risk_class")
+    if value["kind"] not in PROCEDURAL_KINDS:
+        fail("invalid procedural proposal kind")
+    version = procedural_text(value["version"], "proposal version", maximum=128)
+    weakness = procedural_text(value["weakness"], "proposal weakness")
+    benefit = procedural_text(value["expected_benefit"], "proposal expected_benefit")
+    if not isinstance(value["target_paths"], list) or not value["target_paths"]:
+        fail("proposal target_paths must be a non-empty array")
+    target_paths = []
+    for path in value["target_paths"]:
+        normalized = normalize_procedural_path(path, "proposal target path")
+        if normalized not in target_paths:
+            target_paths.append(normalized)
+    evidence = procedural_evidence(value["evidence"])
+    authority = procedural_authority(value["authority"])
+    rollback = procedural_rollback(value["rollback"])
+    risk_class = value["risk_class"]
+    if risk_class not in PROCEDURAL_RISK_CLASSES:
+        fail("invalid procedural proposal risk_class")
+    if authority["kind"] == "primary" and authority["elevated"]:
+        fail("primary authority cannot claim elevated authority")
+    return {
+        "kind": value["kind"], "version": version, "weakness": weakness,
+        "expected_benefit": benefit, "target_paths": target_paths,
+        "evidence": evidence, "authority": authority, "rollback": rollback,
+        "risk_class": risk_class,
+    }
+
+
+def procedural_scope(args: argparse.Namespace) -> tuple[str, str | None]:
+    scope = getattr(args, "scope", PROJECT_SCOPE)
+    if scope not in {PROJECT_SCOPE, INSTALLATION_SCOPE}:
+        fail("collective/global procedural sharing is not supported")
+    if scope == PROJECT_SCOPE:
+        return scope, project_identity(args)
+    if getattr(args, "project_identity", None):
+        fail("--project-identity is not valid for installation procedural scope")
+    return scope, None
+
+
+def procedural_mutation_authority(args: argparse.Namespace) -> dict[str, Any]:
+    kind = getattr(args, "authority_kind", None)
+    request_id = getattr(args, "authority_request_id", None)
+    if kind is None or request_id is None:
+        fail("procedural mutation requires authority kind and request ID")
+    authority = procedural_authority({"kind": kind, "request_id": request_id, "elevated": bool(getattr(args, "elevated", False))}, "mutation authority")
+    if getattr(args, "writer_authority", "primary") != "primary":
+        fail("MEMORY_AUTHORITY_REQUIRED: only the primary may persist procedural records")
+    return authority
+
+
+def procedural_payload_hash(operation: str, payload: Any) -> str:
+    return procedural_digest({"operation": operation, "payload": payload})
+
+
+def procedural_read_events(paths: dict[str, Path], identity: str | None, scope: str) -> list[dict[str, Any]]:
+    if not paths["events"].exists():
+        return []
+    try:
+        lines = paths["events"].read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot read procedural log: {exc}")
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: corrupt procedural event at line {line_number}: {exc}")
+        if not isinstance(event, dict) or event.get("schema") != PROCEDURAL_EVENT_SCHEMA:
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: invalid procedural event at line {line_number}")
+        record = procedural_validate_record(event.get("record"), identity, scope)
+        if not isinstance(event.get("request_id"), str) or not isinstance(event.get("operation"), str):
+            fail("MEMORY_BACKEND_UNAVAILABLE: procedural event identity missing")
+        if not isinstance(event.get("payload_sha256"), str) or not PROCEDURAL_SHA256_RE.fullmatch(event["payload_sha256"]):
+            fail("MEMORY_BACKEND_UNAVAILABLE: invalid procedural payload digest")
+        if not isinstance(event.get("response"), dict):
+            fail("MEMORY_BACKEND_UNAVAILABLE: procedural event response missing")
+        event["record"] = record
+        events.append(event)
+    return events
+
+
+def procedural_validate_record(record: Any, identity: str | None, scope: str) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        fail("MEMORY_BACKEND_UNAVAILABLE: procedural record is not an object")
+    required = {"schema", "experiment_id", "revision", "request_id", "scope", "status", "proposal", "created_at", "updated_at", "previous_record_sha256"}
+    allowed = required | {"candidate", "tests", "verifier", "trial", "outcome", "decision"}
+    if set(record) - allowed or not required.issubset(record):
+        fail("MEMORY_BACKEND_UNAVAILABLE: procedural record has an unsupported shape")
+    if record["schema"] != PROCEDURAL_SCHEMA or not isinstance(record["experiment_id"], str) or not PROCEDURAL_ID_RE.fullmatch(record["experiment_id"]):
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid procedural experiment identity")
+    if not isinstance(record["revision"], int) or record["revision"] < 0:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid procedural revision")
+    procedural_request(record["request_id"], "procedural request_id")
+    if record["scope"] != scope or scope not in {PROJECT_SCOPE, INSTALLATION_SCOPE}:
+        fail("MEMORY_BACKEND_UNAVAILABLE: procedural scope mismatch")
+    if scope == INSTALLATION_SCOPE and identity is not None:
+        fail("MEMORY_BACKEND_UNAVAILABLE: installation procedural record has project identity")
+    if scope == PROJECT_SCOPE and identity is None:
+        fail("MEMORY_BACKEND_UNAVAILABLE: project procedural record lacks identity")
+    if record["status"] not in PROCEDURAL_STATUSES:
+        fail("MEMORY_BACKEND_UNAVAILABLE: invalid procedural status")
+    procedural_proposal(record["proposal"])
+    previous = record["previous_record_sha256"]
+    if previous is not None:
+        procedural_sha256(previous, "previous_record_sha256")
+    for key in ("created_at", "updated_at"):
+        nullable_timestamp(record[key], f"procedural {key}")
+    for key in ("candidate", "tests", "verifier", "trial", "outcome", "decision"):
+        if key in record and record[key] is not None and not isinstance(record[key], dict):
+            fail(f"MEMORY_BACKEND_UNAVAILABLE: procedural {key} must be an object or null")
+    return record
+
+
+def procedural_materialize(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for event in events:
+        records[event["record"]["experiment_id"]] = event["record"]
+    return records
+
+
+def procedural_append(paths: dict[str, Path], event: dict[str, Any]) -> None:
+    try:
+        existing = paths["events"].read_bytes() if paths["events"].exists() else b""
+        if existing and not existing.endswith(b"\n"):
+            fail("MEMORY_BACKEND_UNAVAILABLE: procedural log has an incomplete final event")
+        payload = existing + (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        atomic_write_bytes(paths["events"], payload)
+    except OSError as exc:
+        fail(f"MEMORY_BACKEND_UNAVAILABLE: cannot append procedural log: {exc}")
+
+
+def procedural_replay(events: list[dict[str, Any]], request_id: str, operation: str, payload_hash: str) -> dict[str, Any] | None:
+    matches = [event for event in events if event.get("request_id") == request_id]
+    if not matches:
+        return None
+    event = matches[-1]
+    if event.get("operation") != operation or event.get("payload_sha256") != payload_hash:
+        fail("MEMORY_REQUEST_ID_REUSED: procedural request ID conflicts with a prior operation or payload")
+    return event["response"]
+
+
+def procedural_event(operation: str, request_id: str, payload_hash: str, record: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": PROCEDURAL_EVENT_SCHEMA,
+        "event_id": "procevt_" + secrets.token_urlsafe(12),
+        "operation": operation,
+        "request_id": request_id,
+        "payload_sha256": payload_hash,
+        "record": record,
+        "response": response,
+        "timestamp": utcnow(),
+    }
+
+
+def procedural_record_update(record: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    updated = copy.deepcopy(record)
+    updated["previous_record_sha256"] = procedural_digest(record)
+    updated["revision"] += 1
+    updated["updated_at"] = utcnow()
+    updated.update(changes)
+    return updated
+
+
+def procedural_records_for(args: argparse.Namespace, *, create: bool) -> tuple[str, str | None, dict[str, Path], list[dict[str, Any]]]:
+    scope, identity = procedural_scope(args)
+    paths = procedural_paths(scope, identity)
+    return scope, identity, paths, []
+
+
+def procedural_commit(
+    *, paths: dict[str, Path], scope: str, identity: str | None, events: list[dict[str, Any]],
+    operation: str, request_id: str, payload_hash: str, record: dict[str, Any], response: dict[str, Any],
+) -> int:
+    procedural_validate_record(record, identity, scope)
+    event = procedural_event(operation, request_id, payload_hash, record, response)
+    procedural_append(paths, event)
+    events.append(event)
+    return emit(response)
+
+
+def procedural_id(value: Any) -> str:
+    if not isinstance(value, str) or not PROCEDURAL_ID_RE.fullmatch(value):
+        fail("invalid procedural experiment ID")
+    return value
+
+
+def procedural_expected_revision(args: argparse.Namespace) -> int:
+    value = getattr(args, "expect_revision", None)
+    if value is None or value < 0:
+        fail("--expect-revision is required and must be non-negative")
+    return value
+
+
+def procedural_find(events: list[dict[str, Any]], experiment_id: str) -> dict[str, Any]:
+    record = procedural_materialize(events).get(procedural_id(experiment_id))
+    if record is None:
+        fail(f"procedural experiment not found: {experiment_id}")
+    return record
+
+
+def procedural_json_option(value: str | None, option: str, default: Any) -> Any:
+    return default if value is None else parse_json(value, option)
+
+
+def procedural_proposal_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    raw = procedural_json_option(args.proposal_json, "--proposal-json", {})
+    if not isinstance(raw, dict):
+        fail("--proposal-json must be an object")
+    direct = {
+        "kind": args.kind, "version": args.version, "weakness": args.weakness,
+        "expected_benefit": args.expected_benefit,
+        "target_paths": procedural_json_option(args.target_paths_json, "--target-paths-json", args.target_path),
+        "evidence": procedural_json_option(args.evidence_json, "--evidence-json", None),
+        "authority": {
+            "kind": args.authority_kind, "request_id": args.authority_request_id,
+            "elevated": bool(args.elevated),
+        },
+        "rollback": procedural_json_option(args.rollback_json, "--rollback-json", {
+            "description": args.rollback_description, "restore_artifact_sha256": args.restore_artifact_sha256,
+        }),
+        "risk_class": args.risk_class,
+    }
+    for key, value in direct.items():
+        if value is not None and value != {"kind": None, "request_id": None, "elevated": False}:
+            raw.setdefault(key, value)
+    return procedural_proposal(raw)
+
+
+def procedural_authority_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return procedural_mutation_authority(args)
+
+
+def procedural_installation_guard(proposal: dict[str, Any], scope: str) -> None:
+    if scope != INSTALLATION_SCOPE:
+        return
+    if proposal["authority"]["kind"] not in {"frontier", "human"}:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: installation proposals require explicit Frontier or human authority")
+    if "bin/myrmex-state" in proposal["target_paths"]:
+        fail("PROCEDURAL_SCOPE_REJECTED: installation proposals cannot target bin/myrmex-state")
+    for text in (proposal["weakness"], proposal["expected_benefit"]):
+        if re.search(r"(?:/home/|/Users/|\.env|customer data|secret|token)", text, re.I):
+            fail("PROCEDURAL_SCOPE_REJECTED: installation proposals must be sanitized and generalizable")
+
+
+def procedural_experiment_id(scope: str, proposal: dict[str, Any]) -> str:
+    return "exp_" + sha256_bytes(json.dumps({"scope": scope, "proposal": proposal}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def cmd_procedural_propose(args: argparse.Namespace) -> int:
+    scope, identity = procedural_scope(args)
+    request_id = procedural_request(args.request_id, "--request-id")
+    expected = procedural_expected_revision(args)
+    if expected != 0:
+        fail("initial procedural proposal requires --expect-revision 0")
+    procedural_authority_from_args(args)
+    proposal = procedural_proposal_from_args(args)
+    procedural_installation_guard(proposal, scope)
+    experiment_id = procedural_experiment_id(scope, proposal)
+    payload = {"scope": scope, "proposal": proposal, "experiment_id": experiment_id, "expect_revision": expected, "authority": procedural_authority_from_args(args)}
+    payload_hash = procedural_payload_hash("propose", payload)
+    now = utcnow()
+    record = {
+        "schema": PROCEDURAL_SCHEMA, "experiment_id": experiment_id, "revision": 0,
+        "request_id": request_id, "scope": scope, "status": "proposed", "proposal": proposal,
+        "created_at": now, "updated_at": now, "previous_record_sha256": None,
+        "candidate": None, "tests": None, "verifier": None, "trial": None,
+        "outcome": None, "decision": None,
+    }
+    response = {"created": True, "idempotent": False, "experiment": record}
+    with procedural_lock(scope, identity, create=True) as paths:
+        events = procedural_read_events(paths, identity, scope)
+        replay = procedural_replay(events, request_id, "propose", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        existing = procedural_materialize(events).get(experiment_id)
+        if existing is not None:
+            fail("PROCEDURAL_EXPERIMENT_CONFLICT: deterministic experiment already exists")
+        return procedural_commit(paths=paths, scope=scope, identity=identity, events=events, operation="propose", request_id=request_id, payload_hash=payload_hash, record=record, response=response)
+
+
+def procedural_mutation_context(args: argparse.Namespace, operation: str) -> tuple[str, str | None, str, int, dict[str, Any], dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
+    scope, identity = procedural_scope(args)
+    request_id = procedural_request(args.request_id, "--request-id")
+    expected = procedural_expected_revision(args)
+    authority = procedural_authority_from_args(args)
+    payload = {"experiment_id": procedural_id(args.experiment_id), "expect_revision": expected, "authority": authority, "operation": operation}
+    paths = procedural_paths(scope, identity)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+    return scope, identity, request_id, expected, authority, paths, events, payload
+
+
+def procedural_reject_record(record: dict[str, Any], reason: str, authority: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    decision = {"result": "reject", "reason": procedural_text(reason, "rejection reason", maximum=2000), "authority": authority, "evidence": evidence}
+    return procedural_record_update(record, status="rejected", decision=decision)
+
+
+def cmd_procedural_candidate(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "candidate")
+    source = args.candidate_source
+    if source != "child-agent":
+        fail("PROCEDURAL_CANDIDATE_REJECTED: only child-agent candidates may enter the durable candidate gate")
+    artifact = procedural_sha256(args.artifact_sha256, "candidate artifact_sha256")
+    base_identity = procedural_text(args.base_identity, "candidate base_identity", maximum=512)
+    changed = procedural_json_option(args.changed_paths_json, "--changed-paths-json", args.changed_path)
+    if not isinstance(changed, list) or not changed:
+        fail("candidate changed_paths must be a non-empty array")
+    changed = list(dict.fromkeys(normalize_procedural_path(path, "candidate changed path") for path in changed))
+    isolation = args.isolation_mode
+    payload.update({"artifact_sha256": artifact, "base_identity": base_identity, "changed_paths": changed, "isolation_mode": isolation, "candidate_source": source})
+    payload_hash = procedural_payload_hash("candidate", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "candidate", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "proposed":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: candidate requires proposed status")
+        target_paths = set(record["proposal"]["target_paths"])
+        if not target_paths.issuperset(changed):
+            fail("PROCEDURAL_TARGET_REJECTED: candidate changed paths must be a subset of proposal target paths")
+        if isolation != "disposable":
+            fail("PROCEDURAL_ISOLATION_REJECTED: candidate activation must be disposable")
+        candidate = {"artifact_sha256": artifact, "base_identity": base_identity, "changed_paths": changed, "isolation_mode": "disposable", "source": "child-agent"}
+        updated = procedural_record_update(record, status="isolated_candidate", candidate=candidate)
+        response = {"updated": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="candidate", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def cmd_procedural_tests(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "tests")
+    result = args.result
+    artifact = procedural_sha256(args.artifact_sha256, "tests artifact_sha256") if args.artifact_sha256 else None
+    summaries = procedural_json_option(args.command_summaries_json, "--command-summaries-json", args.command_summary)
+    if not isinstance(summaries, list) or not summaries:
+        fail("tests command_summaries must be a non-empty array")
+    summaries = [procedural_text(item, "test command summary", maximum=1000) for item in summaries]
+    payload.update({"result": result, "artifact_sha256": artifact, "command_summaries": summaries})
+    payload_hash = procedural_payload_hash("tests", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "tests", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "isolated_candidate":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: tests require isolated_candidate status")
+        if result != "pass":
+            evidence = procedural_evidence(args.evidence_json) if args.evidence_json else [{"run_id": request_id, "commit_sha": None, "artifact_sha256": artifact, "verifier_request_id": None, "frontier_request_id": None}]
+            updated = procedural_reject_record(record, args.failure_reason or "candidate tests failed", authority, evidence)
+            response = {"rejected": True, "idempotent": False, "experiment": updated}
+        else:
+            if artifact is None:
+                fail("tests artifact_sha256 is required for a passing result")
+            tests = {"result": "pass", "artifact_sha256": artifact, "command_summaries": summaries}
+            updated = procedural_record_update(record, status="tests_passed", tests=tests)
+            response = {"updated": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="tests", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def cmd_procedural_verify(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "verify")
+    verifier_request_id = procedural_request(args.verifier_request_id, "verifier request_id")
+    verifier_task_id = procedural_text(args.verifier_task_id, "verifier task identity", maximum=256)
+    author_task_id = procedural_text(args.proposal_author_task_id, "proposal author task identity", maximum=256)
+    artifact = procedural_sha256(args.artifact_sha256, "verifier artifact_sha256") if args.artifact_sha256 else None
+    payload.update({"result": args.result, "verifier_request_id": verifier_request_id, "verifier_task_id": verifier_task_id, "proposal_author_task_id": author_task_id, "artifact_sha256": artifact, "independent": args.independent})
+    payload_hash = procedural_payload_hash("verify", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "verify", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "tests_passed":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: verification requires tests_passed status")
+        if args.result != "pass" or not args.independent or verifier_task_id == author_task_id:
+            evidence = procedural_evidence(args.evidence_json) if args.evidence_json else [{"verifier_request_id": verifier_request_id, "run_id": None, "commit_sha": None, "artifact_sha256": artifact, "frontier_request_id": None}]
+            reason = args.failure_reason or "independent verification failed"
+            updated = procedural_reject_record(record, reason, authority, evidence)
+            response = {"rejected": True, "idempotent": False, "experiment": updated}
+        else:
+            if artifact is None:
+                fail("verifier artifact_sha256 is required for a passing result")
+            verifier = {"result": "pass", "request_id": verifier_request_id, "artifact_sha256": artifact, "independent": True, "proposal_author_task_id": author_task_id, "verifier_task_id": verifier_task_id}
+            updated = procedural_record_update(record, status="verifier_passed", verifier=verifier)
+            response = {"updated": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="verify", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def procedural_bounds(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("trial bounds must be an object")
+    allowed = {"max_runs", "max_work_units", "expires_at"}
+    if set(value) - allowed:
+        fail("unknown trial bound")
+    bounds = {key: value.get(key) for key in allowed}
+    for key in ("max_runs", "max_work_units"):
+        if bounds[key] is not None and (not isinstance(bounds[key], int) or isinstance(bounds[key], bool) or bounds[key] <= 0):
+            fail(f"trial {key} must be a positive integer")
+    if bounds["expires_at"] is not None:
+        nullable_timestamp(bounds["expires_at"], "trial expires_at")
+        if parse_timestamp(bounds["expires_at"]) <= dt.datetime.now(dt.timezone.utc):
+            fail("PROCEDURAL_TRIAL_REJECTED: trial expires_at must be in the future")
+    if bounds["max_runs"] is None and bounds["max_work_units"] is None and bounds["expires_at"] is None:
+        fail("PROCEDURAL_TRIAL_REJECTED: trial must have a positive max_runs, max_work_units, or expires_at bound")
+    return bounds
+
+
+def cmd_procedural_trial_start(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "trial-start")
+    if authority["kind"] not in {"frontier", "human"}:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: trial activation requires Frontier or human authority")
+    bounds = procedural_bounds(procedural_json_option(args.bounds_json, "--bounds-json", {
+        "max_runs": args.max_runs, "max_work_units": args.max_work_units, "expires_at": args.expires_at,
+    }))
+    trial_id = procedural_text(args.trial_id, "trial_id", maximum=256)
+    fixture = procedural_text(args.fixture_identity, "fixture_identity", maximum=512)
+    candidate_artifact = procedural_sha256(args.candidate_artifact_sha256, "trial candidate_artifact_sha256")
+    baseline = procedural_sha256(args.baseline_metrics_artifact_sha256, "baseline_metrics_artifact_sha256")
+    rollback = procedural_sha256(args.rollback_artifact_sha256, "rollback_artifact_sha256")
+    activation_raw = procedural_json_option(args.activation_authority_json, "--activation-authority-json", {
+        "kind": authority["kind"], "request_id": authority["request_id"], "elevated": authority["elevated"],
+    })
+    activation = procedural_authority(activation_raw, "activation authority", allow_frontier_request=True)
+    if activation["kind"] != authority["kind"] or activation["request_id"] != authority["request_id"]:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: activation authority does not match mutation authority")
+    payload.update({"trial_id": trial_id, "fixture_identity": fixture, "candidate_artifact_sha256": candidate_artifact, "bounds": bounds, "baseline_metrics_artifact_sha256": baseline, "rollback_artifact_sha256": rollback, "activation_authority": activation})
+    payload_hash = procedural_payload_hash("trial-start", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "trial-start", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "verifier_passed":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: trial start requires verifier_passed status")
+        if candidate_artifact != record["candidate"]["artifact_sha256"]:
+            fail("PROCEDURAL_IDENTITY_REJECTED: trial candidate artifact does not match isolated candidate")
+        if record["proposal"]["risk_class"] == "core_control":
+            if activation["kind"] != "human" or not activation["elevated"]:
+                fail("PROCEDURAL_AUTHORITY_REJECTED: core-control trials require an elevated human")
+            frontier_ids = {item["frontier_request_id"] for item in record["proposal"]["evidence"] if item["frontier_request_id"]}
+            frontier_request_id = args.frontier_request_id
+            if not frontier_request_id or frontier_request_id not in frontier_ids:
+                fail("PROCEDURAL_AUTHORITY_REJECTED: core-control trial requires a matching Frontier request")
+            activation["frontier_request_id"] = frontier_request_id
+        trial = {"trial_id": trial_id, "fixture_identity": fixture, "candidate_artifact_sha256": candidate_artifact, "bounds": bounds, "baseline_metrics_artifact_sha256": baseline, "rollback_artifact_sha256": rollback, "activation_authority": activation}
+        updated = procedural_record_update(record, status="bounded_trial_active", trial=trial)
+        response = {"started": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="trial-start", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def procedural_outcome_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    result = args.result
+    observed = procedural_sha256(args.observed_metrics_artifact_sha256, "observed_metrics_artifact_sha256")
+    summary = procedural_text(args.effectiveness_summary, "effectiveness_summary", maximum=2000)
+    rollback = procedural_sha256(args.rollback_artifact_sha256, "outcome rollback_artifact_sha256") if args.rollback_artifact_sha256 else None
+    evidence = procedural_evidence(args.evidence_json) if args.evidence_json else []
+    if result in {"regression", "inconclusive"} and rollback is None:
+        fail("PROCEDURAL_ROLLBACK_REQUIRED: regression/inconclusive outcome requires rollback evidence")
+    if result in {"regression", "inconclusive"} and not evidence:
+        fail("PROCEDURAL_EVIDENCE_REJECTED: regression/inconclusive outcome requires evidence")
+    return {"result": result, "observed_metrics_artifact_sha256": observed, "effectiveness_summary": summary, "rollback_artifact_sha256": rollback, "evidence": evidence}
+
+
+def cmd_procedural_trial_outcome(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "trial-outcome")
+    if authority["kind"] not in {"frontier", "human"}:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: trial outcome requires Frontier or human authority")
+    outcome = procedural_outcome_from_args(args)
+    payload.update(outcome)
+    payload_hash = procedural_payload_hash("trial-outcome", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "trial-outcome", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "bounded_trial_active":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: trial outcome requires bounded_trial_active status")
+        if outcome["result"] == "success":
+            updated = procedural_record_update(record, outcome=outcome)
+            response = {"recorded": True, "idempotent": False, "experiment": updated}
+        else:
+            decision = {"result": "revert", "reason": outcome["effectiveness_summary"], "authority": authority, "evidence": outcome["evidence"]}
+            updated = procedural_record_update(record, status="reverted", outcome=outcome, decision=decision)
+            response = {"reverted": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="trial-outcome", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def procedural_promotion_guard(record: dict[str, Any]) -> None:
+    if record["status"] != "bounded_trial_active" or not record.get("outcome") or record["outcome"]["result"] != "success":
+        fail("PROCEDURAL_PROMOTION_REJECTED: only a successful bounded trial may be promoted")
+    candidate_artifact = record["candidate"]["artifact_sha256"]
+    if record["trial"]["candidate_artifact_sha256"] != candidate_artifact:
+        fail("PROCEDURAL_IDENTITY_REJECTED: trial candidate does not match candidate")
+    evidence_artifacts = {item["artifact_sha256"] for item in record["proposal"]["evidence"] if item["artifact_sha256"]}
+    if candidate_artifact not in evidence_artifacts:
+        fail("PROCEDURAL_IDENTITY_REJECTED: candidate artifact is absent from proposal evidence")
+
+
+def cmd_procedural_promote(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "promote")
+    if authority["kind"] not in {"frontier", "human"}:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: promotion requires Frontier or human authority")
+    reason = procedural_text(args.reason, "promotion reason", maximum=2000)
+    evidence = procedural_evidence(args.evidence_json)
+    payload.update({"reason": reason, "evidence": evidence})
+    payload_hash = procedural_payload_hash("promote", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "promote", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        procedural_promotion_guard(record)
+        decision = {"result": "promote", "reason": reason, "authority": authority, "evidence": evidence}
+        updated = procedural_record_update(record, status="promoted", decision=decision)
+        response = {"promoted": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="promote", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def cmd_procedural_revert(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "revert")
+    if authority["kind"] not in {"frontier", "human"}:
+        fail("PROCEDURAL_AUTHORITY_REJECTED: revert requires Frontier or human authority")
+    outcome = procedural_outcome_from_args(args)
+    if outcome["result"] not in {"regression", "inconclusive"}:
+        fail("PROCEDURAL_REVERT_REJECTED: revert requires regression or inconclusive evidence")
+    payload.update(outcome)
+    payload_hash = procedural_payload_hash("revert", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "revert", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] != "promoted":
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: later revert requires a promoted experiment")
+        decision = {"result": "revert", "reason": outcome["effectiveness_summary"], "authority": authority, "evidence": outcome["evidence"]}
+        updated = procedural_record_update(record, status="reverted", outcome=outcome, decision=decision)
+        response = {"reverted": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="revert", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def cmd_procedural_reject(args: argparse.Namespace) -> int:
+    scope, identity, request_id, expected, authority, paths, _, payload = procedural_mutation_context(args, "reject")
+    evidence = procedural_evidence(args.evidence_json)
+    reason = procedural_text(args.reason, "rejection reason", maximum=2000)
+    payload.update({"reason": reason, "evidence": evidence})
+    payload_hash = procedural_payload_hash("reject", payload)
+    with procedural_lock(scope, identity, create=False) as locked_paths:
+        events = procedural_read_events(locked_paths, identity, scope)
+        replay = procedural_replay(events, request_id, "reject", payload_hash)
+        if replay is not None:
+            return emit(replay)
+        record = copy.deepcopy(procedural_find(events, args.experiment_id))
+        if record["revision"] != expected:
+            fail(f"revision conflict: expected {expected}, observed {record['revision']}")
+        if record["status"] in {"promoted", "reverted", "rejected"}:
+            fail("PROCEDURAL_LIFECYCLE_REJECTED: terminal experiment cannot be rejected")
+        updated = procedural_reject_record(record, reason, authority, evidence)
+        response = {"rejected": True, "idempotent": False, "experiment": updated}
+        return procedural_commit(paths=locked_paths, scope=scope, identity=identity, events=events, operation="reject", request_id=request_id, payload_hash=payload_hash, record=updated, response=response)
+
+
+def cmd_procedural_list(args: argparse.Namespace) -> int:
+    scope, identity = procedural_scope(args)
+    with procedural_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            return emit({"scope": scope, "experiments": []})
+        events = procedural_read_events(paths, identity, scope)
+    records = list(procedural_materialize(events).values())
+    records.sort(key=lambda item: (item["created_at"], item["experiment_id"]))
+    return emit({"scope": scope, "experiments": records[:args.limit]})
+
+
+def cmd_procedural_show(args: argparse.Namespace) -> int:
+    scope, identity = procedural_scope(args)
+    with procedural_lock(scope, identity, create=False) as paths:
+        if not paths["root"].is_dir():
+            store_not_found("procedural " + scope)
+        events = procedural_read_events(paths, identity, scope)
+        record = procedural_find(events, args.experiment_id)
+    return emit(record)
+
+
 def cmd_project_id(args: argparse.Namespace) -> int:
     print(project_identity_from_root(args.repository_root))
     return 0
@@ -1938,6 +2680,137 @@ def build_parser() -> argparse.ArgumentParser:
     metric_list.add_argument("--limit", type=int, default=20)
     metric_list.set_defaults(func=cmd_metric_list)
 
+    procedural = sub.add_parser("procedural", help="governed append-only procedural learning experiments")
+    procedural_sub = procedural.add_subparsers(dest="procedural_command", required=True)
+
+    procedural_propose = procedural_sub.add_parser("propose")
+    add_project_arguments(procedural_propose, root_optional=True)
+    procedural_propose.add_argument("--scope", choices=[PROJECT_SCOPE, INSTALLATION_SCOPE], default=PROJECT_SCOPE)
+    procedural_propose.add_argument("--proposal-json")
+    procedural_propose.add_argument("--kind", choices=sorted(PROCEDURAL_KINDS))
+    procedural_propose.add_argument("--version")
+    procedural_propose.add_argument("--weakness")
+    procedural_propose.add_argument("--expected-benefit")
+    procedural_propose.add_argument("--target-path", action="append")
+    procedural_propose.add_argument("--target-paths-json")
+    procedural_propose.add_argument("--evidence-json")
+    procedural_propose.add_argument("--authority-kind", "--authority", dest="authority_kind", choices=sorted(PROCEDURAL_AUTHORITIES))
+    procedural_propose.add_argument("--authority-request-id")
+    procedural_propose.add_argument("--elevated", action="store_true")
+    procedural_propose.add_argument("--rollback-json")
+    procedural_propose.add_argument("--rollback-description")
+    procedural_propose.add_argument("--restore-artifact-sha256")
+    procedural_propose.add_argument("--risk-class", choices=sorted(PROCEDURAL_RISK_CLASSES))
+    procedural_propose.add_argument("--writer-authority", default="primary")
+    procedural_propose.add_argument("--request-id", required=True)
+    procedural_propose.add_argument("--expect-revision", type=int, required=True)
+    procedural_propose.set_defaults(func=cmd_procedural_propose)
+
+    procedural_candidate = procedural_sub.add_parser("candidate")
+    add_project_arguments(procedural_candidate, root_optional=True)
+    add_procedural_mutation_arguments(procedural_candidate)
+    procedural_candidate.add_argument("experiment_id")
+    procedural_candidate.add_argument("--artifact-sha256", "--artifact-digest", dest="artifact_sha256", required=True)
+    procedural_candidate.add_argument("--base-identity", required=True)
+    procedural_candidate.add_argument("--changed-path", action="append")
+    procedural_candidate.add_argument("--changed-paths-json")
+    procedural_candidate.add_argument("--isolation-mode", default="disposable")
+    procedural_candidate.add_argument("--candidate-source", default="child-agent")
+    procedural_candidate.set_defaults(func=cmd_procedural_candidate)
+
+    procedural_tests = procedural_sub.add_parser("tests")
+    add_project_arguments(procedural_tests, root_optional=True)
+    add_procedural_mutation_arguments(procedural_tests)
+    procedural_tests.add_argument("experiment_id")
+    procedural_tests.add_argument("--result", choices=["pass", "fail"], required=True)
+    procedural_tests.add_argument("--artifact-sha256", "--artifact-digest", dest="artifact_sha256")
+    procedural_tests.add_argument("--command-summary", action="append")
+    procedural_tests.add_argument("--command-summaries-json")
+    procedural_tests.add_argument("--evidence-json")
+    procedural_tests.add_argument("--failure-reason")
+    procedural_tests.set_defaults(func=cmd_procedural_tests)
+
+    procedural_verify = procedural_sub.add_parser("verify")
+    add_project_arguments(procedural_verify, root_optional=True)
+    add_procedural_mutation_arguments(procedural_verify)
+    procedural_verify.add_argument("experiment_id")
+    procedural_verify.add_argument("--result", choices=["pass", "fail"], required=True)
+    procedural_verify.add_argument("--verifier-request-id", required=True)
+    procedural_verify.add_argument("--verifier-task-id", required=True)
+    procedural_verify.add_argument("--proposal-author-task-id", required=True)
+    procedural_verify.add_argument("--artifact-sha256", "--artifact-digest", dest="artifact_sha256")
+    procedural_verify.add_argument("--independent", action="store_true")
+    procedural_verify.add_argument("--evidence-json")
+    procedural_verify.add_argument("--failure-reason")
+    procedural_verify.set_defaults(func=cmd_procedural_verify)
+
+    procedural_trial_start = procedural_sub.add_parser("trial-start")
+    add_project_arguments(procedural_trial_start, root_optional=True)
+    add_procedural_mutation_arguments(procedural_trial_start)
+    procedural_trial_start.add_argument("experiment_id")
+    procedural_trial_start.add_argument("--trial-id", required=True)
+    procedural_trial_start.add_argument("--fixture-identity", required=True)
+    procedural_trial_start.add_argument("--candidate-artifact-sha256", required=True)
+    procedural_trial_start.add_argument("--bounds-json")
+    procedural_trial_start.add_argument("--max-runs", type=int)
+    procedural_trial_start.add_argument("--max-work-units", type=int)
+    procedural_trial_start.add_argument("--expires-at")
+    procedural_trial_start.add_argument("--baseline-metrics-artifact-sha256", required=True)
+    procedural_trial_start.add_argument("--rollback-artifact-sha256", required=True)
+    procedural_trial_start.add_argument("--activation-authority-json")
+    procedural_trial_start.add_argument("--frontier-request-id")
+    procedural_trial_start.set_defaults(func=cmd_procedural_trial_start)
+
+    procedural_outcome = procedural_sub.add_parser("trial-outcome")
+    add_project_arguments(procedural_outcome, root_optional=True)
+    add_procedural_mutation_arguments(procedural_outcome)
+    procedural_outcome.add_argument("experiment_id")
+    procedural_outcome.add_argument("--result", choices=sorted(PROCEDURAL_OUTCOMES), required=True)
+    procedural_outcome.add_argument("--observed-metrics-artifact-sha256", required=True)
+    procedural_outcome.add_argument("--effectiveness-summary", required=True)
+    procedural_outcome.add_argument("--rollback-artifact-sha256")
+    procedural_outcome.add_argument("--evidence-json")
+    procedural_outcome.set_defaults(func=cmd_procedural_trial_outcome)
+
+    procedural_promote = procedural_sub.add_parser("promote")
+    add_project_arguments(procedural_promote, root_optional=True)
+    add_procedural_mutation_arguments(procedural_promote)
+    procedural_promote.add_argument("experiment_id")
+    procedural_promote.add_argument("--reason", required=True)
+    procedural_promote.add_argument("--evidence-json", required=True)
+    procedural_promote.set_defaults(func=cmd_procedural_promote)
+
+    procedural_revert = procedural_sub.add_parser("revert")
+    add_project_arguments(procedural_revert, root_optional=True)
+    add_procedural_mutation_arguments(procedural_revert)
+    procedural_revert.add_argument("experiment_id")
+    procedural_revert.add_argument("--result", choices=["regression", "inconclusive"], required=True)
+    procedural_revert.add_argument("--observed-metrics-artifact-sha256", required=True)
+    procedural_revert.add_argument("--effectiveness-summary", required=True)
+    procedural_revert.add_argument("--rollback-artifact-sha256", required=True)
+    procedural_revert.add_argument("--evidence-json", required=True)
+    procedural_revert.set_defaults(func=cmd_procedural_revert)
+
+    procedural_reject = procedural_sub.add_parser("reject")
+    add_project_arguments(procedural_reject, root_optional=True)
+    add_procedural_mutation_arguments(procedural_reject)
+    procedural_reject.add_argument("experiment_id")
+    procedural_reject.add_argument("--reason", required=True)
+    procedural_reject.add_argument("--evidence-json", required=True)
+    procedural_reject.set_defaults(func=cmd_procedural_reject)
+
+    procedural_list = procedural_sub.add_parser("list")
+    add_project_arguments(procedural_list, root_optional=True)
+    procedural_list.add_argument("--scope", choices=[PROJECT_SCOPE, INSTALLATION_SCOPE], default=PROJECT_SCOPE)
+    procedural_list.add_argument("--limit", type=int, default=100)
+    procedural_list.set_defaults(func=cmd_procedural_list)
+
+    procedural_show = procedural_sub.add_parser("show")
+    add_project_arguments(procedural_show, root_optional=True)
+    procedural_show.add_argument("experiment_id")
+    procedural_show.add_argument("--scope", choices=[PROJECT_SCOPE, INSTALLATION_SCOPE], default=PROJECT_SCOPE)
+    procedural_show.set_defaults(func=cmd_procedural_show)
+
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=cmd_doctor)
     return parser
@@ -1948,6 +2821,16 @@ def add_project_arguments(parser: argparse.ArgumentParser, *, root_optional: boo
     # the store while repository_root bounds and validates evidence paths.
     parser.add_argument("--project-identity")
     parser.add_argument("--repository-root")
+
+
+def add_procedural_mutation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scope", choices=[PROJECT_SCOPE, INSTALLATION_SCOPE], default=PROJECT_SCOPE)
+    parser.add_argument("--authority-kind", "--authority", dest="authority_kind", choices=sorted(PROCEDURAL_AUTHORITIES), required=True)
+    parser.add_argument("--authority-request-id", required=True)
+    parser.add_argument("--elevated", action="store_true")
+    parser.add_argument("--writer-authority", default="primary")
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--expect-revision", type=int, required=True)
 
 
 def main() -> int:
