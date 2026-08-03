@@ -136,6 +136,30 @@ Before editing or delegating a writer:
 
 Commit only after verification and explicit approval or a standing authorization stated by the user. Load `myrmex-git-delivery` for commit/push. Push only with explicit authorization. Never force-push or push destructive history. Do not push directly to a protected branch unless the user has explicitly named and authorized that branch.
 
+## Tracking issue and PR delivery order
+
+When the resolved delivery policy requires a tracking issue, make the GitHub
+boundary explicit and resumable. First run the read-only
+`scripts/resolve-delivery-policy.py`; then persist a typed `tracking_issue`
+operation before invoking `scripts/github-tracking-issue-recovery.py`. Persist
+the complete resolved policy and `policy_digest` in that intent. State must
+recompute the resolver from the persisted exact inputs before any helper call,
+then persist
+the helper artifact as observed effect and receipt, and confirm it only when
+the receipt is the canonical `ISSUE_APPROVED` or `ISSUE_REUSED` with the exact stable marker,
+repository, issue number, and URL from the intent.
+
+Never create a PR intent without that confirmed approved issue identity. Use
+`myrmex-state delivery <run-id> pr-body` to generate the PR body from the
+confirmed operation; do not hand-copy an issue URL. Persist a typed
+`pull_request` intent containing the generated body, mandatory `body_digest`, and tracking operation,
+then invoke the existing `scripts/github-pr-recovery.py`. Persist and confirm
+its receipt only when it is the canonical `PR_CREATED`; require an exact issue
+URL token/marker, recheck the body digest before effect/receipt/confirmation,
+and require matching effect/receipt PR identities. On resume, run `myrmex-state
+reconcile` first and reuse the saved operation, stable marker, body, and
+head/base identity; discovery must prove absence before any create retry.
+
 ## Verification
 
 Evidence is required, but proportionality matters.
@@ -153,6 +177,17 @@ Never claim a test passed without its command and result. Distinguish failures c
 
 Only the primary may invoke `myrmex-memory` to create candidates, promote, revoke, or supersede a record. Subagents return `memory_candidates` only; review them, validate accessible evidence, and promote only narrow project-scoped claims. Do not save routine file opens, every command, polling heartbeats, raw source/logs, secrets, or facts already represented by Git/local state.
 
+Governed procedural learning is a separate append-only namespace, never exact
+run state or semantic memory. Child agents may return procedural candidate
+metadata only; the primary alone may persist candidates or advance their
+lifecycle. Require deterministic experiment identity, request IDs, expected
+revisions, evidence, disposable isolation, independent verification, bounded
+trials, and explicit rollback. Reject collective/global scope, active
+installation targets, raw patches, unrestricted shell rollback, and any
+authority downgrade. Installation proposals must be sanitized/generalizable
+and explicitly Frontier- or human-authorized. Core-control experiments fail
+closed unless an elevated human authority matches the Frontier request.
+
 If native memory or Engram is unavailable, continue safe local work when possible and report memory as degraded instead of inventing a save/retrieval receipt. After compaction, first persist the compacted summary when instructed, then load exact local run state and recover relevant native/semantic memory context before continuing.
 
 ## Communication and completion
@@ -160,6 +195,24 @@ If native memory or Engram is unavailable, continue safe local work when possibl
 For long work, give concise progress updates with concrete findings. Do not narrate every tool call.
 
 Ask a question only when repository inspection cannot resolve a material ambiguity. Otherwise make the smallest safe repository-consistent decision and state it.
+
+### Continuous-parent status side-band
+
+In a continuous run, treat an informational user message such as `¿Cómo va?`,
+`¿Terminaste?`, or `¿Qué estás haciendo?` as a side-band status request, not as
+an instruction to pause, cancel, abandon, or complete. Read the current typed
+state and reconcile action, report the current phase/status, blocker, active WU,
+and exact next action, then resume that same action automatically. Do not write
+an event or revision for the side-band message, do not replace a pending
+operation, and do not ask for generic confirmation before resuming.
+
+Only an explicit typed pause is resumable (`myrmex-state pause` followed by
+`resume`); explicit cancellation is distinct and terminal (`cancel` records
+`PARENT_OBJECTIVE_CANCELLED` for a continuous parent). A typed
+`BLOCKING_CLARIFICATION` is blocked but resumable and must preserve its request
+ID, message ID, operation ID, question, and pre-response action. A completed
+work unit always requests the parent gate; only a confirmed Frontier
+`PARENT_OBJECTIVE_COMPLETE` may satisfy the parent completion gate.
 
 Stop when the stated objective is complete. Do not ask models or subagents for arbitrary extra work. Report:
 

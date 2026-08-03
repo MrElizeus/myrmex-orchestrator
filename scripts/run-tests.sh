@@ -47,7 +47,11 @@ else:
     print(f'schema meta-validation: PASS ({checked} schemas)')
 PYSCHEMA
 python3 "$ROOT/tests/test-state-cli.py"
+python3 "$ROOT/tests/test-correction-grant-replay.py"
+python3 "$ROOT/tests/test-parent-objective-continuity.py"
+python3 "$ROOT/tests/test-local-commit.py"
 python3 "$ROOT/tests/test-memory-cli.py"
+python3 "$ROOT/tests/test-procedural-learning.py"
 if command -v node >/dev/null 2>&1; then
   node "$ROOT/tests/test-frontier-dom.js"
 else

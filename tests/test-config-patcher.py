@@ -89,4 +89,21 @@ with tempfile.TemporaryDirectory(prefix="myrmex-patcher-") as td:
     assert all("@latest" not in part for part in generated)
     assert any(part.startswith("--user-data-dir=") for part in generated)
 
+    # Existing child symlinks cannot redirect generated profile or transport
+    # output into the repository or outside the explicit artifact root.
+    repository = base / "repository"
+    repository.mkdir()
+    for child in ("browser-profile", "transport-output"):
+        isolated_root = base / ("symlink-" + child)
+        isolated_root.mkdir()
+        (isolated_root / child).symlink_to(repository, target_is_directory=True)
+        isolated_config = isolated_root / "opencode.json"
+        isolated_config.write_text("{}\n")
+        before = isolated_config.read_bytes()
+        run(
+            "apply", "--config", str(isolated_config), "--record", str(isolated_root / "change.json"),
+            "--artifact-root", str(isolated_root), ok=False,
+        )
+        assert isolated_config.read_bytes() == before
+
 print("config patcher test: PASS")

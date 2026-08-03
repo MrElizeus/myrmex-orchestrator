@@ -45,7 +45,8 @@
     "no_progress_cycles",
     "active_work_unit_id",
     "work_units",
-    "remediation"
+    "remediation",
+    "authorizations"
   ],
   "properties": {
     "schema": {
@@ -122,6 +123,11 @@
       "type": "string",
       "minLength": 1
     },
+    "artifact_root": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
     "branch": {
       "type": [
         "string",
@@ -145,8 +151,66 @@
       "enum": [
         "deny",
         "ask",
-        "authorized"
+        "authorized",
+        "governed"
       ]
+    },
+    "commit_policy_authorization": {
+      "type": ["object", "null"],
+      "required": [
+        "authorization_id",
+        "authority",
+        "source_request_id",
+        "scope",
+        "source",
+        "accepted_work_unit",
+        "status",
+        "authorized_at",
+        "audit_history"
+      ],
+      "properties": {
+        "authorization_id": {"type": "string", "pattern": "^policy-auth-[0-9a-f]{24}$"},
+        "authority": {"const": "user"},
+        "source_request_id": {"type": "string", "minLength": 1},
+        "scope": {
+          "type": "object",
+          "required": ["parent_run_id", "parent_objective", "repository_root", "branch"],
+          "properties": {
+            "parent_run_id": {"type": "string", "minLength": 1},
+            "parent_objective": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "source": {
+          "type": "object",
+          "required": ["operation_id", "request_id", "message_id", "work_unit_id", "response_type", "frontier_decision"],
+          "properties": {
+            "operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+            "request_id": {"type": "string", "minLength": 1},
+            "message_id": {"type": "string", "minLength": 1},
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "response_type": {"const": "sub_objective_complete"},
+            "frontier_decision": {"const": "ACCEPT"}
+          },
+          "additionalProperties": false
+        },
+        "accepted_work_unit": {
+          "type": "object",
+          "required": ["work_unit_id", "repository_root", "branch"],
+          "properties": {
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "status": {"enum": ["active", "revoked"]},
+        "authorized_at": {"type": "string", "format": "date-time"},
+        "audit_history": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+      },
+      "additionalProperties": false
     },
     "push_policy": {
       "enum": [
@@ -408,8 +472,10 @@
               "work_unit_id",
               "work_unit_attempt",
               "source_request_id",
+              "verification_request_id",
               "scope_digest",
               "source_candidate_sha",
+              "defect_revision",
               "grant_id"
             ],
             "properties": {
@@ -423,6 +489,9 @@
               "source_request_id": {
                 "type": "string"
               },
+              "verification_request_id": {
+                "type": "string"
+              },
               "scope_digest": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$"
@@ -430,6 +499,10 @@
               "source_candidate_sha": {
                 "type": "string",
                 "pattern": "^[0-9a-fA-F]{7,64}$"
+              },
+              "defect_revision": {
+                "type": "integer",
+                "minimum": 0
               },
               "grant_id": {
                 "type": [
@@ -673,6 +746,138 @@
       },
       "additionalProperties": true
     },
+    "parent_gate": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["required", "requested", "confirmed", "blocked"]
+        },
+        "completed_work_unit_id": {
+          "type": ["string", "null"]
+        },
+        "operation_id": {
+          "type": ["string", "null"]
+        },
+        "request_id": {
+          "type": ["string", "null"]
+        },
+        "message_id": {
+          "type": ["string", "null"]
+        },
+        "response_type": {
+          "enum": [
+            "plan",
+            "blocking_clarification",
+            "objective_complete",
+            "sub_objective_complete",
+            "parent_objective_complete",
+            "already_complete",
+            "unknown",
+            null
+          ]
+        },
+        "frontier_decision": {
+          "enum": ["ACCEPT", "REMEDIATE", "BLOCKED", null]
+        },
+        "effect": {
+          "type": ["object", "null"]
+        },
+        "receipt": {
+          "type": ["object", "null"]
+        },
+        "next_work_unit_id": {
+          "type": ["string", "null"]
+        },
+        "recorded_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "parent_gate_history": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "next_work_unit": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": ["status", "work_unit_id", "intent", "provenance"],
+      "properties": {
+        "status": {
+          "enum": ["approved", "active", "complete"]
+        },
+        "work_unit_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intent": {
+          "type": "object"
+        },
+        "provenance": {
+          "type": "object",
+          "required": ["operation_id", "request_id", "message_id"],
+          "properties": {
+            "operation_id": {"type": "string"},
+            "request_id": {"type": "string"},
+            "message_id": {"type": "string"},
+            "frontier_decision": {"type": ["string", "null"]},
+            "effect": {"type": "object"},
+            "receipt": {"type": "object"}
+          },
+          "additionalProperties": true
+        },
+        "approved_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "clarification": {
+      "type": ["object", "null"],
+      "properties": {
+        "status": {"enum": ["blocked", "resumed"]},
+        "response_type": {"const": "blocking_clarification"},
+        "operation_id": {"type": "string"},
+        "request_id": {"type": "string"},
+        "message_id": {"type": "string"},
+        "question": {},
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "recorded_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "pause": {
+      "type": ["object", "null"],
+      "properties": {
+        "status": {"enum": ["paused", "resumed"]},
+        "reason": {"type": "string"},
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "paused_at": {"type": "string"},
+        "resumed_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "cancellation": {
+      "type": ["object", "null"],
+      "properties": {
+        "type": {"enum": ["PARENT_OBJECTIVE_CANCELLED", "RUN_CANCELLED"]},
+        "reason": {"type": "string"},
+        "request_id": {"type": ["string", "null"]},
+        "message_id": {"type": ["string", "null"]},
+        "evidence": {"type": "object"},
+        "cancelled_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
     "active_work_unit_id": {
       "type": [
         "string",
@@ -754,6 +959,8 @@
               "authority",
               "request_id",
               "work_unit_id",
+              "verification_request_id",
+              "defect_revision",
               "scope_digest",
               "source_candidate_sha",
               "granted_attempts",
@@ -780,6 +987,14 @@
               "work_unit_id": {
                 "type": "string",
                 "minLength": 1
+              },
+              "verification_request_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "defect_revision": {
+                "type": "integer",
+                "minimum": 0
               },
               "scope_digest": {
                 "type": "string",
@@ -866,6 +1081,13 @@
             "source_request_id": {
               "type": "string"
             },
+            "verification_request_id": {
+              "type": "string"
+            },
+            "defect_revision": {
+              "type": "integer",
+              "minimum": 0
+            },
             "scope_digest": {
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
@@ -879,6 +1101,80 @@
         }
       },
       "additionalProperties": false
+    },
+    "authorizations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization_id",
+          "kind",
+          "authority",
+          "request_id",
+          "repository_root",
+          "branch",
+          "expected_head",
+          "allowed_paths",
+          "scope_digest",
+          "commit_message",
+          "commit_message_digest",
+          "max_uses",
+          "consumed_uses",
+          "expires_at",
+          "status",
+          "authorized_at",
+          "consumed_at"
+        ],
+        "properties": {
+          "authorization_id": {"type": "string", "pattern": "^auth-[0-9a-f]{24}$"},
+          "kind": {"const": "local_commit"},
+          "authority": {"enum": ["user", "frontier"]},
+          "request_id": {"type": "string", "minLength": 1},
+          "repository_root": {"type": "string", "minLength": 1},
+          "branch": {"type": "string", "minLength": 1},
+          "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+          "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "commit_message": {"type": "string", "minLength": 1},
+          "commit_message_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "grant_kind": {"enum": ["governed"]},
+          "parent_run_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+          "source_request_id": {"type": "string", "minLength": 1},
+          "source_scope": {
+            "type": "object",
+            "required": ["repository_root", "branch", "expected_head", "candidate_diff_sha", "allowed_paths", "commit_message"],
+            "properties": {
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1},
+              "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+              "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+              "commit_message": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          },
+          "accepted_work_unit": {
+            "type": "object",
+            "required": ["work_unit_id", "repository_root", "branch"],
+            "properties": {
+              "work_unit_id": {"type": "string", "minLength": 1},
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          },
+          "max_uses": {"const": 1},
+          "consumed_uses": {"type": "integer", "minimum": 0},
+          "expires_at": {"type": ["string", "null"], "format": "date-time"},
+          "status": {"enum": ["open", "consumed", "expired", "revoked"]},
+          "authorized_at": {"type": "string", "format": "date-time"},
+          "consumed_at": {"type": ["string", "null"], "format": "date-time"}
+        }
+      }
     },
     "pending_operations": {
       "type": "array",
@@ -912,7 +1208,8 @@
               "ci",
               "local_verification",
               "parent_gate",
-              "git_delivery"
+              "git_delivery",
+              "local_commit"
             ]
           },
           "idempotency_key": {
@@ -929,6 +1226,12 @@
               "abandoned"
             ]
           },
+          "request_id": {"type": "string", "minLength": 1},
+          "message_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "effective_request_id": {"type": "string", "minLength": 1},
+          "effective_message_id": {"type": "string", "minLength": 1},
+          "effective_work_unit_id": {"type": "string", "minLength": 1},
           "intent": {
             "type": "object"
           },
@@ -964,6 +1267,191 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "transport_status": {
+            "enum": [
+              "success",
+              "transport_error",
+              "timeout",
+              "malformed",
+              "request_mismatch",
+              "response_identity_mismatch"
+            ]
+          },
+          "frontier_decision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ACCEPT",
+              "REMEDIATE",
+              "BLOCKED",
+              null
+            ]
+          },
+          "response_type": {
+            "enum": [
+              "plan",
+              "blocking_clarification",
+              "objective_complete",
+              "sub_objective_complete",
+              "parent_objective_complete",
+              "already_complete",
+              "unknown",
+              null
+            ]
+          },
+          "proposed_plan": {
+            "type": ["object", "null"]
+          },
+          "effective_status": {
+            "enum": [
+              "confirmed",
+              "failed",
+              "abandoned"
+            ]
+          },
+          "effective_transport_status": {
+            "enum": [
+              "success",
+              "transport_error",
+              "timeout",
+              "malformed",
+              "request_mismatch",
+              "response_identity_mismatch"
+            ]
+          },
+          "effective_frontier_decision": {
+            "enum": [
+              "ACCEPT",
+              "REMEDIATE",
+              "BLOCKED"
+            ]
+          },
+          "effective_response_type": {
+            "enum": [
+              "plan",
+              "blocking_clarification",
+              "objective_complete",
+              "sub_objective_complete",
+              "parent_objective_complete",
+              "already_complete",
+              "unknown",
+              null
+            ]
+          },
+          "effective_outcome": {
+            "type": "object",
+            "required": [
+              "transport_status",
+              "frontier_decision",
+              "request_id",
+              "message_id",
+              "effect",
+              "receipt"
+            ],
+            "properties": {
+              "transport_status": {
+                "enum": [
+                  "success",
+                  "transport_error",
+                  "timeout",
+                  "malformed",
+                  "request_mismatch",
+                  "response_identity_mismatch"
+                ]
+              },
+              "frontier_decision": {
+                "enum": [
+                  "ACCEPT",
+                  "REMEDIATE",
+                  "BLOCKED"
+                ]
+              },
+              "request_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "message_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "effect": {
+                "type": "object"
+              },
+              "receipt": {
+                "type": "object"
+              }
+            },
+            "additionalProperties": true
+          },
+          "recovery_history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "recovery_id",
+                "transport_status",
+                "frontier_decision",
+                "request_id",
+                "message_id",
+                "effective_status",
+                "effect",
+                "receipt",
+                "recorded_at"
+              ],
+              "properties": {
+                "recovery_id": {
+                  "type": "string",
+                  "pattern": "^recovery-[0-9a-f]{24}$"
+                },
+                "transport_status": {
+                  "const": "success"
+                },
+                "frontier_decision": {
+                  "enum": [
+                    "ACCEPT",
+                    "REMEDIATE",
+                    "BLOCKED"
+                  ]
+                },
+                "request_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "task_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "scope": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "effective_status": {
+                  "const": "confirmed"
+                },
+                "effect": {
+                  "type": "object"
+                },
+                "receipt": {
+                  "type": "object"
+                },
+                "recorded_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "additionalProperties": true
+            }
           }
         },
         "allOf": [
@@ -1090,9 +1578,165 @@
                 }
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {"const": "tracking_issue"}
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "intent": {"$ref": "#/$defs/trackingIssueIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {"const": "pull_request"}
+              },
+              "required": ["kind"]
+            },
+            "then": {
+              "properties": {
+                "intent": {"$ref": "#/$defs/pullRequestIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
+              }
+            }
           }
         ]
       }
+    }
+  },
+  "$defs": {
+    "deliveryPolicy": {
+      "type": "object",
+      "required": ["schema", "repository_root", "mode", "delivery", "decision", "policy_digest", "provenance", "inputs"],
+      "properties": {
+        "schema": {"const": "myrmex.delivery-policy/v1"},
+        "repository_root": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["autonomous", "interactive"]},
+        "delivery": {
+          "type": "object",
+          "required": ["tracking_issue"],
+          "properties": {
+            "tracking_issue": {
+              "type": "object",
+              "required": ["required", "reuse_matching_approved", "create_when_missing", "approval_marker", "ask_on_ambiguous_match"],
+              "properties": {
+                "required": {"type": "boolean"},
+                "reuse_matching_approved": {"type": "boolean"},
+                "create_when_missing": {"type": "boolean"},
+                "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+                "ask_on_ambiguous_match": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "decision": {
+          "type": "object",
+          "required": ["on_missing_tracking_issue", "on_ambiguous_match", "creation_policy"],
+          "properties": {
+            "on_missing_tracking_issue": {"enum": ["not-required", "create", "ask"]},
+            "on_ambiguous_match": {"enum": ["ask", "block"]},
+            "creation_policy": {"enum": ["deny", "ask", "authorized"]}
+          },
+          "additionalProperties": false
+        },
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {"type": "object"},
+        "inputs": {
+          "type": "object",
+          "required": ["run_authorization", "repository_config", "installation_profile"],
+          "properties": {
+            "run_authorization": {"type": ["string", "null"]},
+            "repository_config": {"type": ["string", "null"]},
+            "installation_profile": {"type": ["string", "null"]}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "trackingIssueIntent": {
+      "type": "object",
+      "required": [
+        "required",
+        "repo",
+        "title",
+        "body_file",
+        "receipt_file",
+        "objective_id",
+        "scope_digest",
+        "approval_marker",
+        "reuse_matching_approved",
+        "create_when_missing",
+        "ask_on_ambiguous_match",
+        "creation_policy",
+        "ensure_approval",
+        "identity_marker",
+        "policy_digest",
+        "policy"
+      ],
+      "properties": {
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "objective_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reuse_matching_approved": {"type": "boolean"},
+        "create_when_missing": {"type": "boolean"},
+        "ask_on_ambiguous_match": {"type": "boolean"},
+        "creation_policy": {"enum": ["deny", "ask", "authorized"]},
+        "ensure_approval": {"type": "boolean"},
+        "identity_marker": {"type": "string", "minLength": 1},
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "policy": {"$ref": "#/$defs/deliveryPolicy"}
+      },
+      "additionalProperties": true
+    },
+    "pullRequestIntent": {
+      "type": "object",
+      "required": [
+        "required",
+        "repo",
+        "head",
+        "base",
+        "title",
+        "body_file",
+        "receipt_file",
+        "tracking_issue_operation_id",
+        "tracking_issue_number",
+        "tracking_issue_url",
+        "tracking_issue_identity_marker",
+        "body_digest"
+      ],
+      "properties": {
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "head": {"type": "string", "minLength": 1},
+        "base": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "label": {"type": ["string", "null"]},
+        "tracking_issue_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+        "tracking_issue_number": {"type": "integer", "minimum": 1},
+        "tracking_issue_url": {"type": "string", "format": "uri"},
+        "tracking_issue_identity_marker": {"type": "string", "minLength": 1},
+        "body_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": true
     }
   }
 }

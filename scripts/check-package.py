@@ -52,6 +52,7 @@ REQUIRED_CONTRACTS = {
     "frontier-state-v2.schema.json",
     "memory-v1.schema.json",
     "work-unit-metric-v1.schema.json",
+    "procedural-experiment-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }
 REQUIRED_FRONTIER_REFS = {
@@ -183,6 +184,7 @@ def main() -> int:
     require_text(agent_dir / "myrmex-orchestrator.md", [
         '"myrmex-frontier": allow',
         '"playwright_*": deny', '"git push --force*": deny', "**DIRECT** — default",
+        "tracking_issue", "policy_digest", "body_digest", "recompute", "github-tracking-issue-recovery.py", "github-pr-recovery.py",
     ], errors)
     require_text(agent_dir / "myrmex-scout.md", [
         "edit: deny", "task: deny", '"mem_*": deny', '"playwright_*": deny', '"*": deny',
@@ -285,6 +287,7 @@ def main() -> int:
         "frontier-state-v2.schema.json": [ROOT / "skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json"],
         "memory-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/memory-v1.schema.json"],
         "work-unit-metric-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/work-unit-metric-v1.schema.json"],
+        "procedural-experiment-v1.schema.json": [ROOT / "skills/myrmex-memory/assets/schemas/procedural-experiment-v1.schema.json"],
     }
     for canonical, copies in canonical_copies.items():
         source = ROOT / "contracts" / canonical
@@ -363,9 +366,29 @@ def main() -> int:
     for name in required_root:
         if not (ROOT / name).is_file():
             errors.append(f"missing root file: {name}")
-    for name in ["build-release.py", "collect-git-evidence.py", "inspect-agent-resolution.py", "validate-diff-size.py", "verify-receipt.py"]:
+    for name in ["build-release.py", "collect-git-evidence.py", "inspect-agent-resolution.py", "validate-diff-size.py", "verify-receipt.py", "myrmex-git-local.py"]:
         if not (ROOT / "scripts" / name).is_file():
             errors.append(f"missing release/control script: scripts/{name}")
+    for name in ["resolve-delivery-policy.py", "github-tracking-issue-recovery.py", "github-pr-recovery.py"]:
+        if not (ROOT / "scripts" / name).is_file():
+            errors.append(f"missing delivery recovery script: scripts/{name}")
+
+    require_text(ROOT / "skills/myrmex-git-delivery/SKILL.md", [
+        "tracking_issue", "policy_digest", "body_digest", "recomputes", "ISSUE_APPROVED", "PR_CREATED", "myrmex-state delivery", "PR_CREATED_LABEL_PENDING",
+    ], errors)
+    require_text(ROOT / "docs/OPERATIONS.md", [
+        "resolve-delivery-policy.py", "tracking_issue", "policy_digest", "body_digest", "recomputing",
+        "github-tracking-issue-recovery.py", "myrmex-state delivery", "github-pr-recovery.py", "idempotent",
+        "commit-policy authorize", "candidate-diff-sha", "governed",
+    ], errors)
+    require_text(ROOT / "docs/SECURITY.md", [
+        "typed side-effect boundary", "policy digest", "recomputes", "mandatory digest", "ISSUE_APPROVED", "PR_CREATED_LABEL_PENDING",
+        "SUB_OBJECTIVE_COMPLETE", "candidate diff digest", "Generic patches",
+        "procedural-experiment-v1", "bounded", "active-installation",
+    ], errors)
+    require_text(ROOT / "skills/myrmex-memory/SKILL.md", [
+        "Governed procedural learning", "procedural list", "child-agent", "bounded",
+    ], errors)
     if (ROOT / ".github").exists() and not (ROOT / ".github" / "workflows" / "ci.yml").is_file():
         errors.append("missing GitHub CI workflow: .github/workflows/ci.yml")
 

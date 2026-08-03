@@ -2,6 +2,8 @@
   "$schema": "myrmex.config/v1",
   "frontier": {
     "default_chat_url": null,
+    "artifact_root": null,
+    "artifact_root_policy": "external-per-run",
     "timeout_seconds": 900,
     "poll_seconds": [
       5,
@@ -32,6 +34,14 @@
   },
   "memory": {
     "engram_required": false
+  },
+  "procedural_learning": {
+    "enabled": true,
+    "default_scope": "project",
+    "independent_verifier_required": true,
+    "default_trial_max_work_units": 1,
+    "core_control_requires_elevated_human": true,
+    "collective_enabled": false
   },
   "agent_policy": {
     "allowed_provider_prefixes": [

@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:procedural-experiment:v1",
+  "title": "Myrmex Governed Procedural Experiment v1",
+  "description": "Append-only, bounded, evidence-backed procedural learning record. It is separate from semantic memory and exact run state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "experiment_id",
+    "revision",
+    "request_id",
+    "scope",
+    "status",
+    "proposal",
+    "created_at",
+    "updated_at",
+    "previous_record_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "myrmex.procedural-experiment/v1" },
+    "experiment_id": { "type": "string", "pattern": "^exp_[0-9a-f]{64}$" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "scope": { "enum": ["project", "installation"] },
+    "status": {
+      "enum": [
+        "proposed",
+        "isolated_candidate",
+        "tests_passed",
+        "verifier_passed",
+        "bounded_trial_active",
+        "promoted",
+        "reverted",
+        "rejected"
+      ]
+    },
+    "proposal": { "$ref": "#/$defs/proposal" },
+    "candidate": { "anyOf": [{ "$ref": "#/$defs/candidate" }, { "type": "null" }] },
+    "tests": { "anyOf": [{ "$ref": "#/$defs/tests" }, { "type": "null" }] },
+    "verifier": { "anyOf": [{ "$ref": "#/$defs/verifier" }, { "type": "null" }] },
+    "trial": { "anyOf": [{ "$ref": "#/$defs/trial" }, { "type": "null" }] },
+    "outcome": { "anyOf": [{ "$ref": "#/$defs/outcome" }, { "type": "null" }] },
+    "decision": { "anyOf": [{ "$ref": "#/$defs/decision" }, { "type": "null" }] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "previous_record_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^(?:sha256:)?[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^(?:sha256:)?[0-9a-f]{64}$"
+    },
+    "request": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "request_id", "elevated"],
+      "properties": {
+        "kind": { "enum": ["primary", "frontier", "human"] },
+        "request_id": { "$ref": "#/$defs/request" },
+        "elevated": { "type": "boolean" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "run_id": { "type": ["string", "null"], "minLength": 1 },
+        "commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{7,64}$" },
+        "artifact_sha256": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "verifier_request_id": { "type": ["string", "null"], "minLength": 1 },
+        "frontier_request_id": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "anyOf": [
+        { "required": ["run_id"], "properties": { "run_id": { "type": "string", "minLength": 1 } } },
+        { "required": ["commit_sha"], "properties": { "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" } } },
+        { "required": ["artifact_sha256"], "properties": { "artifact_sha256": { "$ref": "#/$defs/digest" } } },
+        { "required": ["verifier_request_id"], "properties": { "verifier_request_id": { "type": "string", "minLength": 1 } } },
+        { "required": ["frontier_request_id"], "properties": { "frontier_request_id": { "type": "string", "minLength": 1 } } }
+      ]
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "restore_artifact_sha256"],
+      "properties": {
+        "description": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "restore_artifact_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "version",
+        "weakness",
+        "expected_benefit",
+        "target_paths",
+        "evidence",
+        "authority",
+        "rollback",
+        "risk_class"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "prompt",
+            "skill",
+            "heuristic",
+            "receipt_template",
+            "recovery_strategy",
+            "validator",
+            "model_selection_policy"
+          ]
+        },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "weakness": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "expected_benefit": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "target_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "authority": { "$ref": "#/$defs/authority" },
+        "rollback": { "$ref": "#/$defs/rollback" },
+        "risk_class": { "enum": ["procedural", "core_control"] }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "base_identity", "changed_paths", "isolation_mode", "source"],
+      "properties": {
+        "artifact_sha256": { "$ref": "#/$defs/digest" },
+        "base_identity": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "changed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "isolation_mode": { "const": "disposable" },
+        "source": { "const": "child-agent" }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "artifact_sha256", "command_summaries"],
+      "properties": {
+        "result": { "const": "pass" },
+        "artifact_sha256": { "$ref": "#/$defs/digest" },
+        "command_summaries": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        }
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result",
+        "request_id",
+        "artifact_sha256",
+        "independent",
+        "proposal_author_task_id",
+        "verifier_task_id"
+      ],
+      "properties": {
+        "result": { "const": "pass" },
+        "request_id": { "$ref": "#/$defs/request" },
+        "artifact_sha256": { "$ref": "#/$defs/digest" },
+        "independent": { "const": true },
+        "proposal_author_task_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "verifier_task_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_runs": { "type": ["integer", "null"], "minimum": 1 },
+        "max_work_units": { "type": ["integer", "null"], "minimum": 1 },
+        "expires_at": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "anyOf": [
+        { "required": ["max_runs"], "properties": { "max_runs": { "type": "integer", "minimum": 1 } } },
+        { "required": ["max_work_units"], "properties": { "max_work_units": { "type": "integer", "minimum": 1 } } },
+        { "required": ["expires_at"], "properties": { "expires_at": { "type": "string", "format": "date-time" } } }
+      ]
+    },
+    "activation_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "request_id", "elevated"],
+      "properties": {
+        "kind": { "enum": ["primary", "frontier", "human"] },
+        "request_id": { "$ref": "#/$defs/request" },
+        "elevated": { "type": "boolean" },
+        "frontier_request_id": { "$ref": "#/$defs/request" }
+      }
+    },
+    "trial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trial_id",
+        "fixture_identity",
+        "candidate_artifact_sha256",
+        "bounds",
+        "baseline_metrics_artifact_sha256",
+        "rollback_artifact_sha256",
+        "activation_authority"
+      ],
+      "properties": {
+        "trial_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "fixture_identity": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "candidate_artifact_sha256": { "$ref": "#/$defs/digest" },
+        "bounds": { "$ref": "#/$defs/bounds" },
+        "baseline_metrics_artifact_sha256": { "$ref": "#/$defs/digest" },
+        "rollback_artifact_sha256": { "$ref": "#/$defs/digest" },
+        "activation_authority": { "$ref": "#/$defs/activation_authority" }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "observed_metrics_artifact_sha256", "effectiveness_summary", "rollback_artifact_sha256", "evidence"],
+      "properties": {
+        "result": { "enum": ["success", "regression", "inconclusive"] },
+        "observed_metrics_artifact_sha256": { "$ref": "#/$defs/digest" },
+        "effectiveness_summary": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "rollback_artifact_sha256": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "reason", "authority", "evidence"],
+      "properties": {
+        "result": { "enum": ["promote", "revert", "reject"] },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "authority": { "$ref": "#/$defs/authority" },
+        "evidence": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/evidence" } }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "isolated_candidate" } }, "required": ["status"] },
+      "then": { "required": ["candidate"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "tests_passed" } }, "required": ["status"] },
+      "then": { "required": ["candidate", "tests"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "verifier_passed" } }, "required": ["status"] },
+      "then": { "required": ["candidate", "tests", "verifier"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "bounded_trial_active" } }, "required": ["status"] },
+      "then": { "required": ["candidate", "tests", "verifier", "trial"] }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["promoted", "reverted"] } }, "required": ["status"] },
+      "then": { "required": ["candidate", "tests", "verifier", "trial", "outcome", "decision"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "rejected" } }, "required": ["status"] },
+      "then": { "required": ["decision"] }
+    },
+    {
+      "if": { "properties": { "scope": { "const": "installation" } }, "required": ["scope"] },
+      "then": {
+        "properties": {
+          "proposal": {
+            "properties": {
+              "authority": { "properties": { "kind": { "enum": ["frontier", "human"] } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "promoted" } }, "required": ["status"] },
+      "then": { "properties": { "outcome": { "properties": { "result": { "const": "success" } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "reverted" } }, "required": ["status"] },
+      "then": { "properties": { "outcome": { "properties": { "result": { "enum": ["regression", "inconclusive"] } } } } }
+    }
+  ]
+}

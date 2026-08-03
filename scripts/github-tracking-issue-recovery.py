@@ -135,6 +135,7 @@ def approval_marker_available(repo: str, approval_marker: str) -> bool:
 
 
 def issue_record(status: str, repo: str, identity: str, issue: dict[str, Any] | None, approval_marker: str) -> dict[str, Any]:
+    approved = bool(issue and approval_marker in issue.get("labels", []))
     return {
         "status": status,
         "repo": repo,
@@ -143,6 +144,7 @@ def issue_record(status: str, repo: str, identity: str, issue: dict[str, Any] | 
         "source": issue.get("source") if issue else None,
         "identity_marker": identity,
         "approval_marker": approval_marker,
+        "approved": approved,
     }
 
 
@@ -156,11 +158,18 @@ def main() -> int:
     parser.add_argument("--scope-digest", required=True)
     parser.add_argument("--approval-marker", default="status:approved")
     parser.add_argument("--creation-policy", choices=["authorized", "ask", "deny"], default="ask")
+    parser.add_argument(
+        "--reuse-matching-approved", dest="reuse_matching_approved",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="allow the narrow pre-marker approved-issue fallback (exact markers are always reused)",
+    )
     parser.add_argument("--ensure-approval", action="store_true")
     args = parser.parse_args()
 
     if not re.fullmatch(r"[0-9a-f]{64}", args.scope_digest):
         raise SystemExit("--scope-digest must be a lowercase SHA-256 digest")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", args.objective_id):
+        raise SystemExit("--objective-id contains unsafe marker characters")
     body_path = Path(args.body_file).expanduser().resolve()
     receipt_path = Path(args.receipt_file).expanduser().resolve()
     authorized_body = body_path.read_text(encoding="utf-8")
@@ -206,15 +215,18 @@ def main() -> int:
             # Only an already-approved, open issue with the exact title and
             # strong scope evidence can be adopted without inventing a new
             # tracking record.
-            try:
-                fallback_matches = list_approved_fallback(
-                    args.repo, args.title, authorized_body, args.scope_digest, args.approval_marker,
-                )
-            except DiscoveryError:
-                record = issue_record("ISSUE_DISCOVERY_FAILED", args.repo, identity, None, args.approval_marker)
-                atomic_json(receipt_path, record)
-                print(json.dumps(record, indent=2, sort_keys=True))
-                return 1
+            if args.reuse_matching_approved:
+                try:
+                    fallback_matches = list_approved_fallback(
+                        args.repo, args.title, authorized_body, args.scope_digest, args.approval_marker,
+                    )
+                except DiscoveryError:
+                    record = issue_record("ISSUE_DISCOVERY_FAILED", args.repo, identity, None, args.approval_marker)
+                    atomic_json(receipt_path, record)
+                    print(json.dumps(record, indent=2, sort_keys=True))
+                    return 1
+            else:
+                fallback_matches = []
             if len(fallback_matches) > 1:
                 record = issue_record("ISSUE_AMBIGUOUS", args.repo, identity, None, args.approval_marker)
                 record["candidate_numbers"] = [item["number"] for item in fallback_matches]

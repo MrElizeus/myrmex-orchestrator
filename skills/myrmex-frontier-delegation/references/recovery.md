@@ -17,8 +17,10 @@
 
 - `COLLECT_DELEGATIONS` / `RECOVER_MISSING_RESULT`: collect only saved task
   IDs or batch results; do not launch a replacement child first.
-- `RECOVER_FRONTIER_EXCHANGE`: discover the stable request/task identity before
-  sending anything. `WAIT_FRONTIER` waits for that same exchange.
+- `RECOVER_FRONTIER_EXCHANGE`: discover the stable request/task/chat/message
+  identity, read the newest stable matched response, and only resend when the
+  original outbound request is proven absent. `WAIT_FRONTIER` waits for that
+  same exchange.
 - `RECONCILE_TRACKING_ISSUE` / `RECONCILE_PULL_REQUEST`: query the saved
   idempotency identity, then append the observed effect, receipt, and terminal
   confirmation to its operation record.
@@ -32,7 +34,7 @@
 
 ## Phase-specific behavior
 
-- `waiting-for-frontier`: call `myrmex-frontier` with `read_latest` or `recover_and_wait`; resend only when the recorded outbound request is proven absent.
+- `waiting-for-frontier`: call `myrmex-frontier` with `read_latest` or `recover_and_wait`; recover the newest stable response before any resend, and resend only when the recorded outbound request is proven absent. A duplicate request identity is never a new send.
 - `implementing`: inspect recorded worker task/result and actual Git state; resume the same task only when its completion receipt is absent.
 - `waiting-for-delegations` / `collecting-delegation-results` / `consolidating-evidence`: inspect the saved delegation batch, collect only missing terminal results, and call the recorded next-gate transition once. Do not relaunch completed children.
 - `verifying`: continue/re-run the intended verifier against the same candidate.

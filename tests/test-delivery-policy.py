@@ -65,6 +65,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-delivery-policy-") as directory:
     assert first.returncode == 0, first.stderr
     resolved = json.loads(first.stdout)
     assert resolved["schema"] == "myrmex.delivery-policy/v1"
+    assert len(resolved["policy_digest"]) == 64 and set(resolved["policy_digest"]) <= set("0123456789abcdef")
     assert resolved["decision"] == {
         "creation_policy": "authorized",
         "on_ambiguous_match": "ask",

@@ -144,6 +144,43 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "--claim", "api_key=abcdefghijklmnop", "--confidence", "0.5", "--request-id", "req-secret", env=env, ok=False,
     )
     assert "MEMORY_SENSITIVITY_REJECTED" in secret_claim.stderr
+
+    # GitHub token detection requires a complete token shape, not merely a
+    # prefix. Rejected values must not appear in output or the local store.
+    github_tokens = [prefix + "A" * 36 for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_")] + ["github_pat_" + "A" * 82]
+    for index, token in enumerate(github_tokens):
+        rejected = run(
+            "candidate", "create", "--repository-root", str(repo), "--authority", "primary", "--kind", "warning",
+            "--claim", "Synthetic secret " + token, "--confidence", "0.5",
+            "--request-id", f"req-github-token-{index}", env=env, ok=False,
+        )
+        assert "MEMORY_SENSITIVITY_REJECTED" in rejected.stderr
+        assert token not in rejected.stdout and token not in rejected.stderr
+        assert all(token.encode("utf-8") not in stored.read_bytes() for stored in (temp / "memory").rglob("*") if stored.is_file())
+
+    # Prefix-like prose and incomplete token-shaped values are ordinary text.
+    for index, claim in enumerate((
+        "The ghp_ prefix is documented but no token is present",
+        "github_pat_example is a placeholder name",
+        "ghp_" + "A" * 35,
+    )):
+        accepted = json.loads(run(
+            "candidate", "create", "--repository-root", str(repo), "--authority", "primary", "--kind", "warning",
+            "--claim", claim, "--confidence", "0.5", "--request-id", f"req-prefix-boundary-{index}", env=env,
+        ).stdout)
+        assert accepted["created"] is True
+
+    secret_proof = repo / "secret-proof.txt"
+    secret_proof.write_text("proof contains " + github_tokens[0] + "\n", encoding="utf-8")
+    secret_evidence = evidence("secret-proof.txt", "sha256:" + "0" * 64)
+    rejected_evidence = run(
+        "candidate", "create", "--repository-root", str(repo), "--authority", "primary", "--kind", "warning",
+        "--claim", "Evidence content must be scanned before persistence", "--confidence", "0.5",
+        "--evidence-json", secret_evidence, "--request-id", "req-secret-evidence", env=env, ok=False,
+    )
+    assert "MEMORY_SENSITIVITY_REJECTED" in rejected_evidence.stderr
+    assert github_tokens[0] not in rejected_evidence.stdout and github_tokens[0] not in rejected_evidence.stderr
+    assert all(github_tokens[0].encode("utf-8") not in stored.read_bytes() for stored in (temp / "memory").rglob("*") if stored.is_file())
     unsanitized_installation = run(
         "candidate", "create", "--repository-root", str(repo), "--authority", "primary", "--scope", "installation", "--kind", "warning",
         "--claim", "Unsanitized installation lesson", "--confidence", "0.5", "--request-id", "req-installation", env=env, ok=False,
@@ -194,7 +231,10 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "--sanitization-reason", "Removed repository names, local paths, and run identifiers from the reusable lesson",
         "--sanitized-evidence-json", proof_evidence,
         "--applicability-json", '{"tool_version_range":">=1.0,<2.0","model":"model-a"}',
-        "--freshness-json", '{"ttl_seconds":0,"decay":"half-life:1"}',
+        # Leave enough TTL headroom for the confirmation and follow-up search
+        # to cross a wall-clock second without making the refresh assertion
+        # timing-sensitive under slower Python versions.
+        "--freshness-json", '{"ttl_seconds":5,"decay":"half-life:1"}',
         "--authority", "primary", "--request-id", "req-install-promote-1", env=env,
     ).stdout)["memory"]
     assert installation_memory["scope"] == "installation" and installation_memory["status"] == "verified"
@@ -223,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
     assert [item["retrieval"]["scope"] for item in auto_retrieved["records"][:2]] == ["project", "installation"]
     install_retrieval = next(item for item in auto_retrieved["records"] if item["memory"]["memory_id"] == installation_memory["memory_id"])
     assert install_retrieval["retrieval"]["applicability"]["status"] == "applicable"
-    time.sleep(1.1)
+    time.sleep(6.1)
     aged = json.loads(run(
         "search", "--scope", "installation", "--query", "canonical", "--tool-version", "1.5", "--model", "model-a", env=env,
     ).stdout)["records"]
@@ -238,8 +278,10 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
     assert "version-stale" in stale_installation["retrieval"]["applicability"]["warnings"]
 
     # A read never reinforces memory. A reviewed confirmation has a distinct
-    # usefulness statement and evidence, restores freshness, and is auditable
-    # without increasing confidence automatically.
+    # usefulness statement and evidence, resets the freshness age, and is
+    # auditable without increasing confidence automatically. The decay policy
+    # may still lower priority after a wall-clock second, but confirmation must
+    # clear the TTL-expired state.
     confirmed_installation = json.loads(run(
         "confirm", installation_memory["memory_id"], "--scope", "installation", "--repository-root", str(repo),
         "--authority", "primary", "--request-id", "req-install-confirm-1", "--expect-revision", "0",
@@ -251,7 +293,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "search", "--scope", "installation", "--query", "canonical", "--tool-version", "1.5", "--model", "model-a", env=env,
     ).stdout)["records"]
     refreshed_installation = next(item for item in refreshed if item["memory"]["memory_id"] == installation_memory["memory_id"])
-    assert refreshed_installation["retrieval"]["freshness"]["status"] == "fresh"
+    refreshed_freshness = refreshed_installation["retrieval"]["freshness"]
+    assert refreshed_freshness["age_seconds"] <= installation_memory["freshness"]["ttl_seconds"]
+    assert refreshed_freshness["status"] != "ttl-expired"
 
     # Installation refutation/supersession is append-only and changes trusted
     # retrieval just like project-scoped records.
@@ -316,6 +360,65 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "--authority", "primary", "--request-id", "req-metric-raw-command", env=env, ok=False,
     )
     assert "each metric test must contain category" in raw_metric_command.stderr
+
+    # The key is created atomically in the installation store and is private.
+    metric_key = temp / "memory" / "installation" / "metric-hmac.key"
+    assert metric_key.is_file() and stat.S_IMODE(metric_key.stat().st_mode) == 0o600
+    assert len(metric_key.read_bytes()) == 32
+
+    stable_metric = json.loads(run(
+        "metric", "record", "--repository-root", str(repo), "--work-unit-id", "WU-8", "--outcome", "success",
+        "--corrections-used", "0", "--verification-json", json.dumps({"verdict": "pass", "request_id": "verify-stable", "evidence": []}),
+        "--recovery-json", '{"events":[],"recovered":false}', "--tests-json", tests_json,
+        "--authority", "primary", "--request-id", "req-metric-stable", env=env,
+    ).stdout)["metric"]
+    assert stable_metric["project_identity"] == metric["project_identity"]
+    assert stable_metric["work_unit_id"] == metric["work_unit_id"]
+    assert stable_metric["project_identity"].startswith("hmac-sha256:")
+
+    other_env = dict(env, MYRMEX_MEMORY_HOME=str(temp / "other-memory"))
+    other_metric = json.loads(run(
+        "metric", "record", "--repository-root", str(repo), "--work-unit-id", "WU-8", "--outcome", "success",
+        "--corrections-used", "0", "--verification-json", json.dumps({"verdict": "pass", "request_id": "verify-stable", "evidence": []}),
+        "--recovery-json", '{"events":[],"recovered":false}', "--tests-json", tests_json,
+        "--authority", "primary", "--request-id", "req-metric-stable", env=other_env,
+    ).stdout)["metric"]
+    assert other_metric["project_identity"] != metric["project_identity"]
+    assert other_metric["work_unit_id"] != metric["work_unit_id"]
+    assert other_metric["project_identity"].startswith("hmac-sha256:")
+
+    metric_key.chmod(0o644)
+    insecure_key = run("metric", "list", "--repository-root", str(repo), env=env, ok=False)
+    assert "MEMORY_KEY_UNAVAILABLE" in insecure_key.stderr
+    metric_key.chmod(0o600)
+
+    # Legacy records with unkeyed handles remain readable and listable.
+    project_id = run("project-id", "--repository-root", str(repo), env=env).stdout.strip()
+    legacy_handle = lambda namespace, value: "sha256:" + hashlib.sha256(
+        (namespace + "\0" + project_id + "\0" + value).encode("utf-8")
+    ).hexdigest()
+    legacy_metric = {
+        "schema": "myrmex.work-unit-metric/v1", "metric_id": "metric_legacy01", "scope": "installation",
+        "sensitivity": "sanitized", "project_identity": project_id,
+        "work_unit_id": legacy_handle("work-unit", "legacy-WU"), "outcome": "success",
+        "corrections": {"used": 0, "defect_evidence": []},
+        "verification": {"verdict": "pass", "request_id": legacy_handle("verification-request", "legacy-verify"), "evidence": []},
+        "recovery": {"events": [], "recovered": False},
+        "tests": [{"category": "unit", "outcome": "passed", "artifact_digest": None, "duration_seconds": 0}],
+        "applicability": {"tool_version": None, "model": None},
+        "provenance": {"authority": "primary", "request_id": legacy_handle("metric-request", "legacy-request"), "run_id": None},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    with (temp / "memory" / "installation" / "work-unit-metrics.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(legacy_metric) + "\n")
+    listed_with_legacy = json.loads(run("metric", "list", "--repository-root", str(repo), env=env).stdout)["metrics"]
+    assert any(item["metric_id"] == "metric_legacy01" for item in listed_with_legacy)
+
+    # Canonical contracts and their packaged mirrors must remain byte-identical.
+    for schema_name in ("memory-v1.schema.json", "work-unit-metric-v1.schema.json"):
+        canonical = (ROOT / "contracts" / schema_name).read_bytes()
+        mirror = (ROOT / "skills" / "myrmex-memory" / "assets" / "schemas" / schema_name).read_bytes()
+        assert canonical == mirror
 
     # A corrupt derived index is never trusted over the append-only log.
     identity = json.loads(run(

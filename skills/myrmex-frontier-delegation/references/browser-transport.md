@@ -5,6 +5,8 @@
 - OpenCode Playwright MCP enabled.
 - A persistent browser profile with the frontier service already authenticated.
 - Only one active browser process using that profile. A persistent Playwright profile is single-writer; concurrent clients can conflict.
+- The parent must persist one absolute, stable per-run artifact root before launch. It must resolve outside the repository root, Git common directory, and all linked worktrees; reject relative, empty, repository-descendant, and symlink-escaping roots.
+- Set both `--user-data-dir` and Playwright MCP `--output-dir` beneath that root. Downloads, traces, screenshots, console/network logs, snapshots, and temporary transport files must not use the repository or current working directory.
 - `myrmex-frontier` allowed to call `playwright_*` tools and denied repository mutation.
 
 ## Exchange request
@@ -81,10 +83,11 @@ type: BLOCKING_CLARIFICATION | OBJECTIVE_COMPLETE | SUB_OBJECTIVE_COMPLETE | PAR
 
 Intervals: 5, 15, 30, 45, 60 seconds, then 60 seconds.
 
-At timeout:
+At timeout, crash recovery, reconnect, or duplicate invocation:
 
 1. Save the observation in the transport result.
-2. Reload once if allowed.
-3. Re-send only if the latest user turns prove the outbound request is absent.
-4. If still failed and failover is allowed, create one new chat and send the supplied recovery handoff.
-5. Otherwise return `timeout` or `blocked`; do not invent a response.
+2. Read the newest assistant turn and recover it if its request ID matches and it is stable in two consecutive observations.
+3. Reload once if allowed when no matched stable response is present.
+4. Re-read after reload; re-send only if the latest user turns prove the outbound request is absent and no matched stable response exists. Reuse the exact persisted request identity.
+5. If still failed and failover is allowed, create one new chat and send the supplied recovery handoff.
+6. Otherwise return `timeout` or `blocked`; do not invent a response.

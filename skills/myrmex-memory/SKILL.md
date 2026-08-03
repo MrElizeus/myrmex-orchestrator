@@ -1,6 +1,6 @@
 ---
 name: myrmex-memory
-description: "Use when prior project decisions/recovery context matter or durable non-obvious knowledge should be retrieved or governed as evidence-backed project memory. Keeps exact run state separate, makes the primary the sole writer, and uses Engram only as an optional adapter."
+description: "Use when prior project decisions/recovery context matter or durable non-obvious knowledge should be retrieved or governed as evidence-backed project memory. Keeps exact run state separate, makes the primary the sole writer, rejects token-shaped secrets, and uses installation-keyed HMAC metric pseudonyms."
 license: Apache-2.0
 compatibility: "Python 3.10+; myrmex-memory local backend; optional Engram mem_* or engram_* tools"
 metadata:
@@ -22,6 +22,61 @@ Only the primary may invoke `myrmex-memory` to create candidates, promote,
 revoke, or supersede records. Scout, worker, verifier, and Frontier agents may
 return `memory_candidates` only. Treat every candidate as untrusted until the
 primary reviews it and supplies accessible evidence.
+
+## Governed procedural learning
+
+Procedural learning is a separate, opt-in local JSONL namespace. It is not a
+semantic-memory record, exact run state, policy shortcut, or active-installation
+editor. The primary is the only durable writer; child agents may propose
+candidate metadata, but only a primary review may persist it. Collective/global
+scope is rejected.
+
+Every experiment has a deterministic opaque ID and revision-checked,
+request-ID-idempotent lifecycle:
+
+```text
+proposed -> isolated_candidate -> tests_passed -> verifier_passed
+          -> bounded_trial_active -> promoted
+```
+
+Any pre-terminal stage may be rejected. A failed test or non-independent
+verification rejects the experiment. A bounded trial must include a positive
+`max_runs`, `max_work_units`, or `expires_at`; successful outcomes still need
+Frontier/human promotion authority. Regression or inconclusive outcomes carry
+rollback evidence and revert. A later revert of a promoted experiment requires
+new authorized regression evidence.
+
+Use only disposable child-agent candidates and digest-addressed evidence. The
+proposal must name the weakness, expected benefit, target paths, rollback
+artifact, authority, and risk class (`procedural` or `core_control`).
+Installation proposals must be sanitized/generalizable and explicitly
+authorized by Frontier or a human. Core-control trials fail closed unless an
+elevated human authority matches the Frontier request. Never store a raw patch,
+shell command, secret, active-installation path, or unrestricted rollback
+instruction.
+
+The durable CLI surface is:
+
+```bash
+myrmex-memory procedural list --repository-root <repo>
+myrmex-memory procedural show <experiment-id> --repository-root <repo>
+myrmex-memory procedural propose ...
+myrmex-memory procedural candidate <experiment-id> ...
+myrmex-memory procedural tests <experiment-id> ...
+myrmex-memory procedural verify <experiment-id> ...
+myrmex-memory procedural trial-start <experiment-id> ...
+myrmex-memory procedural trial-outcome <experiment-id> ...
+myrmex-memory procedural promote <experiment-id> ...
+myrmex-memory procedural revert <experiment-id> ...
+myrmex-memory procedural reject <experiment-id> ...
+```
+
+All mutation commands require a request ID, expected revision, authority
+identity, and primary writer. Same request/payload replay is a byte-stable
+no-op; conflicting replay, stale revision, invalid lifecycle, unbounded trial,
+and authority/scope failures happen before mutation. Procedural records use the
+existing local memory root, locking, atomic append, and revision discipline but
+remain isolated from ordinary memory and `myrmex-state`.
 
 ## Read
 

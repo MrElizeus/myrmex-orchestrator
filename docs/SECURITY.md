@@ -11,11 +11,33 @@
 
 Myrmex agents deny `.env` reads and must not transmit secrets to browser models. Redact tokens, cookies, private keys, database URLs, customer data, and sensitive logs.
 
-Native memory is private local metadata, not a source archive. Its stores use
-owner-only directories/files, and promotion/refutation/confirmation reject
-environment files, repository-escaping evidence paths, malformed digests, and
-obvious secret-bearing text. Child agents return `memory_candidates`; only the
-primary may persist a candidate or change its lifecycle.
+Native memory is private local metadata, not a source archive. Its owner-only
+stores reject new environment-file, escaping-path, malformed-digest, and
+secret-bearing records. Detection recognizes valid `ghp_`, `gho_`, `ghu_`,
+`ghs_`, `ghr_`, and `github_pat_` tokens without rejecting prefix-like prose;
+evidence is scanned before hashing and rejected values are never printed,
+logged, hashed into public evidence, or persisted. Legacy records remain
+readable. Child agents return `memory_candidates`; only the primary persists
+or changes their lifecycle.
+
+Procedural learning is a distinct local append-only namespace governed by
+`procedural-experiment-v1` (`myrmex.procedural-experiment/v1`). It is not semantic memory, exact run state,
+model training, or an active-installation mutation channel. The primary is the
+sole durable writer; child agents can supply candidate metadata only. Records
+are revision-checked and request-idempotent, and conflicting replays fail
+closed before mutation.
+
+The procedural gate requires evidence, an explicit rollback artifact, a
+deterministic opaque experiment ID, disposable isolation, child-agent-only
+candidates, passing tests, independent verifier identities, and a bounded
+trial. Bounds must include a positive run/work-unit limit or expiry. Raw
+patches and unrestricted shell rollback are never stored. Installation scope
+must be sanitized/generalizable with Frontier or human authority; collective or
+global sharing and active-installation target paths are rejected. Core-control
+experiments cannot be downgraded and require elevated human trial authority
+with the matching Frontier request. Promotion requires a successful bounded
+trial and Frontier/human authority; regression or inconclusive results require
+rollback evidence and revert.
 
 Installation scope is a stricter local privacy boundary, not a sharing channel:
 it requires a sanitized claim, null project identity/repository reference, and
@@ -23,11 +45,13 @@ tool/model applicability. Project-private material needs an explicit rewritten
 claim, sanitization reason, and fresh proof before promotion. The raw proof is
 validated only locally; installation records retain digest-derived evidence
 handles rather than project paths, run/WU IDs, commits, or verifier/frontier
-request IDs. Metrics additionally turn work-unit/run/request IDs into opaque
-per-project handles and accept only normalized recovery codes and safe test
-categories—not commands or paths. Records are never uploaded by default,
-shared across installations, used to train a model, or allowed to modify policy
-automatically.
+request IDs. Metrics pseudonymize repository identity, usernames, local paths,
+and WU/run/request IDs with installation-keyed HMAC-SHA-256 and
+record-type/schema-version separation; this is not anonymization. The key is
+atomic, private, installation-local, never exported/stored in repository files,
+schemas, or metrics, and fails closed when insecure. Metrics accept only
+normalized recovery codes and safe test categories; records are not uploaded,
+shared across installations, used to train a model, or allowed to modify policy.
 
 ## Repository protection
 
@@ -37,14 +61,78 @@ automatically.
 - One writer per work unit.
 - Worker has no commit/push capability.
 - Verifier and browser are read-only with respect to source.
+- Frontier transport is validated independently from the model decision. Only
+  a matching request ID, response message ID, effect, and receipt can produce
+  a technically confirmed exchange; `REMEDIATE` and `BLOCKED` are decisions,
+  not transport failures. Recovery of a legacy failed exchange is typed,
+  revision-checked, identity-bound, append-only, and cannot rewrite its
+  original terminal evidence.
+- Continuous-parent lifecycle is typed: a completed WU cannot complete its
+  parent, a next-WU handoff requires confirmed Frontier `proposed_plan`
+  provenance, and only `PARENT_OBJECTIVE_COMPLETE` or the explicit
+  `PARENT_OBJECTIVE_CANCELLED` command is terminal for the parent. Generic
+  patches cannot modify parent identity, scope, gate evidence, handoffs,
+  clarification, pause, or cancellation state.
+- Informational status messages are a non-mutating side-band. They may expose
+  the current state and exact reconcile action, but must not create a pause,
+  cancel, abandonment, or replacement operation. Explicit pause and typed
+  clarification retain a resumable action; cancellation remains terminal.
+- Correction grants are immutable identity capabilities: work unit, candidate
+  SHA, scope digest, verification request ID, and defect revision must all match
+  the current blocker. A consumed grant is never replayed, and a stale grant
+  cannot clear or replace a newer blocker.
 
 ## Delivery
 
 OpenCode asks before commit/push by default. Force push is denied. Direct pushes to protected branches require explicit, branch-specific authorization.
+The governed `local_commit` helper is narrower than that global gate: a standing
+human authorization is accepted only from matching Frontier
+`SUB_OBJECTIVE_COMPLETE`/`ACCEPT` work-unit evidence; a `plan` response alone
+is insufficient. Each persisted
+single-use grant is tied to the parent run, accepted WU, target repository,
+branch, expected HEAD, candidate diff digest, exact path set, and message. The
+standing authorization is not itself a local-commit grant, and governed mode
+alone cannot commit.
+Parent root/branch identity is immutable, target WU workspaces are accepted
+only from persisted WU identity, and cancellation/completion disables future
+grants. Replays are idempotent; conflicting authority, source, or grant
+identity fails before state mutation. Generic patches cannot alter standing
+authority or grant consumption, and push remains denied.
+The accepted source effect and receipt are bound to the exact target root,
+branch, expected HEAD, candidate digest, allowed paths, and commit message;
+source-scope tampering is rejected both before intent and inside the helper.
+Hooks, filters, editors, signing, and transport are never invoked: the helper
+uses private-index plumbing and compare-and-swap ref updates. Post-effect
+snapshots still reject branch, tag, remote, ref, HEAD, or raw configuration
+changes before consumption.
+
+Tracking-issue and PR delivery have a separate typed side-effect boundary. The
+policy resolver is read-only and validation must use fake/local GitHub helpers;
+tests must not call live GitHub. Before any GitHub effect, state persists a
+`tracking_issue` intent containing the complete resolved policy, policy digest,
+and a stable objective/scope marker. State recomputes the resolver from the
+persisted repository root and exact input paths before accepting it, so a
+self-consistent forged allow artifact cannot bypass repository policy. The exact
+marker is the only unconditional resume identity; title similarity never
+authorizes adoption. A confirmed tracking operation requires the persisted
+repository, issue number, URL, approval marker, and a canonical
+`ISSUE_APPROVED` or `ISSUE_REUSED` receipt. Alias statuses are not accepted as
+approval. Ambiguous discovery, missing approval vocabulary,
+unconfirmed creation, and policy-denied creation remain blockers.
+
+A PR intent is rejected unless it names that confirmed approved issue. The
+state CLI generates the PR body from the persisted issue URL and writes a
+stable body marker and mandatory digest, preventing a copied, tampered, prefix,
+or stale issue link. Effect and receipt must also share the exact PR number and
+URL. The existing PR
+helper queries the exact head/base pair before creation and records
+`PR_CREATED_LABEL_PENDING` before label mutation. A retry must reconcile the
+typed operation and discover the saved issue/PR identity; it must never assume
+that a failed command had no remote effect or create a duplicate.
 
 ## Browser
 
-The Playwright profile is expected to be authenticated by the user in advance. Agents never enter credentials or solve MFA. Only one client should use a persistent profile at a time.
+The Playwright profile is expected to be authenticated by the user in advance. Agents never enter credentials or solve MFA. Only one client should use a persistent profile at a time. Every run derives or requires an absolute external artifact root before browser launch; the profile and MCP output directory remain beneath it, outside the repository, Git common directory, linked worktrees, and current working directory. State records only sanitized identity, response, stability, polling, recovery, and root metadata—not cookies, tokens, auth headers, session tokens, or raw profile contents.
 
 ## Permission-boundary caveat
 

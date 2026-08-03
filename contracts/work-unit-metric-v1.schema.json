@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:myrmex:schema:work-unit-metric:v1",
   "title": "Myrmex Work-unit Metric v1",
-  "description": "Normalized, sanitized installation-local work-unit outcome telemetry. It is not myrmex-state and must not carry raw project content.",
+  "description": "Normalized, sanitized installation-local work-unit outcome telemetry. Metric handles are installation-keyed HMAC-SHA-256 pseudonyms, not anonymization; legacy unkeyed sha256 handles remain readable. It is not myrmex-state and must not carry raw project content.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -37,11 +37,13 @@
     },
     "project_identity": {
       "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
+      "pattern": "^(?:sha256|hmac-sha256):[0-9a-f]{64}$",
+      "description": "Installation-keyed HMAC-SHA-256 project pseudonym; sha256 is accepted for legacy records."
     },
     "work_unit_id": {
       "type": "string",
-      "pattern": "^sha256:[0-9a-f]{64}$"
+      "pattern": "^(?:sha256|hmac-sha256):[0-9a-f]{64}$",
+      "description": "Installation-keyed HMAC-SHA-256 work-unit pseudonym; sha256 is accepted for legacy records."
     },
     "outcome": {
       "enum": [
@@ -93,7 +95,7 @@
             "string",
             "null"
           ],
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "pattern": "^(?:sha256|hmac-sha256):[0-9a-f]{64}$"
         },
         "evidence": {
           "type": "array",
@@ -172,14 +174,14 @@
         },
         "request_id": {
           "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "pattern": "^(?:sha256|hmac-sha256):[0-9a-f]{64}$"
         },
         "run_id": {
           "type": [
             "string",
             "null"
           ],
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "pattern": "^(?:sha256|hmac-sha256):[0-9a-f]{64}$"
         }
       }
     },
