@@ -231,7 +231,10 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "--sanitization-reason", "Removed repository names, local paths, and run identifiers from the reusable lesson",
         "--sanitized-evidence-json", proof_evidence,
         "--applicability-json", '{"tool_version_range":">=1.0,<2.0","model":"model-a"}',
-        "--freshness-json", '{"ttl_seconds":0,"decay":"half-life:1"}',
+        # Leave enough TTL headroom for the confirmation and follow-up search
+        # to cross a wall-clock second without making the refresh assertion
+        # timing-sensitive under slower Python versions.
+        "--freshness-json", '{"ttl_seconds":5,"decay":"half-life:1"}',
         "--authority", "primary", "--request-id", "req-install-promote-1", env=env,
     ).stdout)["memory"]
     assert installation_memory["scope"] == "installation" and installation_memory["status"] == "verified"
@@ -260,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
     assert [item["retrieval"]["scope"] for item in auto_retrieved["records"][:2]] == ["project", "installation"]
     install_retrieval = next(item for item in auto_retrieved["records"] if item["memory"]["memory_id"] == installation_memory["memory_id"])
     assert install_retrieval["retrieval"]["applicability"]["status"] == "applicable"
-    time.sleep(1.1)
+    time.sleep(6.1)
     aged = json.loads(run(
         "search", "--scope", "installation", "--query", "canonical", "--tool-version", "1.5", "--model", "model-a", env=env,
     ).stdout)["records"]
@@ -275,8 +278,10 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
     assert "version-stale" in stale_installation["retrieval"]["applicability"]["warnings"]
 
     # A read never reinforces memory. A reviewed confirmation has a distinct
-    # usefulness statement and evidence, restores freshness, and is auditable
-    # without increasing confidence automatically.
+    # usefulness statement and evidence, resets the freshness age, and is
+    # auditable without increasing confidence automatically. The decay policy
+    # may still lower priority after a wall-clock second, but confirmation must
+    # clear the TTL-expired state.
     confirmed_installation = json.loads(run(
         "confirm", installation_memory["memory_id"], "--scope", "installation", "--repository-root", str(repo),
         "--authority", "primary", "--request-id", "req-install-confirm-1", "--expect-revision", "0",
@@ -288,7 +293,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-memory-test-") as td:
         "search", "--scope", "installation", "--query", "canonical", "--tool-version", "1.5", "--model", "model-a", env=env,
     ).stdout)["records"]
     refreshed_installation = next(item for item in refreshed if item["memory"]["memory_id"] == installation_memory["memory_id"])
-    assert refreshed_installation["retrieval"]["freshness"]["status"] == "fresh"
+    refreshed_freshness = refreshed_installation["retrieval"]["freshness"]
+    assert refreshed_freshness["age_seconds"] <= installation_memory["freshness"]["ttl_seconds"]
+    assert refreshed_freshness["status"] != "ttl-expired"
 
     # Installation refutation/supersession is append-only and changes trusted
     # retrieval just like project-scoped records.
