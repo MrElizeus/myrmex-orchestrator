@@ -1216,6 +1216,33 @@
             "type": "string",
             "minLength": 1
           },
+          "effect_stage": {
+            "enum": [
+              "none",
+              "transport_started",
+              "request_sent",
+              "response_observed"
+            ]
+          },
+          "effective_effect_stage": {
+            "enum": [
+              "none",
+              "transport_started",
+              "request_sent",
+              "response_observed"
+            ]
+          },
+          "pre_effect_absence_proven": {
+            "type": "boolean"
+          },
+          "predecessor_operation_id": {
+            "type": "string",
+            "pattern": "^op-[0-9a-f]{24}$"
+          },
+          "successor_operation_id": {
+            "type": "string",
+            "pattern": "^op-[0-9a-f]{24}$"
+          },
           "status": {
             "enum": [
               "intent",
@@ -1223,7 +1250,8 @@
               "receipt-recorded",
               "confirmed",
               "failed",
-              "abandoned"
+              "abandoned",
+              "superseded"
             ]
           },
           "request_id": {"type": "string", "minLength": 1},
@@ -1377,6 +1405,14 @@
                 "type": "string",
                 "minLength": 1
               },
+              "effect_stage": {
+                "enum": [
+                  "none",
+                  "transport_started",
+                  "request_sent",
+                  "response_observed"
+                ]
+              },
               "effect": {
                 "type": "object"
               },
@@ -1438,6 +1474,9 @@
                 },
                 "effective_status": {
                   "const": "confirmed"
+                },
+                "effect_stage": {
+                  "const": "response_observed"
                 },
                 "effect": {
                   "type": "object"
@@ -1562,7 +1601,8 @@
                 "status": {
                   "enum": [
                     "failed",
-                    "abandoned"
+                    "abandoned",
+                    "superseded"
                   ]
                 }
               },

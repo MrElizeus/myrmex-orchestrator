@@ -29,6 +29,17 @@ Close other instances using the same `--user-data-dir`, or configure a separate 
 
 Run `myrmex-state doctor`. Confirm `~/.local/bin` is on PATH and the XDG state directory is writable. Frontier mode must not start without healthy local state.
 
+## Frontier resume repeats the same failed exchange
+
+Inspect `myrmex-state reconcile <run-id>`. If the failed operation has
+`effect_stage=none` and the transport evidence proves there was no browser tab,
+outbound request, or message identity, use `myrmex-state frontier <run-id>
+retry` with `--pre-effect-absence-proven`. After the successor returns a
+confirmed response, close the historical operation with `myrmex-state
+operation <run-id> supersede ... --reason PRE_EFFECT_FAILURE`. Do not fabricate
+a `message_id`; if any effect may have happened, use `frontier recover` and
+inspect the saved receipts instead.
+
 ## Memory unavailable
 
 Normal and frontier work may continue when local state is healthy, but semantic cross-session memory is degraded. Restart OpenCode after MCP changes. Never claim a memory save that did not succeed.

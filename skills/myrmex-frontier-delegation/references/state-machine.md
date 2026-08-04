@@ -79,7 +79,12 @@ transition and `myrmex-state event` for compact audit events. Generic `patch`
 is only for non-critical metadata; it cannot modify state-machine fields or
 receipts. Persist every external effect in `pending_operations` as `intent →
 observed effect → receipt → terminal confirmation` with a stable idempotency
-key, then use `myrmex-state reconcile <run-id>` before recovery. `myrmex-state`
+key, and record its effect stage (`none`, `transport_started`, `request_sent`,
+or `response_observed`). A transport failure proven to have happened before
+any effect may use `frontier retry` with the same request ID, then link the
+confirmed successor with `operation supersede`; use `operation abandon` when no
+successor is needed. Use `myrmex-state reconcile <run-id>` before recovery.
+`myrmex-state`
 accepts only explicit
 pairs: all work phases are `/active`; `blocked/blocked`, `dormant/dormant`,
 `failed/failed`, `cancelled/cancelled`, and `superseded/superseded` are

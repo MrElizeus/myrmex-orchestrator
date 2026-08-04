@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed Frontier pre-effect transport failures getting stuck behind an
+  impossible `message_id` recovery precondition. Operations now record effect
+  stages, support proven no-effect retries, and can be typed as abandoned or
+  superseded by a confirmed successor without losing history.
 - Removed hard step ceilings from the continuous orchestrator and frontier transport while retaining bounded scout, worker, and verifier limits.
 - Removed legacy bridge files from the public baseline so Myrmex starts as an independent OpenCode project.
 - Added `myrmex.memory/v1` and the offline `myrmex-memory` project backend:

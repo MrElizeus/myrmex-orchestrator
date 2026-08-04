@@ -55,11 +55,17 @@ myrmex-state frontier <run-id> result --operation-id <op-...> --request-id <requ
   --transport-status success --frontier-decision ACCEPT --response-type plan --plan-json '{"work_unit_id":"WU-next"}' --expect-revision <n>
 myrmex-state frontier <run-id> recover --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
   --transport-status success --frontier-decision REMEDIATE --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
+myrmex-state frontier <run-id> retry --operation-id <failed-op-...> --request-id <same-request-id> \
+  --pre-effect-absence-proven --expect-revision <n>
 myrmex-state delegation-preflight <run-id> --agent myrmex-worker --role writer --reason "bounded work" --task-id <task-id> --work-unit-id WU-03 --workspace <repo> --expect-revision <n>
 myrmex-state operation <run-id> intent --kind pull_request --idempotency-key <stable-key> --intent-json '{"required":true}' --expect-revision <n>
 myrmex-state operation <run-id> observe --operation-id op-... --effect-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> receipt --operation-id op-... --receipt-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> confirm --operation-id op-... --status confirmed --reason "receipt verified" --expect-revision <n>
+myrmex-state operation <run-id> supersede --operation-id <failed-op-...> \
+  --successor-operation-id <confirmed-op-...> --reason PRE_EFFECT_FAILURE --expect-revision <n>
+myrmex-state operation <run-id> abandon --operation-id <failed-op-...> \
+  --pre-effect-absence-proven --reason PRE_EFFECT_FAILURE --expect-revision <n>
 myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{...}' --expect-revision <n>
 myrmex-state pause <run-id> --reason "pause requested" --expect-revision <n>
 myrmex-state resume <run-id> --expect-revision <n>
@@ -230,16 +236,22 @@ only; neither the policy resolver nor the tests call live GitHub.
    operation ID, body, receipt, stable marker, and exact remote identity. This
    makes resume idempotent without duplicate issue or PR creation.
 
-Frontier responses keep transport status separate from the substantive decision.
-`success` transport with `ACCEPT`, `REMEDIATE`, or `BLOCKED` is technically
-confirmed once the request ID, response message ID, effect, and receipt match.
+Frontier responses keep transport status separate from the substantive decision
+and record an `effect_stage`: `none`, `transport_started`, `request_sent`, or
+`response_observed`. A failed exchange can be retried with the same request ID
+only when the caller explicitly proves `none` (no browser tab, outbound
+request, or message identity). The retry creates a linked successor; after the
+successor is confirmed, `operation supersede` closes the old record without
+deleting its evidence. `operation abandon` is the equivalent terminal
+resolution when no successor is needed.
+
 Transport errors, timeouts, malformed responses, request mismatches, and
-response-identity mismatches are recorded as failed and remain completion
-blockers. `frontier recover` is the typed path for a legacy failed Frontier
-operation: it appends immutable recovery evidence and an effective confirmed
-outcome without rewriting the original terminal record. An exact replay is a
-byte-stable no-op; conflicting identity/payload or an unexpected revision is
-rejected without mutation.
+response-identity mismatches with a possible external effect remain recovery
+blockers. `frontier recover` no longer requires an original `message_id`; it
+can attach a later confirmed response identity to a failed operation. An exact
+replay is a byte-stable no-op; conflicting identity/payload or an unexpected
+revision is rejected without mutation. Failed, abandoned, and superseded
+historical records do not block completion once they have a typed resolution.
 The generic `operation observe/receipt/confirm` lifecycle cannot confirm a
 Frontier exchange unless those same typed fields and identities are present.
 

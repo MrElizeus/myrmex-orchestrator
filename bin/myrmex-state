@@ -94,9 +94,19 @@ OPERATION_KINDS = {
     "frontier_exchange", "delegation", "tracking_issue", "pull_request",
     "ci", "local_verification", "parent_gate", "git_delivery", "local_commit",
 }
-OPERATION_STATUSES = {"intent", "effect-observed", "receipt-recorded", "confirmed", "failed", "abandoned"}
-TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned"}
+OPERATION_STATUSES = {
+    "intent", "effect-observed", "receipt-recorded", "confirmed", "failed",
+    "abandoned", "superseded",
+}
+TERMINAL_OPERATION_STATUSES = {"confirmed", "failed", "abandoned", "superseded"}
 PENDING_OPERATION_STATUSES = OPERATION_STATUSES - TERMINAL_OPERATION_STATUSES
+EFFECT_STAGES = {"none", "transport_started", "request_sent", "response_observed"}
+EFFECT_STAGE_ORDER = {
+    "none": 0,
+    "transport_started": 1,
+    "request_sent": 2,
+    "response_observed": 3,
+}
 DELIVERY_POLICY_SCHEMA = "myrmex.delivery-policy/v1"
 TRACKING_ISSUE_APPROVED_STATUSES = {"ISSUE_APPROVED", "ISSUE_REUSED"}
 PULL_REQUEST_SUCCESS_STATUSES = {"PR_CREATED"}
@@ -788,6 +798,15 @@ def normalize_frontier_transport_status(value: Any) -> str:
     return normalized
 
 
+def normalize_effect_stage(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("effect_stage must be none, transport_started, request_sent, or response_observed")
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized not in EFFECT_STAGES:
+        raise SystemExit(f"invalid effect_stage: {value!r}")
+    return normalized
+
+
 def normalize_frontier_decision(value: Any, *, allow_none: bool = False) -> str | None:
     if value is None and allow_none:
         return None
@@ -849,6 +868,29 @@ def validate_frontier_typed_fields(operation: dict[str, Any]) -> None:
     """Validate additive Frontier transport/decision and recovery evidence."""
     if operation.get("kind") != "frontier_exchange":
         return
+    effect_stage = operation.get("effect_stage")
+    effective_effect_stage = operation.get("effective_effect_stage")
+    if effect_stage is not None:
+        normalize_effect_stage(effect_stage)
+    if effective_effect_stage is not None:
+        normalize_effect_stage(effective_effect_stage)
+    if (
+        effect_stage is not None
+        and effective_effect_stage is not None
+        and EFFECT_STAGE_ORDER[effective_effect_stage] < EFFECT_STAGE_ORDER[effect_stage]
+    ):
+        raise SystemExit("Frontier effective effect_stage cannot precede the original stage")
+    if operation.get("pre_effect_absence_proven") is not None and not isinstance(
+        operation["pre_effect_absence_proven"], bool
+    ):
+        raise SystemExit("Frontier pre_effect_absence_proven must be boolean")
+    if operation.get("pre_effect_absence_proven") is True and effect_stage not in {None, "none"}:
+        raise SystemExit("Frontier pre-effect absence proof requires effect_stage=none")
+    if operation.get("pre_effect_absence_proven") is True:
+        for source_name in ("effect", "receipt"):
+            source = operation.get(source_name)
+            if isinstance(source, dict) and frontier_message_id(source) is not None:
+                raise SystemExit("Frontier pre-effect absence proof conflicts with message identity")
     for field in ("transport_status", "effective_transport_status"):
         if field in operation and operation[field] is not None:
             normalize_frontier_transport_status(operation[field])
@@ -895,6 +937,8 @@ def validate_frontier_typed_fields(operation: dict[str, Any]) -> None:
         for field in ("transport_status", "frontier_decision", "request_id", "message_id", "effect", "receipt"):
             if field not in effective_outcome:
                 raise SystemExit(f"Frontier effective_outcome missing {field}")
+        if effective_outcome.get("effect_stage") is not None:
+            normalize_effect_stage(effective_outcome["effect_stage"])
         normalize_frontier_transport_status(effective_outcome["transport_status"])
         normalize_frontier_decision(effective_outcome["frontier_decision"])
         if not isinstance(effective_outcome["request_id"], str) or not isinstance(effective_outcome["message_id"], str):
@@ -965,6 +1009,15 @@ def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None
         reason = operation.get("terminal_reason")
         if reason is not None and not isinstance(reason, str):
             raise SystemExit("pending operation terminal_reason must be a string or null")
+        effect_stage = operation.get("effect_stage")
+        if effect_stage is not None:
+            normalize_effect_stage(effect_stage)
+        for link in ("predecessor_operation_id", "successor_operation_id"):
+            link_value = operation.get(link)
+            if link_value is not None and (
+                not isinstance(link_value, str) or not OPERATION_ID_RE.fullmatch(link_value)
+            ):
+                raise SystemExit(f"pending operation {link} must be a valid operation ID or null")
         validate_frontier_typed_fields(operation)
 
 
@@ -1802,7 +1855,8 @@ FRONTIER_METADATA_KEYS = {
     "response_digest", "response_id", "response_message_id", "response_type", "scope",
     "stable", "status", "task_id", "transport_status", "type", "work_unit_id",
     "repository_root", "branch", "expected_head", "candidate_diff_sha",
-    "allowed_paths", "commit_message",
+    "allowed_paths", "commit_message", "effect_stage", "pre_effect_absence_proven",
+    "browser_tab_opened", "outbound_request_observed", "request_sent",
 }
 
 
@@ -1837,6 +1891,45 @@ def response_type_from_sources(*sources: Any) -> str | None:
     if len(set(values)) != 1:
         raise SystemExit("Frontier response_type mismatch")
     return values[0]
+
+
+def pre_effect_absence_proven(
+    args: argparse.Namespace, effect: dict[str, Any], receipt: dict[str, Any],
+) -> bool:
+    """Require explicit evidence before classifying a failed exchange as no-effect."""
+    if bool(getattr(args, "pre_effect_absence_proven", False)):
+        return True
+    sources = [source for source in (effect, receipt) if isinstance(source, dict)]
+    if any(source.get("pre_effect_absence_proven") is True for source in sources):
+        return True
+    browser_tab_opened = [source.get("browser_tab_opened") for source in sources]
+    outbound_observed = [
+        source.get("outbound_request_observed", source.get("request_sent"))
+        for source in sources
+    ]
+    return (
+        bool(browser_tab_opened)
+        and all(value is False for value in browser_tab_opened if value is not None)
+        and any(value is False for value in outbound_observed)
+        and all(value is not None for value in outbound_observed)
+    )
+
+
+def requested_effect_stage(
+    args: argparse.Namespace, *, status: str, message_id: str | None,
+    effect: dict[str, Any], receipt: dict[str, Any],
+) -> str:
+    explicit = getattr(args, "effect_stage", None)
+    if explicit is not None:
+        return normalize_effect_stage(explicit)
+    if status == "success":
+        return "response_observed"
+    if message_id is None and pre_effect_absence_proven(args, effect, receipt):
+        return "none"
+    # A failed exchange with an identity is at least request-sent.  A failure
+    # without one is still conservatively transport-started until the caller
+    # supplies an explicit absence proof.
+    return "request_sent" if message_id else "transport_started"
 
 
 def proposed_plan_from_sources(*sources: Any) -> dict[str, Any] | None:
@@ -2348,6 +2441,7 @@ def record_operation_intent(
         "kind": kind,
         "idempotency_key": idempotency_key,
         "status": "intent",
+        "effect_stage": "none",
         "intent": normalized_intent,
         "effect": None,
         "receipt": None,
@@ -2360,12 +2454,138 @@ def record_operation_intent(
     return operation, True
 
 
+def operation_is_effectively_confirmed(operation: dict[str, Any]) -> bool:
+    return operation.get("status") == "confirmed" or (
+        operation.get("kind") == "frontier_exchange"
+        and operation.get("effective_status") == "confirmed"
+    )
+
+
+def operation_purpose(operation: dict[str, Any]) -> tuple[Any, ...]:
+    """Return the stable purpose used to prevent unrelated supersession."""
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        intent = {}
+    parent_gate = bool(intent.get("parent_gate") is True or intent.get("purpose") == "parent_gate")
+    purpose = intent.get("purpose") or ("parent_gate" if parent_gate else operation.get("kind"))
+    return (
+        operation.get("kind"), purpose, parent_gate,
+        intent.get("completed_work_unit_id"), intent.get("work_unit_id"),
+    )
+
+
+def mark_pre_effect_absence_proven(operation: dict[str, Any], *, explicit: bool) -> None:
+    """Promote an operator's explicit absence proof without guessing from a timeout."""
+    if operation.get("pre_effect_absence_proven") is True:
+        return
+    if not explicit:
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRED")
+    if operation.get("kind") == "frontier_exchange" and operation.get("status") not in {"intent", "failed"}:
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRES_UNRESOLVED_FRONTIER_FAILURE")
+    if operation.get("effect_stage") not in {None, "none"}:
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_RECORDED_EFFECT")
+    for source_name in ("effect", "receipt"):
+        source = operation.get(source_name)
+        if not isinstance(source, dict):
+            continue
+        if frontier_message_id(source) is not None:
+            raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_MESSAGE_ID")
+        if source.get("transport_status") == "success":
+            raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_SUCCESS")
+    operation["effect_stage"] = "none"
+    operation["pre_effect_absence_proven"] = True
+
+
+def require_safe_operation_resolution(
+    operation: dict[str, Any], *, explicit_pre_effect_proof: bool,
+) -> None:
+    if operation.get("status") == "intent":
+        mark_pre_effect_absence_proven(operation, explicit=False)
+        return
+    if operation.get("status") != "failed":
+        raise SystemExit("OPERATION_RESOLUTION_REQUIRES_FAILED_OPERATION")
+    mark_pre_effect_absence_proven(operation, explicit=explicit_pre_effect_proof)
+    if operation.get("effect_stage") != "none":
+        raise SystemExit("OPERATION_RESOLUTION_REQUIRES_EFFECT_STAGE_NONE")
+
+
+def validate_successor_operation(
+    operation: dict[str, Any], successor: dict[str, Any], *, explicit_pre_effect_proof: bool,
+) -> None:
+    if operation["operation_id"] == successor["operation_id"]:
+        raise SystemExit("OPERATION_SUCCESSOR_MUST_DIFFER")
+    if operation.get("kind") != successor.get("kind"):
+        raise SystemExit("OPERATION_SUCCESSOR_KIND_MISMATCH")
+    if not operation_is_effectively_confirmed(successor):
+        raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
+    if operation_purpose(operation) != operation_purpose(successor):
+        raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+    require_safe_operation_resolution(
+        operation, explicit_pre_effect_proof=explicit_pre_effect_proof,
+    )
+
+
+def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> int:
+    """Resolve a safe no-effect operation without rewriting its evidence."""
+    require_nonterminal_run(data, f"operation {args.operation_action}")
+    if args.operation_id is None:
+        raise SystemExit(f"operation {args.operation_action} requires --operation-id")
+    operation = find_operation(data, args.operation_id)
+    reason = require_nonempty_string(args.reason, "operation resolution reason")
+    explicit_proof = bool(getattr(args, "pre_effect_absence_proven", False))
+    expected_status = "superseded" if args.operation_action == "supersede" else "abandoned"
+    if operation.get("status") == expected_status:
+        requested_successor = args.successor_operation_id
+        if operation.get("terminal_reason") == reason and operation.get("successor_operation_id") == requested_successor:
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("OPERATION_RESOLUTION_CONFLICT")
+    successor = None
+    if args.operation_action == "supersede":
+        if args.successor_operation_id is None:
+            raise SystemExit("operation supersede requires --successor-operation-id")
+        successor = find_operation(data, args.successor_operation_id)
+        validate_successor_operation(
+            operation, successor, explicit_pre_effect_proof=explicit_proof,
+        )
+    else:
+        require_safe_operation_resolution(operation, explicit_pre_effect_proof=explicit_proof)
+        if args.successor_operation_id is not None:
+            successor = find_operation(data, args.successor_operation_id)
+            if not operation_is_effectively_confirmed(successor):
+                raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
+            if operation_purpose(operation) != operation_purpose(successor):
+                raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+
+    now = utcnow()
+    operation["status"] = expected_status
+    operation["terminal_reason"] = reason
+    operation["confirmed_at"] = now
+    operation["updated_at"] = now
+    if successor is not None:
+        operation["successor_operation_id"] = successor["operation_id"]
+        if successor.get("predecessor_operation_id") not in {None, operation["operation_id"]}:
+            raise SystemExit("OPERATION_SUCCESSOR_ALREADY_LINKED")
+        successor["predecessor_operation_id"] = operation["operation_id"]
+        successor["updated_at"] = now
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, f"operation.{args.operation_action}", reason, {
+        "operation_id": operation["operation_id"],
+        "successor_operation_id": operation.get("successor_operation_id"),
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def cmd_operation(args: argparse.Namespace) -> int:
     data = read_state(args.run_id)
     require_v2(data, "operation")
     ensure_v2_defaults(data)
     validate_state(data)
     action = args.operation_action
+    if action in {"supersede", "abandon"}:
+        return cmd_operation_resolution(args, data)
     if action == "intent":
         require_active_run(data, "operation intent")
         if args.kind is None:
@@ -2452,6 +2672,7 @@ def cmd_operation(args: argparse.Namespace) -> int:
             return 0
         operation["effect"] = effect
         operation["status"] = "effect-observed"
+        operation["effect_stage"] = "response_observed"
         operation["updated_at"] = utcnow()
         saved = write_state(data, args.expect_revision)
         append_event(args.run_id, "operation.effect_observed", None, {
@@ -2482,6 +2703,7 @@ def cmd_operation(args: argparse.Namespace) -> int:
             return 0
         operation["receipt"] = receipt
         operation["status"] = "receipt-recorded"
+        operation["effect_stage"] = "response_observed"
         operation["updated_at"] = utcnow()
         saved = write_state(data, args.expect_revision)
         append_event(args.run_id, "operation.receipt_recorded", None, {
@@ -2496,6 +2718,8 @@ def cmd_operation(args: argparse.Namespace) -> int:
     reason = args.reason
     if terminal_status not in TERMINAL_OPERATION_STATUSES:
         raise SystemExit("operation confirm requires --status confirmed, failed, or abandoned")
+    if terminal_status == "superseded":
+        raise SystemExit("operation superseded status requires the typed supersede transition")
     if not isinstance(reason, str) or not reason.strip():
         raise SystemExit("operation confirm requires --reason")
     if operation.get("kind") in {"tracking_issue", "pull_request"}:
@@ -2522,6 +2746,10 @@ def cmd_operation(args: argparse.Namespace) -> int:
             reason = reason + ": Frontier transport " + frontier_status
             if frontier_errors:
                 reason += ": " + "; ".join(sorted(set(frontier_errors)))
+    if terminal_status == "abandoned":
+        require_safe_operation_resolution(
+            operation, explicit_pre_effect_proof=bool(getattr(args, "pre_effect_absence_proven", False)),
+        )
     if operation["status"] in TERMINAL_OPERATION_STATUSES:
         if operation["status"] == terminal_status and operation.get("terminal_reason") == reason:
             print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
@@ -3208,8 +3436,71 @@ def cmd_authorization(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_frontier_retry(args: argparse.Namespace) -> int:
+    """Create a linked, idempotent retry for a proven pre-effect failure."""
+    data = read_state(args.run_id)
+    require_v2(data, "frontier retry")
+    ensure_v2_defaults(data)
+    require_active_run(data, "frontier retry")
+    ensure_route_allows(data, "frontier")
+    if not args.operation_id:
+        raise SystemExit("Frontier retry requires --operation-id")
+    predecessor = find_operation(data, args.operation_id)
+    if predecessor.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_RETRY_WRONG_KIND")
+    if predecessor.get("status") != "failed":
+        raise SystemExit("FRONTIER_RETRY_REQUIRES_FAILED_OPERATION")
+    identity = frontier_operation_identity(predecessor)
+    if identity["request_id"] != args.request_id:
+        raise SystemExit("FRONTIER_RETRY_REQUEST_ID_MISMATCH")
+    require_safe_operation_resolution(
+        predecessor, explicit_pre_effect_proof=bool(args.pre_effect_absence_proven),
+    )
+    task_id = args.task_id or identity["task_id"]
+    if not isinstance(task_id, str) or not task_id:
+        raise SystemExit("Frontier retry requires --task-id when the predecessor has none")
+    intent = copy.deepcopy(predecessor.get("intent"))
+    if not isinstance(intent, dict):
+        raise SystemExit("FRONTIER_RETRY_INVALID_PREDECESSOR_INTENT")
+    override = parse_object_json(args.intent_json, "--intent-json")
+    if override:
+        intent.update(override)
+    intent.update({
+        "request_id": args.request_id,
+        "task_id": task_id,
+        "predecessor_operation_id": predecessor["operation_id"],
+    })
+    intent.pop("message_id", None)
+    key = args.idempotency_key or f"frontier-retry:{predecessor['operation_id']}"
+    operation, created = record_operation_intent(
+        data, kind="frontier_exchange", idempotency_key=key, intent=intent,
+    )
+    if not created:
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    operation["predecessor_operation_id"] = predecessor["operation_id"]
+    data["last_request_id"] = args.request_id
+    data["frontier_task_id"] = task_id
+    gate = data.get("parent_gate")
+    if isinstance(gate, dict) and gate.get("operation_id") == predecessor["operation_id"]:
+        gate["operation_id"] = operation["operation_id"]
+        gate["request_id"] = args.request_id
+        gate["message_id"] = None
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "frontier.retry_intent_recorded", "safe pre-effect Frontier retry", {
+        "operation_id": operation["operation_id"],
+        "predecessor_operation_id": predecessor["operation_id"],
+        "request_id": args.request_id,
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def cmd_frontier(args: argparse.Namespace) -> int:
     """Persist a Frontier exchange intent before browser transport is invoked."""
+    if args.frontier_action == "retry":
+        return cmd_frontier_retry(args)
     if args.frontier_action == "result":
         return cmd_frontier_result(args)
     if args.frontier_action == "recover":
@@ -3225,6 +3516,15 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     if not isinstance(args.task_id, str) or not args.task_id.strip():
         raise SystemExit("--task-id must be a non-empty string")
     intent = parse_object_json(args.intent_json, "--intent-json")
+    predecessor = None
+    if args.predecessor_operation_id is not None:
+        predecessor = find_operation(data, args.predecessor_operation_id)
+        if predecessor.get("kind") != "frontier_exchange":
+            raise SystemExit("FRONTIER_SUCCESSOR_WRONG_PREDECESSOR_KIND")
+        require_safe_operation_resolution(
+            predecessor, explicit_pre_effect_proof=bool(args.pre_effect_absence_proven),
+        )
+        intent["predecessor_operation_id"] = predecessor["operation_id"]
     requested_artifact_root = intent.get("artifact_root")
     if requested_artifact_root is not None:
         if normalize_artifact_root(str(requested_artifact_root), data["repository_root"]) != artifact_root:
@@ -3270,6 +3570,8 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     if not created:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
+    if predecessor is not None:
+        operation["predecessor_operation_id"] = predecessor["operation_id"]
     data["last_request_id"] = args.request_id
     data["frontier_task_id"] = args.task_id
     if args.chat_url is not None:
@@ -3336,7 +3638,7 @@ def frontier_identity_errors(
 
 def build_frontier_response(
     data: dict[str, Any], operation: dict[str, Any], args: argparse.Namespace, *, recovery: bool,
-) -> tuple[str, str | None, str, str | None, dict[str, Any], dict[str, Any], list[str]]:
+) -> tuple[str, str | None, str, str | None, str, bool, dict[str, Any], dict[str, Any], list[str]]:
     requested_status = normalize_frontier_transport_status(args.transport_status)
     requested_decision = normalize_frontier_decision(args.frontier_decision, allow_none=True)
     effect_raw, receipt_raw = frontier_response_objects(args, recovery=recovery)
@@ -3401,6 +3703,26 @@ def build_frontier_response(
                 and effect_raw.get("request_id") != receipt_raw.get("request_id"):
             errors.append("effect and receipt request_id mismatch")
 
+    effect_stage = requested_effect_stage(
+        args, status=requested_status, message_id=message_id,
+        effect=effect_raw, receipt=receipt_raw,
+    )
+    absence_proven = False
+    if effect_stage == "none":
+        absence_proven = pre_effect_absence_proven(args, effect_raw, receipt_raw)
+        if requested_status == "success":
+            errors.append("effect_stage none is incompatible with successful Frontier transport")
+        elif not absence_proven:
+            errors.append("effect_stage none requires proof that no browser tab or outbound request existed")
+        elif message_id is not None:
+            errors.append("pre-effect Frontier failure cannot have message_id")
+    elif effect_stage == "response_observed" and requested_status != "success":
+        # A response identity is useful recovery evidence, but a transport
+        # failure that observed a response must be represented as ambiguous
+        # rather than silently promoted to a no-effect retry.
+        if message_id is None:
+            errors.append("response_observed requires message_id")
+
     status = requested_status
     decision = requested_decision if not errors else None
     if errors and requested_status == "success":
@@ -3415,17 +3737,23 @@ def build_frontier_response(
         effect = {
             "transport_status": status, "frontier_decision": None,
             "request_id": request_id, "message_id": message_id,
+            "effect_stage": effect_stage,
             "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
             "response": effect_raw,
         }
+        if absence_proven:
+            effect["pre_effect_absence_proven"] = True
         if response_type is not None:
             effect["response_type"] = response_type
         receipt = {
             "transport_status": status, "frontier_decision": None,
             "request_id": request_id, "message_id": message_id,
+            "effect_stage": effect_stage,
             "task_id": task_id, "scope": scope, "validation_errors": sorted(set(errors)),
             "response": receipt_raw,
         }
+        if absence_proven:
+            receipt["pre_effect_absence_proven"] = True
         if response_type is not None:
             receipt["response_type"] = response_type
     else:
@@ -3434,7 +3762,10 @@ def build_frontier_response(
             result.update({
                 "transport_status": status, "frontier_decision": decision,
                 "request_id": request_id, "message_id": message_id,
+                "effect_stage": effect_stage,
             })
+            if absence_proven:
+                result["pre_effect_absence_proven"] = True
             if response_type is not None:
                 result["response_type"] = response_type
             if task_id is not None:
@@ -3445,7 +3776,7 @@ def build_frontier_response(
 
         effect = complete(effect_raw)
         receipt = complete(receipt_raw)
-    return status, decision, request_id, message_id, effect, receipt, errors
+    return status, decision, request_id, message_id, effect_stage, absence_proven, effect, receipt, errors
 
 
 def frontier_recovery_projection(entry: dict[str, Any]) -> dict[str, Any]:
@@ -3461,6 +3792,7 @@ def frontier_recovery_entry(
         "frontier_decision": decision,
         "request_id": request_id,
         "message_id": message_id,
+        "effect_stage": "response_observed",
         "task_id": task_id,
         "scope": scope,
         "effective_status": "confirmed",
@@ -3735,7 +4067,7 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     operation = find_operation(data, args.operation_id)
     if operation.get("kind") != "frontier_exchange" and not is_parent_gate_operation(operation):
         raise SystemExit("FRONTIER_OPERATION_KIND_MISMATCH")
-    status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
+    status, decision, request_id, message_id, effect_stage, absence_proven, effect, receipt, errors = build_frontier_response(
         data, operation, args, recovery=False,
     )
     effect["operation_id"] = operation["operation_id"]
@@ -3769,6 +4101,8 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     operation["message_id"] = message_id
     operation["transport_status"] = status
     operation["frontier_decision"] = decision
+    operation["effect_stage"] = effect_stage
+    operation["pre_effect_absence_proven"] = absence_proven
     work_unit_id = matching_work_unit_id(effect, receipt)
     if work_unit_id is not None:
         operation["work_unit_id"] = work_unit_id
@@ -3812,8 +4146,8 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
     if operation.get("status") != "failed":
         raise SystemExit("FRONTIER_RECOVERY_REQUIRES_LEGACY_FAILED_OPERATION")
     identity = frontier_operation_identity(operation)
-    if not identity["request_id"] or not identity["message_id"]:
-        raise SystemExit("FRONTIER_RECOVERY_MISSING_ORIGINAL_IDENTITY")
+    if not identity["request_id"]:
+        raise SystemExit("FRONTIER_RECOVERY_MISSING_ORIGINAL_REQUEST_ID")
     for source_name in ("effect", "receipt"):
         source = operation.get(source_name)
         if not isinstance(source, dict):
@@ -3823,7 +4157,7 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
         source_message = frontier_message_id(source)
         if source_message not in {None, identity["message_id"]}:
             raise SystemExit("FRONTIER_RECOVERY_ORIGINAL_MESSAGE_ID_CONFLICT")
-    status, decision, request_id, message_id, effect, receipt, errors = build_frontier_response(
+    status, decision, request_id, message_id, effect_stage, absence_proven, effect, receipt, errors = build_frontier_response(
         data, operation, args, recovery=True,
     )
     effect["operation_id"] = operation["operation_id"]
@@ -3852,6 +4186,7 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
     operation["effective_status"] = "confirmed"
     operation["effective_transport_status"] = status
     operation["effective_frontier_decision"] = decision
+    operation["effective_effect_stage"] = effect_stage
     operation["effective_request_id"] = request_id
     operation["effective_message_id"] = message_id
     work_unit_id = matching_work_unit_id(effect, receipt)
@@ -3860,6 +4195,7 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
     operation["effective_outcome"] = {
         "transport_status": status, "frontier_decision": decision,
         "request_id": request_id, "message_id": message_id,
+        "effect_stage": effect_stage,
         "effect": effect, "receipt": receipt,
     }
     if response_type is not None:
@@ -4509,6 +4845,7 @@ def cmd_delegation_terminal(args: argparse.Namespace) -> int:
     now = utcnow()
     operation["effect"] = effect
     operation["receipt"] = receipt
+    operation["effect_stage"] = "response_observed"
     operation["status"] = "confirmed" if args.status == "success" else "failed"
     operation["terminal_reason"] = None if args.status == "success" else f"delegation task ended {args.status}"
     operation["confirmed_at"] = now
@@ -5115,6 +5452,17 @@ def operation_effective_status(operation: dict[str, Any]) -> str | None:
     return operation.get("status")
 
 
+def is_pre_effect_frontier_failure(operation: dict[str, Any]) -> bool:
+    identity = frontier_operation_identity(operation)
+    return (
+        operation.get("kind") == "frontier_exchange"
+        and operation.get("status") == "failed"
+        and operation.get("effect_stage") == "none"
+        and operation.get("pre_effect_absence_proven") is True
+        and identity["message_id"] is None
+    )
+
+
 def open_work_units(data: dict[str, Any]) -> list[str]:
     work_units = data.get("work_units", {})
     if not isinstance(work_units, dict):
@@ -5171,6 +5519,10 @@ def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
             status = operation.get("status")
             effective_status = operation_effective_status(operation)
             operation_id_value = str(operation.get("operation_id") or "<unnamed-operation>")
+            if status in {"abandoned", "superseded"}:
+                # These are typed historical resolutions.  Their evidence is
+                # retained, but they are no longer required effects.
+                continue
             if effective_status != "confirmed":
                 # A pending record is reported separately, but a terminal
                 # failed/abandoned effect must remain visible in the terminal
@@ -5345,6 +5697,12 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     ]
     if failed_frontier:
         operation = failed_frontier[0]
+        if is_pre_effect_frontier_failure(operation):
+            return (
+                "RETRY_FRONTIER_EXCHANGE",
+                f"Frontier exchange {operation.get('operation_id', '<unnamed-operation>')} failed before any effect",
+                [str(operation.get("operation_id") or "<unnamed-operation>")],
+            )
         return (
             "RECOVER_FRONTIER_EXCHANGE",
             f"Frontier exchange {operation.get('operation_id', '<unnamed-operation>')} is failed",
@@ -5748,7 +6106,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     operation = sub.add_parser("operation", help="persist one external-effect lifecycle without generic patches")
     operation.add_argument("run_id")
-    operation.add_argument("operation_action", choices=["intent", "observe", "receipt", "confirm"])
+    operation.add_argument(
+        "operation_action",
+        choices=["intent", "observe", "receipt", "confirm", "supersede", "abandon"],
+    )
     operation.add_argument("--kind", choices=sorted(OPERATION_KINDS))
     operation.add_argument("--idempotency-key")
     operation.add_argument("--authorization-id")
@@ -5758,6 +6119,11 @@ def build_parser() -> argparse.ArgumentParser:
     operation.add_argument("--receipt-json")
     operation.add_argument("--status", choices=sorted(TERMINAL_OPERATION_STATUSES))
     operation.add_argument("--reason")
+    operation.add_argument("--successor-operation-id")
+    operation.add_argument(
+        "--pre-effect-absence-proven", action="store_true",
+        help="assert that no browser tab, outbound request, or external effect existed",
+    )
     operation.add_argument("--expect-revision", type=int, required=True)
     operation.set_defaults(func=cmd_operation)
 
@@ -5786,7 +6152,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     frontier = sub.add_parser("frontier", help="record and recover typed Frontier exchange outcomes")
     frontier.add_argument("run_id")
-    frontier.add_argument("frontier_action", choices=["start", "result", "recover"])
+    frontier.add_argument("frontier_action", choices=["start", "result", "recover", "retry"])
     frontier.add_argument("--request-id", required=True)
     frontier.add_argument("--task-id")
     frontier.add_argument("--idempotency-key")
@@ -5795,7 +6161,10 @@ def build_parser() -> argparse.ArgumentParser:
     frontier.add_argument("--message-id")
     frontier.add_argument("--response-message-id", dest="message_id")
     frontier.add_argument("--operation-id")
+    frontier.add_argument("--predecessor-operation-id")
     frontier.add_argument("--transport-status")
+    frontier.add_argument("--effect-stage", choices=sorted(EFFECT_STAGES))
+    frontier.add_argument("--pre-effect-absence-proven", action="store_true")
     frontier.add_argument("--frontier-decision")
     frontier.add_argument("--response-type")
     frontier.add_argument("--plan-json")
