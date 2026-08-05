@@ -72,6 +72,12 @@ IGNORED_TREE_NAMES = {
     "dist",
     "build",
     "node_modules",
+    # Local orchestrator work artifacts — never part of the distributed package
+    ".myrmex-work",
+    ".atl",
+    ".playwright-mcp",
+    # Python cache dirs — gitignored, but may exist during test runs
+    "__pycache__",
 }
 
 

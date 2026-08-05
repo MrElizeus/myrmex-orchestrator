@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse,hashlib,json,os,shutil,subprocess,tempfile,zipfile
 from pathlib import Path
 
-EXCLUDED={".git",".github","dist","external-sources","__pycache__"}
+EXCLUDED={".git",".github","dist","external-sources","__pycache__",".playwright-mcp",".atl",".myrmex-work"}
 def files(root):
  out=[]
  for p in root.rglob("*"):
