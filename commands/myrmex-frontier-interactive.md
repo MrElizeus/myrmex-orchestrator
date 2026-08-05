@@ -10,3 +10,7 @@ $ARGUMENTS
 ```
 
 Create repository-grounded context, obtain one structured frontier plan through `myrmex-frontier`, and show the plan before implementation. Do not push.
+
+
+This command explicitly selects `frontier-gated`; persist that policy before
+the first browser exchange.

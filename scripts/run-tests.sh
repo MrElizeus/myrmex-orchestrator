@@ -47,8 +47,13 @@ else:
     print(f'schema meta-validation: PASS ({checked} schemas)')
 PYSCHEMA
 python3 "$ROOT/tests/test-state-cli.py"
+python3 "$ROOT/tests/test-execution-policy-resolution.py"
 python3 "$ROOT/tests/test-frontier-operation-recovery.py"
+python3 "$ROOT/tests/test-frontier-pre-effect-absence.py"
 python3 "$ROOT/tests/test-frontier-pre-effect-recovery.py"
+python3 "$ROOT/tests/test-frontier-blocked-recovery.py"
+python3 "$ROOT/tests/test-operation-attempt-lifecycle.py"
+python3 "$ROOT/tests/test-eigengrid-blocked-run-recovery.py"
 python3 "$ROOT/tests/test-correction-grant-replay.py"
 python3 "$ROOT/tests/test-parent-objective-continuity.py"
 python3 "$ROOT/tests/test-local-commit.py"

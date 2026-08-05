@@ -1,0 +1,57 @@
+{
+  "schema": "myrmex.incident-fixture/v1",
+  "incident": "eigengrid-controlled-alpha-frontier-pre-effect-deadlock",
+  "source_revision": 25,
+  "phase": "blocked",
+  "status": "blocked",
+  "blocker_code": "BLOCKED_FRONTIER_RECOVERY_MISSING_ORIGINAL_IDENTITY",
+  "resume_phase": "verifying",
+  "operations": [
+    {
+      "source_alias": "op-2c1012cc021dc284eddae80a",
+      "kind": "frontier_exchange",
+      "request_id": "req-plan-controlled-alpha-continuation-20260804-02",
+      "outcome": "proven_pre_effect_failure",
+      "purpose": "controlled-alpha-plan"
+    },
+    {
+      "source_alias": "op-7f4f34c7b0e5a2fb6a3fb008",
+      "kind": "frontier_exchange",
+      "request_id": "req-plan-controlled-alpha-continuation-20260804-03",
+      "outcome": "proven_pre_effect_failure",
+      "purpose": "controlled-alpha-plan"
+    },
+    {
+      "source_alias": "op-a9983d527610cefbe1887884",
+      "kind": "delegation",
+      "task_id": "writer-wu08-failed-attempt",
+      "work_unit_id": "WU-08",
+      "outcome": "failed_attempt"
+    },
+    {
+      "source_alias": "op-856f85a3e3c12a292fb0bccd",
+      "kind": "frontier_exchange",
+      "request_id": "req-plan-controlled-alpha-continuation-20260804-04",
+      "message_id": "conversation-turn-12",
+      "outcome": "confirmed_plan",
+      "purpose": "controlled-alpha-plan",
+      "work_unit_id": "WU-08"
+    }
+  ],
+  "authorization": {
+    "status": "open",
+    "consumed_uses": 0,
+    "work_unit_id": "WU-08"
+  },
+  "delivery": {
+    "commit_sha": null,
+    "push_status": "not_requested"
+  },
+  "expected": {
+    "frontier_transport_replays": 0,
+    "final_status": "active",
+    "final_phase": "verifying",
+    "authoritative_request_id": "req-plan-controlled-alpha-continuation-20260804-04",
+    "authoritative_message_id": "conversation-turn-12"
+  }
+}
