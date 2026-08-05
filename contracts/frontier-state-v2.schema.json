@@ -156,10 +156,7 @@
       ]
     },
     "commit_policy_authorization": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "required": [
         "authorization_id",
         "authority",
@@ -172,121 +169,46 @@
         "audit_history"
       ],
       "properties": {
-        "authorization_id": {
-          "type": "string",
-          "pattern": "^policy-auth-[0-9a-f]{24}$"
-        },
-        "authority": {
-          "const": "user"
-        },
-        "source_request_id": {
-          "type": "string",
-          "minLength": 1
-        },
+        "authorization_id": {"type": "string", "pattern": "^policy-auth-[0-9a-f]{24}$"},
+        "authority": {"const": "user"},
+        "source_request_id": {"type": "string", "minLength": 1},
         "scope": {
           "type": "object",
-          "required": [
-            "parent_run_id",
-            "parent_objective",
-            "repository_root",
-            "branch"
-          ],
+          "required": ["parent_run_id", "parent_objective", "repository_root", "branch"],
           "properties": {
-            "parent_run_id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "parent_objective": {
-              "type": "string",
-              "minLength": 1
-            },
-            "repository_root": {
-              "type": "string",
-              "minLength": 1
-            },
-            "branch": {
-              "type": "string",
-              "minLength": 1
-            }
+            "parent_run_id": {"type": "string", "minLength": 1},
+            "parent_objective": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
           },
           "additionalProperties": false
         },
         "source": {
           "type": "object",
-          "required": [
-            "operation_id",
-            "request_id",
-            "message_id",
-            "work_unit_id",
-            "response_type",
-            "frontier_decision"
-          ],
+          "required": ["operation_id", "request_id", "message_id", "work_unit_id", "response_type", "frontier_decision"],
           "properties": {
-            "operation_id": {
-              "type": "string",
-              "pattern": "^op-[0-9a-f]{24}$"
-            },
-            "request_id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "message_id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "work_unit_id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "response_type": {
-              "const": "sub_objective_complete"
-            },
-            "frontier_decision": {
-              "const": "ACCEPT"
-            }
+            "operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+            "request_id": {"type": "string", "minLength": 1},
+            "message_id": {"type": "string", "minLength": 1},
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "response_type": {"const": "sub_objective_complete"},
+            "frontier_decision": {"const": "ACCEPT"}
           },
           "additionalProperties": false
         },
         "accepted_work_unit": {
           "type": "object",
-          "required": [
-            "work_unit_id",
-            "repository_root",
-            "branch"
-          ],
+          "required": ["work_unit_id", "repository_root", "branch"],
           "properties": {
-            "work_unit_id": {
-              "type": "string",
-              "minLength": 1
-            },
-            "repository_root": {
-              "type": "string",
-              "minLength": 1
-            },
-            "branch": {
-              "type": "string",
-              "minLength": 1
-            }
+            "work_unit_id": {"type": "string", "minLength": 1},
+            "repository_root": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1}
           },
           "additionalProperties": false
         },
-        "status": {
-          "enum": [
-            "active",
-            "revoked"
-          ]
-        },
-        "authorized_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "audit_history": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "object"
-          }
-        }
+        "status": {"enum": ["active", "revoked"]},
+        "authorized_at": {"type": "string", "format": "date-time"},
+        "audit_history": {"type": "array", "minItems": 1, "items": {"type": "object"}}
       },
       "additionalProperties": false
     },
@@ -428,83 +350,26 @@
         "null"
       ],
       "properties": {
-        "code": {
-          "type": "string",
-          "minLength": 1
-        },
-        "status": {
-          "enum": [
-            "blocked",
-            "resolved"
-          ]
-        },
+        "code": {"type": "string", "minLength": 1},
+        "status": {"enum": ["blocked", "resolved"]},
         "operation_ids": {
           "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "^op-[0-9a-f]{24}$"
-          },
+          "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
           "uniqueItems": true
         },
-        "resume_phase": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "blocked_at_revision": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "minimum": 0
-        },
-        "evidence_digest": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "recorded_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "resolved_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "resolved_operation_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^op-[0-9a-f]{24}$"
-        },
-        "successor_operation_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^op-[0-9a-f]{24}$"
-        },
+        "resume_phase": {"type": ["string", "null"]},
+        "blocked_at_revision": {"type": ["integer", "null"], "minimum": 0},
+        "evidence_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "recorded_at": {"type": "string", "format": "date-time"},
+        "resolved_at": {"type": ["string", "null"], "format": "date-time"},
+        "resolved_operation_id": {"type": ["string", "null"], "pattern": "^op-[0-9a-f]{24}$"},
+        "successor_operation_id": {"type": ["string", "null"], "pattern": "^op-[0-9a-f]{24}$"},
         "remaining_operation_ids": {
           "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "^op-[0-9a-f]{24}$"
-          },
+          "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
           "uniqueItems": true
         },
-        "reason": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
+        "reason": {"type": ["string", "null"]}
       },
       "additionalProperties": true
     },
@@ -941,36 +806,19 @@
       ],
       "properties": {
         "status": {
-          "enum": [
-            "required",
-            "requested",
-            "confirmed",
-            "blocked"
-          ]
+          "enum": ["required", "requested", "confirmed", "blocked"]
         },
         "completed_work_unit_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "operation_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "request_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "message_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "response_type": {
           "enum": [
@@ -985,30 +833,16 @@
           ]
         },
         "frontier_decision": {
-          "enum": [
-            "ACCEPT",
-            "REMEDIATE",
-            "BLOCKED",
-            null
-          ]
+          "enum": ["ACCEPT", "REMEDIATE", "BLOCKED", null]
         },
         "effect": {
-          "type": [
-            "object",
-            "null"
-          ]
+          "type": ["object", "null"]
         },
         "receipt": {
-          "type": [
-            "object",
-            "null"
-          ]
+          "type": ["object", "null"]
         },
         "next_work_unit_id": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "recorded_at": {
           "type": "string"
@@ -1027,19 +861,10 @@
         "object",
         "null"
       ],
-      "required": [
-        "status",
-        "work_unit_id",
-        "intent",
-        "provenance"
-      ],
+      "required": ["status", "work_unit_id", "intent", "provenance"],
       "properties": {
         "status": {
-          "enum": [
-            "approved",
-            "active",
-            "complete"
-          ]
+          "enum": ["approved", "active", "complete"]
         },
         "work_unit_id": {
           "type": "string",
@@ -1050,33 +875,14 @@
         },
         "provenance": {
           "type": "object",
-          "required": [
-            "operation_id",
-            "request_id",
-            "message_id"
-          ],
+          "required": ["operation_id", "request_id", "message_id"],
           "properties": {
-            "operation_id": {
-              "type": "string"
-            },
-            "request_id": {
-              "type": "string"
-            },
-            "message_id": {
-              "type": "string"
-            },
-            "frontier_decision": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "effect": {
-              "type": "object"
-            },
-            "receipt": {
-              "type": "object"
-            }
+            "operation_id": {"type": "string"},
+            "request_id": {"type": "string"},
+            "message_id": {"type": "string"},
+            "frontier_decision": {"type": ["string", "null"]},
+            "effect": {"type": "object"},
+            "receipt": {"type": "object"}
           },
           "additionalProperties": true
         },
@@ -1087,105 +893,41 @@
       "additionalProperties": true
     },
     "clarification": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "properties": {
-        "status": {
-          "enum": [
-            "blocked",
-            "resumed"
-          ]
-        },
-        "response_type": {
-          "const": "blocking_clarification"
-        },
-        "operation_id": {
-          "type": "string"
-        },
-        "request_id": {
-          "type": "string"
-        },
-        "message_id": {
-          "type": "string"
-        },
+        "status": {"enum": ["blocked", "resumed"]},
+        "response_type": {"const": "blocking_clarification"},
+        "operation_id": {"type": "string"},
+        "request_id": {"type": "string"},
+        "message_id": {"type": "string"},
         "question": {},
-        "resume_phase": {
-          "type": "string"
-        },
-        "action": {
-          "type": "object"
-        },
-        "recorded_at": {
-          "type": "string"
-        }
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "recorded_at": {"type": "string"}
       },
       "additionalProperties": true
     },
     "pause": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "properties": {
-        "status": {
-          "enum": [
-            "paused",
-            "resumed"
-          ]
-        },
-        "reason": {
-          "type": "string"
-        },
-        "resume_phase": {
-          "type": "string"
-        },
-        "action": {
-          "type": "object"
-        },
-        "paused_at": {
-          "type": "string"
-        },
-        "resumed_at": {
-          "type": "string"
-        }
+        "status": {"enum": ["paused", "resumed"]},
+        "reason": {"type": "string"},
+        "resume_phase": {"type": "string"},
+        "action": {"type": "object"},
+        "paused_at": {"type": "string"},
+        "resumed_at": {"type": "string"}
       },
       "additionalProperties": true
     },
     "cancellation": {
-      "type": [
-        "object",
-        "null"
-      ],
+      "type": ["object", "null"],
       "properties": {
-        "type": {
-          "enum": [
-            "PARENT_OBJECTIVE_CANCELLED",
-            "RUN_CANCELLED"
-          ]
-        },
-        "reason": {
-          "type": "string"
-        },
-        "request_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "message_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "evidence": {
-          "type": "object"
-        },
-        "cancelled_at": {
-          "type": "string"
-        }
+        "type": {"enum": ["PARENT_OBJECTIVE_CANCELLED", "RUN_CANCELLED"]},
+        "reason": {"type": "string"},
+        "request_id": {"type": ["string", "null"]},
+        "message_id": {"type": ["string", "null"]},
+        "evidence": {"type": "object"},
+        "cancelled_at": {"type": "string"}
       },
       "additionalProperties": true
     },
@@ -1438,180 +1180,52 @@
           "consumed_at"
         ],
         "properties": {
-          "authorization_id": {
-            "type": "string",
-            "pattern": "^auth-[0-9a-f]{24}$"
-          },
-          "kind": {
-            "const": "local_commit"
-          },
-          "authority": {
-            "enum": [
-              "user",
-              "frontier"
-            ]
-          },
-          "request_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "repository_root": {
-            "type": "string",
-            "minLength": 1
-          },
-          "branch": {
-            "type": "string",
-            "minLength": 1
-          },
-          "expected_head": {
-            "type": "string",
-            "pattern": "^[0-9a-fA-F]{7,64}$"
-          },
-          "allowed_paths": {
-            "type": "array",
-            "minItems": 1,
-            "uniqueItems": true,
-            "items": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "scope_digest": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "commit_message": {
-            "type": "string",
-            "minLength": 1
-          },
-          "commit_message_digest": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "grant_kind": {
-            "enum": [
-              "governed"
-            ]
-          },
-          "parent_run_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "work_unit_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "candidate_diff_sha": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
-          },
-          "source_operation_id": {
-            "type": "string",
-            "pattern": "^op-[0-9a-f]{24}$"
-          },
-          "source_request_id": {
-            "type": "string",
-            "minLength": 1
-          },
+          "authorization_id": {"type": "string", "pattern": "^auth-[0-9a-f]{24}$"},
+          "kind": {"const": "local_commit"},
+          "authority": {"enum": ["user", "frontier"]},
+          "request_id": {"type": "string", "minLength": 1},
+          "repository_root": {"type": "string", "minLength": 1},
+          "branch": {"type": "string", "minLength": 1},
+          "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+          "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "commit_message": {"type": "string", "minLength": 1},
+          "commit_message_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "grant_kind": {"enum": ["governed"]},
+          "parent_run_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+          "source_request_id": {"type": "string", "minLength": 1},
           "source_scope": {
             "type": "object",
-            "required": [
-              "repository_root",
-              "branch",
-              "expected_head",
-              "candidate_diff_sha",
-              "allowed_paths",
-              "commit_message"
-            ],
+            "required": ["repository_root", "branch", "expected_head", "candidate_diff_sha", "allowed_paths", "commit_message"],
             "properties": {
-              "repository_root": {
-                "type": "string",
-                "minLength": 1
-              },
-              "branch": {
-                "type": "string",
-                "minLength": 1
-              },
-              "expected_head": {
-                "type": "string",
-                "pattern": "^[0-9a-fA-F]{7,64}$"
-              },
-              "candidate_diff_sha": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
-              },
-              "allowed_paths": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": true,
-                "items": {
-                  "type": "string",
-                  "minLength": 1
-                }
-              },
-              "commit_message": {
-                "type": "string",
-                "minLength": 1
-              }
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1},
+              "expected_head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+              "candidate_diff_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+              "commit_message": {"type": "string", "minLength": 1}
             },
             "additionalProperties": false
           },
           "accepted_work_unit": {
             "type": "object",
-            "required": [
-              "work_unit_id",
-              "repository_root",
-              "branch"
-            ],
+            "required": ["work_unit_id", "repository_root", "branch"],
             "properties": {
-              "work_unit_id": {
-                "type": "string",
-                "minLength": 1
-              },
-              "repository_root": {
-                "type": "string",
-                "minLength": 1
-              },
-              "branch": {
-                "type": "string",
-                "minLength": 1
-              }
+              "work_unit_id": {"type": "string", "minLength": 1},
+              "repository_root": {"type": "string", "minLength": 1},
+              "branch": {"type": "string", "minLength": 1}
             },
             "additionalProperties": false
           },
-          "max_uses": {
-            "const": 1
-          },
-          "consumed_uses": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "expires_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          },
-          "status": {
-            "enum": [
-              "open",
-              "consumed",
-              "expired",
-              "revoked"
-            ]
-          },
-          "authorized_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "consumed_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
-          }
+          "max_uses": {"const": 1},
+          "consumed_uses": {"type": "integer", "minimum": 0},
+          "expires_at": {"type": ["string", "null"], "format": "date-time"},
+          "status": {"enum": ["open", "consumed", "expired", "revoked"]},
+          "authorized_at": {"type": "string", "format": "date-time"},
+          "consumed_at": {"type": ["string", "null"], "format": "date-time"}
         }
       }
     },
@@ -1680,10 +1294,7 @@
           },
           "predecessor_operation_ids": {
             "type": "array",
-            "items": {
-              "type": "string",
-              "pattern": "^op-[0-9a-f]{24}$"
-            },
+            "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
             "uniqueItems": true
           },
           "successor_operation_id": {
@@ -1707,9 +1318,7 @@
               "ambiguous_effect"
             ]
           },
-          "resolution_evidence": {
-            "type": "object"
-          },
+          "resolution_evidence": {"type": "object"},
           "resolution_evidence_digest": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
@@ -1725,30 +1334,12 @@
               "superseded"
             ]
           },
-          "request_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "message_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "work_unit_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "effective_request_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "effective_message_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "effective_work_unit_id": {
-            "type": "string",
-            "minLength": 1
-          },
+          "request_id": {"type": "string", "minLength": 1},
+          "message_id": {"type": "string", "minLength": 1},
+          "work_unit_id": {"type": "string", "minLength": 1},
+          "effective_request_id": {"type": "string", "minLength": 1},
+          "effective_message_id": {"type": "string", "minLength": 1},
+          "effective_work_unit_id": {"type": "string", "minLength": 1},
           "intent": {
             "type": "object"
           },
@@ -1820,10 +1411,7 @@
             ]
           },
           "proposed_plan": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "type": ["object", "null"]
           },
           "effective_status": {
             "enum": [
@@ -2114,62 +1702,30 @@
           {
             "if": {
               "properties": {
-                "kind": {
-                  "const": "tracking_issue"
-                }
+                "kind": {"const": "tracking_issue"}
               },
-              "required": [
-                "kind"
-              ]
+              "required": ["kind"]
             },
             "then": {
               "properties": {
-                "intent": {
-                  "$ref": "#/$defs/trackingIssueIntent"
-                },
-                "effect": {
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                },
-                "receipt": {
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                }
+                "intent": {"$ref": "#/$defs/trackingIssueIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
               }
             }
           },
           {
             "if": {
               "properties": {
-                "kind": {
-                  "const": "pull_request"
-                }
+                "kind": {"const": "pull_request"}
               },
-              "required": [
-                "kind"
-              ]
+              "required": ["kind"]
             },
             "then": {
               "properties": {
-                "intent": {
-                  "$ref": "#/$defs/pullRequestIntent"
-                },
-                "effect": {
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                },
-                "receipt": {
-                  "type": [
-                    "object",
-                    "null"
-                  ]
-                }
+                "intent": {"$ref": "#/$defs/pullRequestIntent"},
+                "effect": {"type": ["object", "null"]},
+                "receipt": {"type": ["object", "null"]}
               }
             }
           }
@@ -2180,63 +1736,24 @@
   "$defs": {
     "deliveryPolicy": {
       "type": "object",
-      "required": [
-        "schema",
-        "repository_root",
-        "mode",
-        "delivery",
-        "decision",
-        "policy_digest",
-        "provenance",
-        "inputs"
-      ],
+      "required": ["schema", "repository_root", "mode", "delivery", "decision", "policy_digest", "provenance", "inputs"],
       "properties": {
-        "schema": {
-          "const": "myrmex.delivery-policy/v1"
-        },
-        "repository_root": {
-          "type": "string",
-          "minLength": 1
-        },
-        "mode": {
-          "enum": [
-            "autonomous",
-            "interactive"
-          ]
-        },
+        "schema": {"const": "myrmex.delivery-policy/v1"},
+        "repository_root": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["autonomous", "interactive"]},
         "delivery": {
           "type": "object",
-          "required": [
-            "tracking_issue"
-          ],
+          "required": ["tracking_issue"],
           "properties": {
             "tracking_issue": {
               "type": "object",
-              "required": [
-                "required",
-                "reuse_matching_approved",
-                "create_when_missing",
-                "approval_marker",
-                "ask_on_ambiguous_match"
-              ],
+              "required": ["required", "reuse_matching_approved", "create_when_missing", "approval_marker", "ask_on_ambiguous_match"],
               "properties": {
-                "required": {
-                  "type": "boolean"
-                },
-                "reuse_matching_approved": {
-                  "type": "boolean"
-                },
-                "create_when_missing": {
-                  "type": "boolean"
-                },
-                "approval_marker": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128
-                },
-                "ask_on_ambiguous_match": {
-                  "type": "boolean"
-                }
+                "required": {"type": "boolean"},
+                "reuse_matching_approved": {"type": "boolean"},
+                "create_when_missing": {"type": "boolean"},
+                "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+                "ask_on_ambiguous_match": {"type": "boolean"}
               },
               "additionalProperties": false
             }
@@ -2245,68 +1762,23 @@
         },
         "decision": {
           "type": "object",
-          "required": [
-            "on_missing_tracking_issue",
-            "on_ambiguous_match",
-            "creation_policy"
-          ],
+          "required": ["on_missing_tracking_issue", "on_ambiguous_match", "creation_policy"],
           "properties": {
-            "on_missing_tracking_issue": {
-              "enum": [
-                "not-required",
-                "create",
-                "ask"
-              ]
-            },
-            "on_ambiguous_match": {
-              "enum": [
-                "ask",
-                "block"
-              ]
-            },
-            "creation_policy": {
-              "enum": [
-                "deny",
-                "ask",
-                "authorized"
-              ]
-            }
+            "on_missing_tracking_issue": {"enum": ["not-required", "create", "ask"]},
+            "on_ambiguous_match": {"enum": ["ask", "block"]},
+            "creation_policy": {"enum": ["deny", "ask", "authorized"]}
           },
           "additionalProperties": false
         },
-        "policy_digest": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "provenance": {
-          "type": "object"
-        },
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {"type": "object"},
         "inputs": {
           "type": "object",
-          "required": [
-            "run_authorization",
-            "repository_config",
-            "installation_profile"
-          ],
+          "required": ["run_authorization", "repository_config", "installation_profile"],
           "properties": {
-            "run_authorization": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "repository_config": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "installation_profile": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
+            "run_authorization": {"type": ["string", "null"]},
+            "repository_config": {"type": ["string", "null"]},
+            "installation_profile": {"type": ["string", "null"]}
           },
           "additionalProperties": false
         }
@@ -2334,68 +1806,22 @@
         "policy"
       ],
       "properties": {
-        "required": {
-          "type": "boolean"
-        },
-        "repo": {
-          "type": "string",
-          "minLength": 3
-        },
-        "title": {
-          "type": "string",
-          "minLength": 1
-        },
-        "body_file": {
-          "type": "string",
-          "minLength": 1
-        },
-        "receipt_file": {
-          "type": "string",
-          "minLength": 1
-        },
-        "objective_id": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-        },
-        "scope_digest": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "approval_marker": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
-        },
-        "reuse_matching_approved": {
-          "type": "boolean"
-        },
-        "create_when_missing": {
-          "type": "boolean"
-        },
-        "ask_on_ambiguous_match": {
-          "type": "boolean"
-        },
-        "creation_policy": {
-          "enum": [
-            "deny",
-            "ask",
-            "authorized"
-          ]
-        },
-        "ensure_approval": {
-          "type": "boolean"
-        },
-        "identity_marker": {
-          "type": "string",
-          "minLength": 1
-        },
-        "policy_digest": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "policy": {
-          "$ref": "#/$defs/deliveryPolicy"
-        }
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "objective_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "approval_marker": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reuse_matching_approved": {"type": "boolean"},
+        "create_when_missing": {"type": "boolean"},
+        "ask_on_ambiguous_match": {"type": "boolean"},
+        "creation_policy": {"enum": ["deny", "ask", "authorized"]},
+        "ensure_approval": {"type": "boolean"},
+        "identity_marker": {"type": "string", "minLength": 1},
+        "policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "policy": {"$ref": "#/$defs/deliveryPolicy"}
       },
       "additionalProperties": true
     },
@@ -2416,59 +1842,19 @@
         "body_digest"
       ],
       "properties": {
-        "required": {
-          "type": "boolean"
-        },
-        "repo": {
-          "type": "string",
-          "minLength": 3
-        },
-        "head": {
-          "type": "string",
-          "minLength": 1
-        },
-        "base": {
-          "type": "string",
-          "minLength": 1
-        },
-        "title": {
-          "type": "string",
-          "minLength": 1
-        },
-        "body_file": {
-          "type": "string",
-          "minLength": 1
-        },
-        "receipt_file": {
-          "type": "string",
-          "minLength": 1
-        },
-        "label": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "tracking_issue_operation_id": {
-          "type": "string",
-          "pattern": "^op-[0-9a-f]{24}$"
-        },
-        "tracking_issue_number": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "tracking_issue_url": {
-          "type": "string",
-          "format": "uri"
-        },
-        "tracking_issue_identity_marker": {
-          "type": "string",
-          "minLength": 1
-        },
-        "body_digest": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
-        }
+        "required": {"type": "boolean"},
+        "repo": {"type": "string", "minLength": 3},
+        "head": {"type": "string", "minLength": 1},
+        "base": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "body_file": {"type": "string", "minLength": 1},
+        "receipt_file": {"type": "string", "minLength": 1},
+        "label": {"type": ["string", "null"]},
+        "tracking_issue_operation_id": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+        "tracking_issue_number": {"type": "integer", "minimum": 1},
+        "tracking_issue_url": {"type": "string", "format": "uri"},
+        "tracking_issue_identity_marker": {"type": "string", "minLength": 1},
+        "body_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       },
       "additionalProperties": true
     }
