@@ -15,13 +15,19 @@ jobs:
           fetch-depth: 0
       - name: Decode and validate candidate patch
         run: |
-          echo 'a3b931ce8cf9fe5db75c83a2183fb381f2b16e1ea74e4575fd2c52fb7c4394f3  .github/stabilization.patch.xz.b64.00' | sha256sum --check
+          echo '68683c938874cd059ac4806302771bd4da6c76d5d5b50115243238d88da1b620  .github/stabilization.patch.xz.b64.00a' | sha256sum --check
+          echo 'bd55ac6e56bfed1e443735c48c4a957426ab970ab6343efb4c40f3a0644fab1e  .github/stabilization.patch.xz.b64.00b' | sha256sum --check
+          echo 'fc3de717f0192ebb026a8c89e97b18c065a485b1066f015cfabed694dd3b3ccd  .github/stabilization.patch.xz.b64.00c' | sha256sum --check
+          echo 'a2f0d89f745b5ee5e0f2bfaa314402683d9ea608b6bc0f4e5836ec1f32cb8a58  .github/stabilization.patch.xz.b64.00d' | sha256sum --check
           echo 'a35552102f2cd766bbf26f4d9aa56d7c4e32a6f4460a38597bc522208b809330  .github/stabilization.patch.xz.b64.01' | sha256sum --check
           echo '6560d9cd39f6b730b665ff8a2ba05da47f11bc50754a4e2e80e0caca91b3182f  .github/stabilization.patch.xz.b64.02' | sha256sum --check
           echo 'b87a657eea4728e57a4ee21412dac9a7320c0f9957cc2fe640d724d3599188b6  .github/stabilization.patch.xz.b64.03' | sha256sum --check
           echo '7474f3da79b4ee1635bb24ff8e6ac38f710ac74d89efe51b8bbe7fbb08288314  .github/stabilization.patch.xz.b64.04' | sha256sum --check
           cat \
-            .github/stabilization.patch.xz.b64.00 \
+            .github/stabilization.patch.xz.b64.00a \
+            .github/stabilization.patch.xz.b64.00b \
+            .github/stabilization.patch.xz.b64.00c \
+            .github/stabilization.patch.xz.b64.00d \
             .github/stabilization.patch.xz.b64.01 \
             .github/stabilization.patch.xz.b64.02 \
             .github/stabilization.patch.xz.b64.03 \
