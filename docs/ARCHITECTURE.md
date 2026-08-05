@@ -2,7 +2,7 @@
 
 ## Control plane
 
-`myrmex-orchestrator` owns intent/routing, user interaction, scope, local run state, semantic memory reads/writes, Git delivery, and final acceptance. It executes ordinary bounded work directly; in delegated/frontier routes it coordinates fresh-context agents.
+`myrmex-orchestrator` owns intent/routing, user interaction, scope, local run state, semantic memory reads/writes, Git delivery, and final acceptance. Every new persisted run resolves an explicit execution policy before effects: clear prompts select the route; ambiguous prompts use OpenCode `question` once and remain `unresolved` until the answer is persisted. It executes ordinary bounded work directly only when the resolved policy permits it; in delegated/frontier routes it coordinates fresh-context agents.
 
 ## Execution plane
 

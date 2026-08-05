@@ -44,7 +44,7 @@ Use autonomous frontier delegation for this narrow objective. Continue through i
 myrmex-state doctor
 myrmex-state list
 myrmex-state show <run-id>
-myrmex-state init --objective-file <file> --repository-root <repo> --artifact-root /absolute/external/run-root --mode autonomous --scope narrow
+myrmex-state init --objective-file <file> --repository-root <repo> --artifact-root /absolute/external/run-root --mode autonomous --scope narrow --execution-policy auto
 myrmex-state transition <run-id> --to-phase collecting-context --reason "context gathered" --expect-revision <n>
 myrmex-state route set <run-id> --policy direct-only --authority user --request-id <request-id> --expect-revision <n>
 myrmex-state reconcile <run-id>
@@ -66,6 +66,9 @@ myrmex-state operation <run-id> supersede --operation-id <failed-op-...> \
   --successor-operation-id <confirmed-op-...> --reason PRE_EFFECT_FAILURE --expect-revision <n>
 myrmex-state operation <run-id> abandon --operation-id <failed-op-...> \
   --pre-effect-absence-proven --reason PRE_EFFECT_FAILURE --expect-revision <n>
+myrmex-state recovery <run-id> resolve-frontier --operation-id <failed-op-...> \
+  --successor-operation-id <confirmed-op-...> --disposition supersede \
+  --reason PRE_EFFECT_FAILURE --expect-revision <n>
 myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{...}' --expect-revision <n>
 myrmex-state pause <run-id> --reason "pause requested" --expect-revision <n>
 myrmex-state resume <run-id> --expect-revision <n>
@@ -73,6 +76,23 @@ myrmex-state cancel <run-id> --reason "parent cancelled" --cancellation-type PAR
 myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
 myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --verification-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
+
+
+### Execution policy at run start
+
+A new run never silently defaults to `auto`. When the prompt clearly selects a
+mode, initialize with one of `auto`, `direct-only`, `delegated`, or
+`frontier-gated`. When it is ambiguous, omit the option (the persisted value is
+`unresolved`), call OpenCode `question` once, and then resolve it:
+
+```bash
+myrmex-state reconcile <run-id>  # REQUEST_EXECUTION_POLICY
+myrmex-state route set <run-id> --policy auto --authority user \
+  --request-id <answer-id> --source-digest <sha256> --expect-revision <n>
+```
+
+No Task, Frontier exchange, or other effect is allowed while policy is
+`unresolved`. Resume uses the persisted answer and never asks again.
 
 ### Bounded local commit
 

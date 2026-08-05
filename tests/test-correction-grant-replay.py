@@ -80,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-grant-replay-") as td:
     env = dict(os.environ, MYRMEX_STATE_HOME=str(Path(td) / "state"), PYTHONDONTWRITEBYTECODE="1")
     run_id = run(
         "init", "--run-id", "myrmex-grant-replay", "--objective", "Grant replay identity",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
 
     defects = json.loads(run(
@@ -163,7 +163,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-grant-replay-") as td:
     # remains idempotent.  The same checks cover a correction crash recovery.
     receipt_run = run(
         "init", "--run-id", "myrmex-receipt-conflict", "--objective", "Receipt conflict",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     start(receipt_run, env, revision=0, task_id="receipt-task", request_id="verify-receipt")
     finish(receipt_run, env, revision=1, task_id="receipt-task", evidence='{"result":"one"}')

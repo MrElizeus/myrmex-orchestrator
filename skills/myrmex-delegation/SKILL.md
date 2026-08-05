@@ -25,8 +25,9 @@ Use this skill when a normal coding objective benefits from fresh context, broad
 - Resolve an agent/model/provider through OpenCode precedence before delegation. Never treat an absent provider environment variable as proof that Task cannot route the agent.
 - `CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR` is informational. Only a real Task failure records `PROVIDER_INVOCATION_FAILED`; resolver-backed `AGENT_MODEL_UNRESOLVED` and `AGENT_NOT_INSTALLED` are blocking states.
 - For a persisted run, enforce `execution.requested_policy` before starting a
-  Task. `direct-only` forbids new delegation and must never be bypassed by a
-  resume or a correction loop.
+  Task. `unresolved` requires the one-time OpenCode policy question;
+  `direct-only` forbids new delegation; `frontier-gated` requires a confirmed
+  ACCEPT plan first. None may be bypassed by resume or a correction loop.
 
 ## Flow
 

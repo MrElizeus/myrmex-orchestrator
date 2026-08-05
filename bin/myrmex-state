@@ -38,13 +38,15 @@ PHASES = {
 }
 STATUSES = {"active", "blocked", "dormant", "failed", "cancelled", "superseded"}
 POLICIES = {"deny", "ask", "authorized", "governed"}
-EXECUTION_POLICIES = {"auto", "direct-only", "delegated", "frontier"}
-EFFECTIVE_ROUTES = {"auto", "direct", "delegated", "frontier"}
+EXECUTION_POLICIES = {"unresolved", "auto", "direct-only", "delegated", "frontier", "frontier-gated"}
+EFFECTIVE_ROUTES = {"unresolved", "auto", "direct", "delegated", "frontier"}
 EXECUTION_ROUTE = {
+    "unresolved": "unresolved",
     "auto": "auto",
     "direct-only": "direct",
     "delegated": "delegated",
     "frontier": "frontier",
+    "frontier-gated": "frontier",
 }
 PUSH_STATUSES = {"not_requested", "unauthorized", "pending", "pushed", "failed"}
 MEMORY_STATUSES = {"available", "degraded", "unavailable"}
@@ -124,6 +126,11 @@ PARENT_CANCELLATION_TYPE = "PARENT_OBJECTIVE_CANCELLED"
 RUN_CANCELLATION_TYPE = "RUN_CANCELLED"
 PAUSE_BLOCKER = "EXPLICIT_PAUSE"
 CLARIFICATION_BLOCKER = "BLOCKING_CLARIFICATION"
+RECOVERABLE_FRONTIER_BLOCKER_CODES = {
+    "BLOCKED_FRONTIER_RECOVERY_MISSING_ORIGINAL_IDENTITY",
+    "BLOCKED_FRONTIER_PRE_EFFECT_FAILURE",
+    "BLOCKED_FRONTIER_RECOVERY",
+}
 FRONTIER_TRANSPORT_STATUSES = {
     "success", "transport_error", "timeout", "malformed", "request_mismatch",
     "response_identity_mismatch",
@@ -148,6 +155,7 @@ GIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 AUTHORIZATION_ID_RE = re.compile(r"auth-[0-9a-f]{24}")
 WORK_UNIT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 OPERATION_ID_RE = re.compile(r"op-[0-9a-f]{24}")
+ATTEMPT_GROUP_RE = re.compile(r"attempt-[0-9a-f]{24}")
 GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 GITHUB_ISSUE_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)")
 GITHUB_PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
@@ -164,6 +172,7 @@ PROTECTED_PATCH_PATHS = {
     "phase",
     "status",
     "blocker",
+    "recovery",
     "execution",
     "commit_policy",
     "push_policy",
@@ -333,7 +342,9 @@ def normalize_legacy_state(data: dict[str, Any]) -> list[str]:
             "effective_route": "auto",
             "authority": "system",
             "request_id": None,
+            "source_digest": None,
             "set_at": data.get("created_at") or utcnow(),
+            "resolved_at": data.get("created_at") or utcnow(),
             "locked": False,
         }
         changes.append("initialized execution policy")
@@ -368,6 +379,15 @@ def ensure_v2_defaults(data: dict[str, Any]) -> None:
         data["pause"] = None
     if state_is_v2(data) and "cancellation" not in data:
         data["cancellation"] = None
+    if state_is_v2(data) and "recovery" not in data:
+        data["recovery"] = None
+    if state_is_v2(data) and isinstance(data.get("execution"), dict):
+        execution = data["execution"]
+        execution.setdefault("source_digest", None)
+        execution.setdefault(
+            "resolved_at",
+            None if execution.get("requested_policy") == "unresolved" else execution.get("set_at"),
+        )
 
 
 def parse_authorization_expiry(value: Any) -> dt.datetime | None:
@@ -773,17 +793,31 @@ def validate_execution(data: dict[str, Any], *, required: bool) -> None:
         return
     if not isinstance(execution, dict):
         raise SystemExit("execution must be an object")
-    if execution.get("requested_policy") not in EXECUTION_POLICIES:
+    policy = execution.get("requested_policy")
+    if policy not in EXECUTION_POLICIES:
         raise SystemExit("invalid requested execution policy")
-    expected_route = EXECUTION_ROUTE[execution["requested_policy"]]
+    expected_route = EXECUTION_ROUTE[policy]
     if execution.get("effective_route") != expected_route or execution.get("effective_route") not in EFFECTIVE_ROUTES:
         raise SystemExit("invalid effective execution route")
     if not isinstance(execution.get("authority"), str) or not execution["authority"]:
         raise SystemExit("execution authority must be a non-empty string")
     if execution.get("request_id") is not None and not isinstance(execution["request_id"], str):
         raise SystemExit("execution request_id must be a string or null")
+    source_digest = execution.get("source_digest")
+    if source_digest is not None and (not isinstance(source_digest, str) or not SHA256_RE.fullmatch(source_digest)):
+        raise SystemExit("execution source_digest must be a lowercase SHA-256 digest or null")
     if not isinstance(execution.get("set_at"), str) or not execution["set_at"]:
         raise SystemExit("execution set_at must be a timestamp string")
+    resolved_at = execution.get("resolved_at")
+    if policy == "unresolved":
+        if execution.get("effective_route") != "unresolved":
+            raise SystemExit("unresolved execution policy must use unresolved route")
+        if resolved_at is not None:
+            raise SystemExit("unresolved execution policy cannot have resolved_at")
+        if execution.get("locked") is not False:
+            raise SystemExit("unresolved execution policy cannot be locked")
+    elif resolved_at is not None and (not isinstance(resolved_at, str) or not resolved_at):
+        raise SystemExit("execution resolved_at must be a timestamp string or null")
     if not isinstance(execution.get("locked"), bool):
         raise SystemExit("execution locked must be boolean")
 
@@ -891,6 +925,8 @@ def validate_frontier_typed_fields(operation: dict[str, Any]) -> None:
             source = operation.get(source_name)
             if isinstance(source, dict) and frontier_message_id(source) is not None:
                 raise SystemExit("Frontier pre-effect absence proof conflicts with message identity")
+        if not frontier_resolution_evidence_complete(operation):
+            raise SystemExit("Frontier pre-effect absence proof requires complete structured evidence")
     for field in ("transport_status", "effective_transport_status"):
         if field in operation and operation[field] is not None:
             normalize_frontier_transport_status(operation[field])
@@ -1018,6 +1054,29 @@ def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None
                 not isinstance(link_value, str) or not OPERATION_ID_RE.fullmatch(link_value)
             ):
                 raise SystemExit(f"pending operation {link} must be a valid operation ID or null")
+        predecessor_ids = operation.get("predecessor_operation_ids")
+        if predecessor_ids is not None and (
+            not isinstance(predecessor_ids, list)
+            or len(set(predecessor_ids)) != len(predecessor_ids)
+            or not all(isinstance(item, str) and OPERATION_ID_RE.fullmatch(item) for item in predecessor_ids)
+        ):
+            raise SystemExit("pending operation predecessor_operation_ids must be unique operation IDs")
+        attempt_group_id = operation.get("attempt_group_id")
+        if attempt_group_id is not None and (
+            not isinstance(attempt_group_id, str) or not ATTEMPT_GROUP_RE.fullmatch(attempt_group_id)
+        ):
+            raise SystemExit("pending operation attempt_group_id must be an attempt ID or null")
+        terminal_disposition = operation.get("terminal_disposition")
+        if terminal_disposition is not None and terminal_disposition not in {
+            "completed_effect", "failed_attempt", "superseded", "abandoned", "ambiguous_effect",
+        }:
+            raise SystemExit("pending operation terminal_disposition is invalid")
+        resolution_evidence = operation.get("resolution_evidence")
+        if resolution_evidence is not None and not isinstance(resolution_evidence, dict):
+            raise SystemExit("pending operation resolution_evidence must be an object or null")
+        resolution_digest = operation.get("resolution_evidence_digest")
+        if resolution_digest is not None and (not isinstance(resolution_digest, str) or not SHA256_RE.fullmatch(resolution_digest)):
+            raise SystemExit("pending operation resolution_evidence_digest must be a lowercase SHA-256 digest")
         purpose_digest = operation.get("purpose_digest")
         if purpose_digest is not None:
             if not isinstance(purpose_digest, str) or not SHA256_RE.fullmatch(purpose_digest):
@@ -1183,10 +1242,56 @@ def validate_common_state(data: dict[str, Any]) -> None:
         raise SystemExit("revision must be a non-negative integer")
 
 
+def validate_recovery_context(data: dict[str, Any]) -> None:
+    recovery = data.get("recovery")
+    if recovery is None:
+        return
+    if not isinstance(recovery, dict):
+        raise SystemExit("recovery must be an object or null")
+    code = recovery.get("code")
+    if not isinstance(code, str) or not code:
+        raise SystemExit("recovery code must be a non-empty string")
+    status = recovery.get("status")
+    if status not in {"blocked", "resolved"}:
+        raise SystemExit("recovery status must be blocked or resolved")
+    operation_ids = recovery.get("operation_ids", [])
+    if not isinstance(operation_ids, list) or not all(
+        isinstance(item, str) and OPERATION_ID_RE.fullmatch(item) for item in operation_ids
+    ):
+        raise SystemExit("recovery operation_ids must be operation IDs")
+    resume_phase = recovery.get("resume_phase")
+    if resume_phase is not None and (resume_phase not in PHASES or PHASE_STATUS[resume_phase] != "active"):
+        raise SystemExit("recovery resume_phase must be an active phase or null")
+    blocked_revision = recovery.get("blocked_at_revision")
+    if blocked_revision is not None and (not isinstance(blocked_revision, int) or blocked_revision < 0):
+        raise SystemExit("recovery blocked_at_revision must be a non-negative integer or null")
+    evidence_digest = recovery.get("evidence_digest")
+    if evidence_digest is not None and (not isinstance(evidence_digest, str) or not SHA256_RE.fullmatch(evidence_digest)):
+        raise SystemExit("recovery evidence_digest must be a lowercase SHA-256 digest or null")
+    remaining = recovery.get("remaining_operation_ids", [])
+    if not isinstance(remaining, list) or len(set(remaining)) != len(remaining) or not all(
+        isinstance(item, str) and OPERATION_ID_RE.fullmatch(item) for item in remaining
+    ):
+        raise SystemExit("recovery remaining_operation_ids must be unique operation IDs")
+    for field in ("resolved_operation_id", "successor_operation_id"):
+        value = recovery.get(field)
+        if value is not None and (not isinstance(value, str) or not OPERATION_ID_RE.fullmatch(value)):
+            raise SystemExit(f"recovery {field} must be an operation ID or null")
+    recorded_at = recovery.get("recorded_at")
+    if recorded_at is not None and (not isinstance(recorded_at, str) or not recorded_at):
+        raise SystemExit("recovery recorded_at must be a timestamp string or null")
+    resolved_at = recovery.get("resolved_at")
+    if status == "resolved" and (not isinstance(resolved_at, str) or not resolved_at):
+        raise SystemExit("resolved recovery requires resolved_at")
+    if status == "blocked" and resolved_at is not None:
+        raise SystemExit("blocked recovery cannot have resolved_at")
+
+
 def validate_state(data: dict[str, Any]) -> None:
     validate_common_state(data)
     is_v2 = state_is_v2(data)
     validate_execution(data, required=is_v2)
+    validate_recovery_context(data)
     validate_pending_operations(data, required=False)
     validate_frontier_artifact_roots(data)
     validate_authorizations(data, required=False)
@@ -1464,6 +1569,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     assert objective is not None
     if not objective.strip():
         raise SystemExit("objective cannot be empty")
+    if args.execution_source_digest is not None and not SHA256_RE.fullmatch(args.execution_source_digest):
+        raise SystemExit("--execution-source-digest must be a lowercase SHA-256 digest")
+    if args.execution_policy == "direct-only" and args.execution_authority not in {None, "user"}:
+        raise SystemExit("direct-only execution policy requires user authority")
     repo = str(Path(args.repository_root).expanduser().resolve())
     now = utcnow()
     run_id = args.run_id or (
@@ -1504,12 +1613,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         "commit_sha": None,
         "push_status": "not_requested" if args.push_policy == "deny" else "unauthorized",
         "execution": {
-            "requested_policy": "auto",
-            "effective_route": "auto",
-            "authority": "system",
-            "request_id": None,
+            "requested_policy": args.execution_policy,
+            "effective_route": EXECUTION_ROUTE[args.execution_policy],
+            "authority": (args.execution_authority or ("system" if args.execution_policy == "unresolved" else "prompt")),
+            "request_id": args.execution_request_id,
+            "source_digest": args.execution_source_digest,
             "set_at": now,
-            "locked": False,
+            "resolved_at": None if args.execution_policy == "unresolved" else now,
+            "locked": args.execution_policy == "direct-only",
         },
         "blocker": None,
         "budgets": {
@@ -1546,6 +1657,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "clarification": None,
         "pause": None,
         "cancellation": None,
+        "recovery": None,
         "revision": -1,
         "created_at": now,
         "updated_at": now,
@@ -1640,12 +1752,33 @@ def cmd_transition(args: argparse.Namespace) -> int:
     data["phase"] = target_phase
     data["status"] = target_status
     data["blocker"] = args.blocker if target_status == "blocked" else None
+    if target_status == "blocked":
+        operation_ids = args.recovery_operation_id or []
+        if args.recovery_code is not None:
+            if args.recovery_resume_phase is not None and args.recovery_resume_phase != previous_phase:
+                raise SystemExit("--recovery-resume-phase must match the phase being blocked")
+            if args.recovery_evidence_digest is not None and not SHA256_RE.fullmatch(args.recovery_evidence_digest):
+                raise SystemExit("--recovery-evidence-digest must be a lowercase SHA-256 digest")
+            data["recovery"] = {
+                "code": args.recovery_code,
+                "status": "blocked",
+                "operation_ids": operation_ids,
+                "blocked_at_revision": data["revision"] + 1,
+                "resume_phase": previous_phase,
+                "evidence_digest": args.recovery_evidence_digest,
+                "recorded_at": utcnow(),
+            }
+        else:
+            data["recovery"] = None
+    else:
+        data["recovery"] = None
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "state.transitioned", args.reason, {
         "from_phase": previous_phase,
         "to_phase": target_phase,
         "to_status": target_status,
         "blocker": data["blocker"],
+        "recovery": data.get("recovery"),
         "reason": args.reason,
         "revision": saved["revision"],
     })
@@ -1749,14 +1882,28 @@ def route_change_blockers(data: dict[str, Any]) -> list[str]:
     return blockers
 
 
+def has_confirmed_frontier_plan(data: dict[str, Any]) -> bool:
+    return any(
+        isinstance(operation, dict)
+        and operation.get("kind") == "frontier_exchange"
+        and operation_is_effectively_confirmed(operation)
+        and (operation.get("frontier_decision") or operation.get("effective_frontier_decision")) == "ACCEPT"
+        and (operation.get("response_type") == "plan" or operation.get("effective_response_type") == "plan")
+        for operation in data.get("pending_operations", [])
+    )
+
+
 def ensure_route_allows(data: dict[str, Any], action: str) -> None:
-    """Enforce the persisted direct-only policy at stateful entry points."""
+    """Enforce the persisted execution policy at stateful effect boundaries."""
     policy = data["execution"]["requested_policy"]
-    if policy != "direct-only":
-        return
-    if action in {"delegation", "frontier"}:
-        raise SystemExit("BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY")
-    raise SystemExit(f"unsupported execution-policy action: {action}")
+    if policy == "unresolved":
+        raise SystemExit("BLOCKED_EXECUTION_POLICY_UNRESOLVED")
+    if policy == "direct-only":
+        if action in {"delegation", "frontier"}:
+            raise SystemExit("BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY")
+        raise SystemExit(f"unsupported execution-policy action: {action}")
+    if policy == "frontier-gated" and action == "delegation" and not has_confirmed_frontier_plan(data):
+        raise SystemExit("BLOCKED_FRONTIER_PLAN_REQUIRED_BY_EXECUTION_POLICY")
 
 
 def resolve_route_positionals(args: argparse.Namespace) -> tuple[str, str]:
@@ -1795,11 +1942,16 @@ def cmd_route(args: argparse.Namespace) -> int:
         raise SystemExit("route set requires --policy, --authority, and --request-id")
     current = data["execution"]
     policy = args.policy
+    if policy == "unresolved":
+        raise SystemExit("route set cannot persist unresolved; choose an execution policy")
+    if args.source_digest is not None and not SHA256_RE.fullmatch(args.source_digest):
+        raise SystemExit("--source-digest must be a lowercase SHA-256 digest")
     target_identity = {
         "requested_policy": policy,
         "effective_route": EXECUTION_ROUTE[policy],
         "authority": args.authority,
         "request_id": args.request_id,
+        "source_digest": args.source_digest if args.source_digest is not None else current.get("source_digest"),
         "locked": policy == "direct-only",
     }
     # A retry of the exact request is harmless and must remain idempotent even
@@ -1827,9 +1979,11 @@ def cmd_route(args: argparse.Namespace) -> int:
         if blockers:
             raise SystemExit("BLOCKED_ROUTE_CHANGE_PENDING_WORK: " + "; ".join(blockers))
 
+    resolved_at = utcnow()
     target = {
         **target_identity,
-        "set_at": utcnow(),
+        "set_at": resolved_at,
+        "resolved_at": resolved_at,
     }
     previous = dict(current)
     data["execution"] = target
@@ -2563,6 +2717,164 @@ def validate_purpose_digest_continuity(predecessor: dict[str, Any], successor: d
         raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_DIGEST_MISMATCH")
 
 
+def frontier_resolution_evidence_complete(operation: dict[str, Any]) -> bool:
+    effect = operation.get("effect")
+    receipt = operation.get("receipt")
+    if pre_effect_absence_evidence_complete(
+        effect if isinstance(effect, dict) else {},
+        receipt if isinstance(receipt, dict) else {},
+    ):
+        return True
+    resolution = operation.get("resolution_evidence")
+    if not isinstance(resolution, dict):
+        return False
+    return pre_effect_absence_evidence_complete(
+        resolution.get("effect"), resolution.get("receipt"),
+    )
+
+
+def recovery_blocker_code(data: dict[str, Any]) -> str | None:
+    recovery = data.get("recovery")
+    if isinstance(recovery, dict) and isinstance(recovery.get("code"), str):
+        return recovery["code"]
+    blocker = data.get("blocker")
+    if not isinstance(blocker, str) or not blocker:
+        return None
+    return blocker.split(":", 1)[0].strip()
+
+
+def is_recoverable_frontier_blocker(data: dict[str, Any]) -> bool:
+    return recovery_blocker_code(data) in RECOVERABLE_FRONTIER_BLOCKER_CODES
+
+
+def frontier_successor_candidates(data: dict[str, Any], predecessor: dict[str, Any]) -> list[dict[str, Any]]:
+    explicit = predecessor.get("successor_operation_id")
+    operations = [item for item in data.get("pending_operations", []) if isinstance(item, dict)]
+    if isinstance(explicit, str):
+        return [item for item in operations if item.get("operation_id") == explicit and operation_is_effectively_confirmed(item)]
+    linked = [
+        item for item in operations
+        if item.get("kind") == "frontier_exchange"
+        and operation_is_effectively_confirmed(item)
+        and (
+            item.get("predecessor_operation_id") == predecessor.get("operation_id")
+            or predecessor.get("operation_id") in item.get("predecessor_operation_ids", [])
+        )
+    ]
+    if linked:
+        return linked
+    candidates: list[dict[str, Any]] = []
+    predecessor_purpose = operation_purpose(predecessor)
+    generic_legacy_purpose = predecessor_purpose == (
+        "frontier_exchange", "frontier_exchange", False, None, None,
+    )
+    for item in operations:
+        if item.get("kind") != "frontier_exchange" or not operation_is_effectively_confirmed(item):
+            continue
+        if item.get("operation_id") == predecessor.get("operation_id"):
+            continue
+        if predecessor_purpose != operation_purpose(item):
+            continue
+        predecessor_digest = predecessor.get("purpose_digest")
+        successor_digest = item.get("purpose_digest")
+        if predecessor_digest is not None and predecessor_digest != successor_digest:
+            continue
+        # Legacy records without a digest may be auto-matched only when their
+        # persisted purpose is specific. Generic Frontier intents require an
+        # explicit successor ID from the typed recovery authority.
+        if predecessor_digest is None and generic_legacy_purpose:
+            continue
+        if str(item.get("created_at") or "") < str(predecessor.get("created_at") or ""):
+            continue
+        candidates.append(item)
+    return candidates
+
+
+def confirmed_frontier_successor(data: dict[str, Any], predecessor: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = frontier_successor_candidates(data, predecessor)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def parse_frontier_resolution_evidence(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    evidence = parse_object_json(value, "--evidence-json")
+    effect = evidence.get("effect")
+    receipt = evidence.get("receipt")
+    if not pre_effect_absence_evidence_complete(effect, receipt):
+        raise SystemExit("FRONTIER_RESOLUTION_REQUIRES_COMPLETE_STRUCTURED_EVIDENCE")
+    authority = evidence.get("authority")
+    source = evidence.get("source")
+    if not isinstance(authority, str) or not authority.strip():
+        raise SystemExit("FRONTIER_RESOLUTION_EVIDENCE_AUTHORITY_REQUIRED")
+    if not isinstance(source, str) or not source.strip():
+        raise SystemExit("FRONTIER_RESOLUTION_EVIDENCE_SOURCE_REQUIRED")
+    normalized = {
+        "effect": sanitize_evidence(effect),
+        "receipt": sanitize_evidence(receipt),
+        "authority": authority.strip(),
+        "source": source.strip(),
+    }
+    return normalized
+
+
+def apply_frontier_resolution_evidence(
+    operation: dict[str, Any], evidence: dict[str, Any] | None, *, explicit: bool,
+) -> None:
+    if frontier_resolution_evidence_complete(operation):
+        operation["effect_stage"] = "none"
+        operation["pre_effect_absence_proven"] = True
+        return
+    if not explicit:
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRED")
+    if evidence is None:
+        raise SystemExit("FRONTIER_RESOLUTION_EVIDENCE_REQUIRED")
+    encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    operation["resolution_evidence"] = {**evidence, "recorded_at": utcnow()}
+    operation["resolution_evidence_digest"] = hashlib.sha256(encoded).hexdigest()
+    operation["effect_stage"] = "none"
+    operation["pre_effect_absence_proven"] = True
+
+
+def finalize_frontier_supersession(
+    data: dict[str, Any], predecessor: dict[str, Any], successor: dict[str, Any], *,
+    reason: str, explicit_pre_effect_proof: bool = False,
+    resolution_evidence: dict[str, Any] | None = None,
+) -> bool:
+    if predecessor.get("status") == "superseded":
+        if predecessor.get("successor_operation_id") == successor.get("operation_id"):
+            return False
+        raise SystemExit("OPERATION_RESOLUTION_CONFLICT")
+    if predecessor.get("kind") != "frontier_exchange" or successor.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_SUPERSESSION_WRONG_KIND")
+    if predecessor.get("status") != "failed":
+        raise SystemExit("FRONTIER_SUPERSESSION_REQUIRES_FAILED_PREDECESSOR")
+    if not operation_is_effectively_confirmed(successor):
+        raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
+    if operation_purpose(predecessor) != operation_purpose(successor):
+        raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+    validate_purpose_digest_continuity(predecessor, successor)
+    apply_frontier_resolution_evidence(
+        predecessor, resolution_evidence, explicit=explicit_pre_effect_proof,
+    )
+    now = utcnow()
+    predecessor["status"] = "superseded"
+    predecessor["terminal_reason"] = reason
+    predecessor["terminal_disposition"] = "superseded"
+    predecessor["successor_operation_id"] = successor["operation_id"]
+    predecessor["confirmed_at"] = now
+    predecessor["updated_at"] = now
+    predecessor_ids = successor.setdefault("predecessor_operation_ids", [])
+    if predecessor["operation_id"] not in predecessor_ids:
+        predecessor_ids.append(predecessor["operation_id"])
+    if successor.get("predecessor_operation_id") is None:
+        successor["predecessor_operation_id"] = predecessor["operation_id"]
+    successor["attempt_group_id"] = successor.get("attempt_group_id") or predecessor.get("attempt_group_id")
+    predecessor["attempt_group_id"] = predecessor.get("attempt_group_id") or successor.get("attempt_group_id")
+    successor["updated_at"] = now
+    return True
+
+
 def mark_pre_effect_absence_proven(operation: dict[str, Any], *, explicit: bool) -> None:
     """Promote an operator's explicit absence proof without guessing from a timeout.
 
@@ -2582,10 +2894,7 @@ def mark_pre_effect_absence_proven(operation: dict[str, Any], *, explicit: bool)
         raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_RECORDED_EFFECT")
     effect = operation.get("effect")
     receipt = operation.get("receipt")
-    if not pre_effect_absence_evidence_complete(
-        effect if isinstance(effect, dict) else {},
-        receipt if isinstance(receipt, dict) else {},
-    ):
+    if not frontier_resolution_evidence_complete(operation):
         raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRES_COMPLETE_STRUCTURED_EVIDENCE")
     for source in (effect, receipt):
         if isinstance(source, dict) and source.get("transport_status") == "success":
@@ -2625,7 +2934,7 @@ def validate_successor_operation(
 
 
 def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> int:
-    """Resolve a safe no-effect operation without rewriting its evidence."""
+    """Resolve a safe no-effect Frontier operation without rewriting history."""
     require_nonterminal_run(data, f"operation {args.operation_action}")
     if args.operation_id is None:
         raise SystemExit(f"operation {args.operation_action} requires --operation-id")
@@ -2635,20 +2944,30 @@ def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> 
     expected_status = "superseded" if args.operation_action == "supersede" else "abandoned"
     if operation.get("status") == expected_status:
         requested_successor = args.successor_operation_id
-        if operation.get("terminal_reason") == reason and operation.get("successor_operation_id") == requested_successor:
+        if operation.get("successor_operation_id") == requested_successor:
             print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
             return 0
         raise SystemExit("OPERATION_RESOLUTION_CONFLICT")
+
     successor = None
     if args.operation_action == "supersede":
         if args.successor_operation_id is None:
             raise SystemExit("operation supersede requires --successor-operation-id")
         successor = find_operation(data, args.successor_operation_id)
-        validate_successor_operation(
-            operation, successor, explicit_pre_effect_proof=explicit_proof,
+        finalize_frontier_supersession(
+            data, operation, successor, reason=reason,
+            explicit_pre_effect_proof=explicit_proof,
         )
     else:
         require_safe_operation_resolution(operation, explicit_pre_effect_proof=explicit_proof)
+        if operation.get("kind") != "frontier_exchange":
+            raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_FRONTIER_ONLY")
+        now = utcnow()
+        operation["status"] = "abandoned"
+        operation["terminal_reason"] = reason
+        operation["terminal_disposition"] = "abandoned"
+        operation["confirmed_at"] = now
+        operation["updated_at"] = now
         if args.successor_operation_id is not None:
             successor = find_operation(data, args.successor_operation_id)
             if not operation_is_effectively_confirmed(successor):
@@ -2656,22 +2975,161 @@ def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> 
             if operation_purpose(operation) != operation_purpose(successor):
                 raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
             validate_purpose_digest_continuity(operation, successor)
+            operation["successor_operation_id"] = successor["operation_id"]
+            predecessor_ids = successor.setdefault("predecessor_operation_ids", [])
+            if operation["operation_id"] not in predecessor_ids:
+                predecessor_ids.append(operation["operation_id"])
+            if successor.get("predecessor_operation_id") is None:
+                successor["predecessor_operation_id"] = operation["operation_id"]
+            successor["updated_at"] = now
 
-    now = utcnow()
-    operation["status"] = expected_status
-    operation["terminal_reason"] = reason
-    operation["confirmed_at"] = now
-    operation["updated_at"] = now
-    if successor is not None:
-        operation["successor_operation_id"] = successor["operation_id"]
-        if successor.get("predecessor_operation_id") not in {None, operation["operation_id"]}:
-            raise SystemExit("OPERATION_SUCCESSOR_ALREADY_LINKED")
-        successor["predecessor_operation_id"] = operation["operation_id"]
-        successor["updated_at"] = now
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, f"operation.{args.operation_action}", reason, {
         "operation_id": operation["operation_id"],
         "successor_operation_id": operation.get("successor_operation_id"),
+        "revision": saved["revision"],
+    })
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def resolve_recovery_resume_phase(data: dict[str, Any], explicit_phase: str | None) -> str:
+    recovery = data.get("recovery")
+    persisted = recovery.get("resume_phase") if isinstance(recovery, dict) else None
+    if explicit_phase is not None and persisted is not None and explicit_phase != persisted:
+        raise SystemExit("RECOVERY_RESUME_PHASE_CONFLICT")
+    candidate = explicit_phase or persisted
+    if candidate is None:
+        raise SystemExit("RECOVERY_RESUME_PHASE_REQUIRED_FOR_LEGACY_BLOCKER")
+    if candidate not in PHASES or PHASE_STATUS[candidate] != "active":
+        raise SystemExit("RECOVERY_RESUME_PHASE_MUST_BE_ACTIVE")
+    return candidate
+
+
+def cmd_recovery(args: argparse.Namespace) -> int:
+    data = read_state(args.run_id)
+    require_v2(data, "recovery")
+    ensure_v2_defaults(data)
+    require_nonterminal_run(data, "recovery")
+    if args.recovery_action != "resolve-frontier":
+        raise SystemExit("unsupported recovery action")
+    if not isinstance(args.operation_id, str):
+        raise SystemExit("recovery resolve-frontier requires --operation-id")
+    predecessor = find_operation(data, args.operation_id)
+    if predecessor.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_RECOVERY_WRONG_KIND")
+    persisted_recovery = data.get("recovery") if isinstance(data.get("recovery"), dict) else {}
+    if persisted_recovery.get("status") in {"blocked", "resolved"}:
+        if (
+            args.disposition == "supersede"
+            and predecessor.get("status") == "superseded"
+            and predecessor.get("successor_operation_id") == (
+                args.successor_operation_id or persisted_recovery.get("successor_operation_id")
+            )
+        ):
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.disposition == "abandon" and predecessor.get("status") == "abandoned":
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+    if data["revision"] != args.expect_revision:
+        raise SystemExit(
+            f"revision conflict for {args.run_id}: expected {args.expect_revision}, observed {data['revision']}"
+        )
+    if data.get("status") == "blocked" and not is_recoverable_frontier_blocker(data):
+        raise SystemExit("RECOVERY_CANNOT_CLEAR_UNRELATED_BLOCKER")
+    evidence = parse_frontier_resolution_evidence(args.evidence_json)
+    successor = None
+    if args.successor_operation_id is not None:
+        successor = find_operation(data, args.successor_operation_id)
+    elif args.disposition == "supersede":
+        successor = confirmed_frontier_successor(data, predecessor)
+        if successor is None:
+            candidates = frontier_successor_candidates(data, predecessor)
+            if len(candidates) > 1:
+                raise SystemExit("FRONTIER_RECOVERY_SUCCESSOR_AMBIGUOUS")
+            raise SystemExit("FRONTIER_RECOVERY_CONFIRMED_SUCCESSOR_REQUIRED")
+
+    reason = args.reason or "PRE_EFFECT_FAILURE"
+    if args.disposition == "supersede":
+        assert successor is not None
+        finalize_frontier_supersession(
+            data, predecessor, successor, reason=reason,
+            explicit_pre_effect_proof=bool(args.pre_effect_absence_proven),
+            resolution_evidence=evidence,
+        )
+    else:
+        if predecessor.get("status") == "abandoned":
+            if predecessor.get("terminal_reason") != reason:
+                raise SystemExit("OPERATION_RESOLUTION_CONFLICT")
+        else:
+            if predecessor.get("status") != "failed":
+                raise SystemExit("FRONTIER_ABANDON_REQUIRES_FAILED_OPERATION")
+            apply_frontier_resolution_evidence(
+                predecessor, evidence, explicit=bool(args.pre_effect_absence_proven),
+            )
+            now = utcnow()
+            predecessor["status"] = "abandoned"
+            predecessor["terminal_reason"] = reason
+            predecessor["terminal_disposition"] = "abandoned"
+            predecessor["confirmed_at"] = now
+            predecessor["updated_at"] = now
+
+    previous_phase = data.get("phase")
+    recovery = data.get("recovery") if isinstance(data.get("recovery"), dict) else {}
+    recovery_targets = list(recovery.get("operation_ids", []))
+    if data.get("status") == "blocked" and not recovery_targets:
+        recovery_targets = [
+            item["operation_id"] for item in data.get("pending_operations", [])
+            if isinstance(item, dict)
+            and item.get("kind") == "frontier_exchange"
+            and item.get("status") == "failed"
+            and operation_effective_status(item) != "confirmed"
+        ]
+    operation_ids = list(dict.fromkeys([
+        *recovery_targets,
+        predecessor["operation_id"],
+        *([successor["operation_id"]] if successor is not None else []),
+    ]))
+    unresolved_target_ids = []
+    for operation_id_value in recovery_targets:
+        candidate = find_operation(data, operation_id_value)
+        if (
+            candidate.get("kind") == "frontier_exchange"
+            and candidate.get("status") == "failed"
+            and operation_effective_status(candidate) != "confirmed"
+        ):
+            unresolved_target_ids.append(operation_id_value)
+
+    resumed_phase = None
+    still_blocked = data.get("status") == "blocked" and bool(unresolved_target_ids)
+    if data.get("status") == "blocked" and not still_blocked:
+        resumed_phase = resolve_recovery_resume_phase(data, args.resume_phase)
+        data["phase"] = resumed_phase
+        data["status"] = "active"
+        data["blocker"] = None
+    data["recovery"] = {
+        "code": recovery_blocker_code(data) or recovery.get("code") or "BLOCKED_FRONTIER_PRE_EFFECT_FAILURE",
+        "status": "blocked" if still_blocked else "resolved",
+        "operation_ids": operation_ids,
+        "blocked_at_revision": recovery.get("blocked_at_revision"),
+        "resume_phase": resumed_phase or recovery.get("resume_phase"),
+        "evidence_digest": predecessor.get("resolution_evidence_digest") or recovery.get("evidence_digest"),
+        "recorded_at": recovery.get("recorded_at") or utcnow(),
+        "resolved_at": None if still_blocked else utcnow(),
+        "resolved_operation_id": predecessor["operation_id"],
+        "successor_operation_id": successor.get("operation_id") if successor else None,
+        "remaining_operation_ids": unresolved_target_ids,
+        "reason": reason,
+    }
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "recovery.frontier_resolved", reason, {
+        "operation_id": predecessor["operation_id"],
+        "successor_operation_id": successor.get("operation_id") if successor else None,
+        "disposition": args.disposition,
+        "from_phase": previous_phase,
+        "resume_phase": resumed_phase,
+        "remaining_operation_ids": unresolved_target_ids,
         "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
@@ -3536,6 +3994,17 @@ def cmd_authorization(args: argparse.Namespace) -> int:
     return 0
 
 
+def frontier_retry_projection(data: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
+    projected = copy.deepcopy(data)
+    status = operation.get("status")
+    projected["retry_result"] = {
+        "successor_operation_id": operation.get("operation_id"),
+        "successor_status": status,
+        "transport_required": status == "intent" and operation.get("effect") is None and operation.get("receipt") is None,
+    }
+    return projected
+
+
 def cmd_frontier_retry(args: argparse.Namespace) -> int:
     """Create a linked, idempotent retry for a proven pre-effect failure.
 
@@ -3584,10 +4053,16 @@ def cmd_frontier_retry(args: argparse.Namespace) -> int:
         data, kind="frontier_exchange", idempotency_key=key, intent=intent,
     )
     if not created:
-        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(frontier_retry_projection(data, operation), indent=2, ensure_ascii=False, sort_keys=True))
         return 0
     operation["predecessor_operation_id"] = predecessor["operation_id"]
+    operation["predecessor_operation_ids"] = [predecessor["operation_id"]]
     operation["purpose_digest"] = frontier_purpose_digest(data, operation["intent"])
+    operation["attempt_group_id"] = predecessor.get("attempt_group_id") or f"attempt-{operation['purpose_digest'][:24]}"
+    predecessor["attempt_group_id"] = operation["attempt_group_id"]
+    if predecessor.get("successor_operation_id") not in {None, operation["operation_id"]}:
+        raise SystemExit("OPERATION_SUCCESSOR_ALREADY_LINKED")
+    predecessor["successor_operation_id"] = operation["operation_id"]
     validate_purpose_digest_continuity(predecessor, operation)
     data["last_request_id"] = args.request_id
     data["frontier_task_id"] = task_id
@@ -3603,7 +4078,7 @@ def cmd_frontier_retry(args: argparse.Namespace) -> int:
         "request_id": args.request_id,
         "revision": saved["revision"],
     })
-    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(frontier_retry_projection(saved, operation), indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -3681,8 +4156,16 @@ def cmd_frontier(args: argparse.Namespace) -> int:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
     operation["purpose_digest"] = frontier_purpose_digest(data, operation["intent"])
+    operation["attempt_group_id"] = (
+        predecessor.get("attempt_group_id") if predecessor is not None else None
+    ) or f"attempt-{operation['purpose_digest'][:24]}"
     if predecessor is not None:
         operation["predecessor_operation_id"] = predecessor["operation_id"]
+        operation["predecessor_operation_ids"] = [predecessor["operation_id"]]
+        predecessor["attempt_group_id"] = operation["attempt_group_id"]
+        if predecessor.get("successor_operation_id") not in {None, operation["operation_id"]}:
+            raise SystemExit("OPERATION_SUCCESSOR_ALREADY_LINKED")
+        predecessor["successor_operation_id"] = operation["operation_id"]
         validate_purpose_digest_continuity(predecessor, operation)
     data["last_request_id"] = args.request_id
     data["frontier_task_id"] = args.task_id
@@ -4232,6 +4715,10 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
             operation["proposed_plan"] = proposed_plan
     operation["status"] = terminal_status
     operation["terminal_reason"] = reason
+    operation["terminal_disposition"] = (
+        "completed_effect" if terminal_status == "confirmed"
+        else ("failed_attempt" if effect_stage == "none" and absence_proven else "ambiguous_effect")
+    )
     operation["confirmed_at"] = now
     operation["updated_at"] = now
     if terminal_status == "confirmed" and response_type is not None:
@@ -4242,11 +4729,21 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
             )
         elif response_type == "blocking_clarification":
             apply_blocking_clarification(data, operation, effect, receipt)
+    auto_superseded = None
+    if terminal_status == "confirmed" and isinstance(operation.get("predecessor_operation_id"), str):
+        predecessor = find_operation(data, operation["predecessor_operation_id"])
+        if is_pre_effect_frontier_failure(predecessor):
+            if finalize_frontier_supersession(
+                data, predecessor, operation, reason="PRE_EFFECT_RETRY_SUCCEEDED",
+            ):
+                auto_superseded = predecessor["operation_id"]
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "frontier.result_recorded", reason, {
         "operation_id": operation["operation_id"], "transport_status": status,
         "frontier_decision": decision, "request_id": request_id,
-        "message_id": message_id, "status": terminal_status, "revision": saved["revision"],
+        "message_id": message_id, "status": terminal_status,
+        "auto_superseded_operation_id": auto_superseded,
+        "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
@@ -4317,6 +4814,7 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
         "effect_stage": effect_stage,
         "effect": effect, "receipt": receipt,
     }
+    operation["terminal_disposition"] = "completed_effect"
     if response_type is not None:
         operation["effective_response_type"] = response_type
         proposed_plan = proposed_plan_from_sources(effect, receipt)
@@ -4329,11 +4827,21 @@ def cmd_frontier_recover(args: argparse.Namespace) -> int:
             )
         elif response_type == "blocking_clarification":
             apply_blocking_clarification(data, operation, effect, receipt)
+    auto_superseded = None
+    if isinstance(operation.get("predecessor_operation_id"), str):
+        predecessor = find_operation(data, operation["predecessor_operation_id"])
+        if is_pre_effect_frontier_failure(predecessor):
+            if finalize_frontier_supersession(
+                data, predecessor, operation, reason="PRE_EFFECT_RETRY_RECOVERED",
+            ):
+                auto_superseded = predecessor["operation_id"]
     saved = write_state(data, args.expect_revision)
     append_event(args.run_id, "frontier.operation_recovered", "legacy failed Frontier operation recovered", {
         "operation_id": operation["operation_id"], "recovery_id": entry["recovery_id"],
         "transport_status": status, "frontier_decision": decision,
-        "request_id": request_id, "message_id": message_id, "revision": saved["revision"],
+        "request_id": request_id, "message_id": message_id,
+        "auto_superseded_operation_id": auto_superseded,
+        "revision": saved["revision"],
     })
     print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
@@ -4394,6 +4902,25 @@ def require_continuous_work_unit_provenance(data: dict[str, Any], work_unit_id: 
         raise SystemExit("BLOCKED_CONCURRENT_ACTIVE_WORK_UNIT")
 
 
+def delegation_attempt_group_id(work_unit_id: str, role: str, workspace: str) -> str:
+    encoded = "\0".join(("delegation", work_unit_id, role, workspace)).encode()
+    return "attempt-" + hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def latest_delegation_attempt_in_group(
+    data: dict[str, Any], attempt_group_id: str, *, exclude_operation_id: str | None = None,
+) -> dict[str, Any] | None:
+    for candidate in reversed(data.get("pending_operations", [])):
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("kind") == "delegation"
+            and candidate.get("attempt_group_id") == attempt_group_id
+            and candidate.get("operation_id") != exclude_operation_id
+        ):
+            return candidate
+    return None
+
+
 def cmd_delegation_preflight(args: argparse.Namespace) -> int:
     """Record WU/task/workspace identity before launching a Task side effect."""
     data = read_state(args.run_id)
@@ -4408,6 +4935,7 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
     work_unit_id = require_work_unit_id(args.work_unit_id)
     workspace = accessible_workspace(args.workspace)
     workspace_repository_root, workspace_branch = workspace_git_identity(workspace)
+    attempt_group_id = delegation_attempt_group_id(work_unit_id, args.role, workspace)
     intent = {
         "task_id": args.task_id,
         "work_unit_id": work_unit_id,
@@ -4459,6 +4987,15 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
     if not created:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
+    operation["attempt_group_id"] = attempt_group_id
+    predecessor = latest_delegation_attempt_in_group(
+        data, attempt_group_id, exclude_operation_id=operation["operation_id"],
+    )
+    if predecessor is not None and predecessor.get("status") == "failed":
+        operation["predecessor_operation_id"] = predecessor["operation_id"]
+        operation["predecessor_operation_ids"] = [predecessor["operation_id"]]
+        predecessor["successor_operation_id"] = operation["operation_id"]
+        predecessor["updated_at"] = utcnow()
     work_unit = get_or_create_work_unit(data, work_unit_id)
     entry = {
         "agent": args.agent, "role": args.role, "reason": args.reason,
@@ -4466,6 +5003,7 @@ def cmd_delegation_preflight(args: argparse.Namespace) -> int:
         "attempt": data["attempts"][args.role + "s"] + 1,
         "started_at": utcnow(), "completed_at": None, "status": "started", "outcome": "STARTED",
         "operation_id": operation["operation_id"],
+        "attempt_group_id": attempt_group_id,
     }
     if workspace_repository_root is not None:
         entry["workspace_repository_root"] = workspace_repository_root
@@ -4967,6 +5505,7 @@ def cmd_delegation_terminal(args: argparse.Namespace) -> int:
     operation["effect_stage"] = "response_observed"
     operation["status"] = "confirmed" if args.status == "success" else "failed"
     operation["terminal_reason"] = None if args.status == "success" else f"delegation task ended {args.status}"
+    operation["terminal_disposition"] = "completed_effect" if args.status == "success" else "failed_attempt"
     operation["confirmed_at"] = now
     operation["updated_at"] = now
     if data.get("status") == "active" and outcome in {"AGENT_MODEL_UNRESOLVED", "AGENT_NOT_INSTALLED"}:
@@ -5578,6 +6117,7 @@ def is_pre_effect_frontier_failure(operation: dict[str, Any]) -> bool:
         and operation.get("status") == "failed"
         and operation.get("effect_stage") == "none"
         and operation.get("pre_effect_absence_proven") is True
+        and frontier_resolution_evidence_complete(operation)
         and identity["message_id"] is None
     )
 
@@ -5620,6 +6160,30 @@ def pending_correction_ids(data: dict[str, Any]) -> list[str]:
     return sorted(pending)
 
 
+def delegation_attempt_is_historical_terminal(data: dict[str, Any], operation: dict[str, Any]) -> bool:
+    if operation.get("kind") != "delegation" or operation.get("status") != "failed":
+        return False
+    intent = operation.get("intent")
+    if not isinstance(intent, dict):
+        return False
+    task_id = intent.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return False
+    if task_id in active_task_ids(data):
+        return False
+    entry = find_delegation_entry(data, task_id)
+    if not isinstance(entry, dict) or entry.get("status") == "started":
+        return False
+    for batch in data.get("delegation_batches", []):
+        if (
+            isinstance(batch, dict)
+            and task_id in (batch.get("task_ids") or [])
+            and batch.get("status") != "proceeded"
+        ):
+            return False
+    return operation.get("terminal_disposition") in {None, "failed_attempt"}
+
+
 def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
     """Validate only delivery checks that this run explicitly persisted.
 
@@ -5641,6 +6205,10 @@ def receipt_completion_blockers(data: dict[str, Any]) -> list[str]:
             if status in {"abandoned", "superseded"}:
                 # These are typed historical resolutions.  Their evidence is
                 # retained, but they are no longer required effects.
+                continue
+            if delegation_attempt_is_historical_terminal(data, operation):
+                # The delegation ledger and work-unit state retain the failed
+                # attempt. It is historical evidence, not an unfulfilled effect.
                 continue
             if effective_status != "confirmed":
                 # A pending record is reported separately, but a terminal
@@ -5782,6 +6350,19 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     if data.get("status") in TERMINAL_RUN_STATUSES:
         return "NO_ACTION", "run is terminal", []
 
+    execution = data.get("execution")
+    if data.get("status") == "active" and isinstance(execution, dict) \
+            and execution.get("requested_policy") == "unresolved":
+        return "REQUEST_EXECUTION_POLICY", "execution policy must be resolved before external effects", []
+
+    failed_frontier = [
+        operation for operation in data.get("pending_operations", [])
+        if isinstance(operation, dict)
+        and operation.get("kind") == "frontier_exchange"
+        and operation.get("status") == "failed"
+        and operation_effective_status(operation) != "confirmed"
+    ]
+
     if data.get("status") == "blocked":
         blocker = data.get("blocker")
         if blocker == PAUSE_BLOCKER:
@@ -5800,6 +6381,31 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
             return "REQUEST_CORRECTION", f"correction recovery is required ({blocker})", []
         if blocker == "HUMAN_DECISION_REQUIRED":
             return "HUMAN_DECISION_REQUIRED", "a persisted human decision is required", []
+        if is_recoverable_frontier_blocker(data):
+            for predecessor in failed_frontier:
+                successor = confirmed_frontier_successor(data, predecessor)
+                if successor is not None:
+                    return (
+                        "FINALIZE_FRONTIER_SUPERSESSION",
+                        f"confirmed successor {successor['operation_id']} can close failed Frontier attempt {predecessor['operation_id']}",
+                        [predecessor["operation_id"], successor["operation_id"]],
+                    )
+            if failed_frontier:
+                predecessor = failed_frontier[0]
+                if is_pre_effect_frontier_failure(predecessor) or recovery_blocker_code(data) in {
+                    "BLOCKED_FRONTIER_RECOVERY_MISSING_ORIGINAL_IDENTITY",
+                    "BLOCKED_FRONTIER_PRE_EFFECT_FAILURE",
+                }:
+                    return (
+                        "RESOLVE_PRE_EFFECT_FRONTIER_FAILURE",
+                        f"blocked Frontier attempt {predecessor['operation_id']} requires typed no-effect resolution",
+                        [predecessor["operation_id"]],
+                    )
+                return (
+                    "RECOVER_FRONTIER_EXCHANGE",
+                    f"blocked Frontier exchange {predecessor['operation_id']} may have produced an effect",
+                    [predecessor["operation_id"]],
+                )
         return "BLOCKED_STATE_INCOMPLETE", f"run is blocked ({blocker or 'unspecified blocker'})", []
 
     pending = nonterminal_operations(data)
@@ -5807,13 +6413,15 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
         action, reason = operation_reconcile_action(pending[0])
         return action, reason, [str(operation["operation_id"]) for operation in pending]
 
-    failed_frontier = [
-        operation for operation in data.get("pending_operations", [])
-        if isinstance(operation, dict)
-        and operation.get("kind") == "frontier_exchange"
-        and operation.get("status") == "failed"
-        and operation_effective_status(operation) != "confirmed"
-    ]
+    for predecessor in failed_frontier:
+        successor = confirmed_frontier_successor(data, predecessor)
+        if successor is not None:
+            return (
+                "FINALIZE_FRONTIER_SUPERSESSION",
+                f"confirmed successor {successor['operation_id']} can close failed Frontier attempt {predecessor['operation_id']}",
+                [predecessor["operation_id"], successor["operation_id"]],
+            )
+
     if failed_frontier:
         operation = failed_frontier[0]
         if is_pre_effect_frontier_failure(operation):
@@ -5842,7 +6450,6 @@ def derive_reconcile_action(data: dict[str, Any]) -> tuple[str, str, list[str]]:
     if batches:
         return "COLLECT_DELEGATIONS", "a delegation batch is incomplete", batches
 
-    gate = data.get("parent_gate")
     if parent_gate_needs_request(data):
         return "REQUEST_PARENT_GATE", "completed work unit requires exactly one parent gate", []
     next_work_unit = data.get("next_work_unit")
@@ -6157,6 +6764,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--protected-dirty-path", action="append")
     init.add_argument("--commit-policy", choices=sorted(POLICIES), default="ask")
     init.add_argument("--push-policy", choices=sorted(POLICIES), default="deny")
+    init.add_argument(
+        "--execution-policy", choices=sorted(EXECUTION_POLICIES), default="unresolved",
+        help="persist an explicit route; omit only when OpenCode must ask the user once",
+    )
+    init.add_argument("--execution-authority")
+    init.add_argument("--execution-request-id")
+    init.add_argument("--execution-source-digest")
     init.add_argument("--chat-url")
     init.add_argument("--max-wait-seconds", type=int, default=900)
     init.add_argument("--max-plan-iterations", type=int, default=6)
@@ -6206,6 +6820,10 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--to-phase", choices=sorted(PHASES), required=True)
     transition.add_argument("--reason", required=True)
     transition.add_argument("--blocker")
+    transition.add_argument("--recovery-code")
+    transition.add_argument("--recovery-operation-id", action="append")
+    transition.add_argument("--recovery-resume-phase")
+    transition.add_argument("--recovery-evidence-digest")
     transition.add_argument("--expect-revision", type=int, required=True)
     transition.set_defaults(func=cmd_transition)
 
@@ -6218,6 +6836,7 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--policy", choices=sorted(EXECUTION_POLICIES))
     route.add_argument("--authority")
     route.add_argument("--request-id")
+    route.add_argument("--source-digest")
     route.add_argument("--override-locked", action="store_true")
     route.add_argument("--action", choices=["delegation", "frontier"])
     route.add_argument("--expect-revision", type=int, required=True)
@@ -6245,6 +6864,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     operation.add_argument("--expect-revision", type=int, required=True)
     operation.set_defaults(func=cmd_operation)
+
+    recovery = sub.add_parser("recovery", help="resolve a typed recoverable blocker without generic patches")
+    recovery.add_argument("run_id")
+    recovery.add_argument("recovery_action", choices=["resolve-frontier"])
+    recovery.add_argument("--operation-id", required=True)
+    recovery.add_argument("--successor-operation-id")
+    recovery.add_argument("--disposition", choices=["supersede", "abandon"], default="supersede")
+    recovery.add_argument("--pre-effect-absence-proven", action="store_true")
+    recovery.add_argument("--evidence-json")
+    recovery.add_argument("--resume-phase")
+    recovery.add_argument("--reason")
+    recovery.add_argument("--expect-revision", type=int, required=True)
+    recovery.set_defaults(func=cmd_recovery)
 
     authorization = sub.add_parser("authorization", help="create or consume bounded local operation authorization")
     authorization.add_argument("run_id")
