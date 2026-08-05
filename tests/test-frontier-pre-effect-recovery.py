@@ -28,7 +28,7 @@ def payload(result: subprocess.CompletedProcess[str]) -> dict:
 def init(env: dict[str, str], repository: str, run_id: str) -> str:
     return run(
         "init", "--run-id", run_id, "--objective", run_id,
-        "--repository-root", repository, "--mode", "autonomous", "--scope", "narrow",
+        "--repository-root", repository, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto",
         env=env,
     ).stdout.strip()
 
@@ -89,6 +89,8 @@ with tempfile.TemporaryDirectory(prefix="myrmex-pre-effect-recovery-") as td:
         "--expect-revision", "3", env=env,
     ))
     assert confirmed["pending_operations"][-1]["status"] == "confirmed"
+    assert confirmed["pending_operations"][0]["status"] == "superseded"
+    assert confirmed["pending_operations"][0]["successor_operation_id"] == successor_id
 
     superseded = payload(run(
         "operation", retry_run, "supersede", "--operation-id", predecessor_id,
@@ -104,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-pre-effect-recovery-") as td:
     ))
     assert replayed_supersede["revision"] == superseded["revision"]
     terminal = payload(run(
-        "complete", retry_run, "--message", "safe successor confirmed", "--expect-revision", "5", env=env,
+        "complete", retry_run, "--message", "safe successor confirmed", "--expect-revision", "4", env=env,
     ))
     assert terminal["state"]["status"] == "dormant"
 

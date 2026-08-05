@@ -17,10 +17,16 @@
 
 - `COLLECT_DELEGATIONS` / `RECOVER_MISSING_RESULT`: collect only saved task
   IDs or batch results; do not launch a replacement child first.
+- `REQUEST_EXECUTION_POLICY`: ask exactly once through OpenCode `question`, then
+  persist `auto`, `direct-only`, or `frontier-gated` with `route set`.
+- `RESOLVE_PRE_EFFECT_FRONTIER_FAILURE`: use complete structured evidence and
+  the typed recovery command. Never infer absence from timeout or missing
+  `message_id`.
+- `FINALIZE_FRONTIER_SUPERSESSION`: link the already confirmed successor and
+  close the historical predecessor without browser transport.
 - `RECOVER_FRONTIER_EXCHANGE`: discover the stable request/task/chat/message
-  identity, read the newest stable matched response, and only resend when the
-  original outbound request is proven absent. `WAIT_FRONTIER` waits for that
-  same exchange.
+  identity and read the newest stable matched response. `WAIT_FRONTIER` waits
+  for that same exchange. Ambiguous effects remain blocked.
 - `RECONCILE_TRACKING_ISSUE` / `RECONCILE_PULL_REQUEST`: query the saved
   idempotency identity, then append the observed effect, receipt, and terminal
   confirmation to its operation record.
@@ -40,7 +46,9 @@
 - `verifying`: continue/re-run the intended verifier against the same candidate.
 - `reporting`: rebuild/validate evidence and send only if no outbound receipt exists.
 - `committing`/`pushing`: inspect commit SHA/remote receipts before any repeat side effect.
-- `blocked`: remain blocked until its named condition is resolved.
+- `blocked`: remain blocked unless `reconcile` returns a typed resolver for the
+  exact blocker. Frontier recovery may clear only recognized Frontier blockers;
+  it cannot erase human, permission, correction, batch, or security blockers.
 - `dormant`, `cancelled`, `failed`, `superseded`: do not wake without explicit user input.
 
 Use request IDs, task IDs, state revisions, digests, commit SHAs, push receipts,

@@ -14,3 +14,7 @@ Use repository exploration only when it adds value, delegate exactly one bounded
 For a resumed run, inspect its persisted execution policy before starting any
 Task. If it is `direct-only`, do not delegate or silently change routes; report
 `BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY` instead.
+
+
+For a new persisted run this command is an explicit routing choice; initialize
+with `execution.requested_policy=delegated` rather than `unresolved`.

@@ -108,7 +108,7 @@ def create_governed_parent(env: dict[str, str], repo: Path, run_id: str) -> tupl
     parent = state(
         env, "init", "--run-id", run_id, "--objective", "governed parent", "--parent-objective", "standing parent",
         "--repository-root", str(repo), "--branch", branch, "--base-sha", base,
-        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "authorized", "--push-policy", "deny",
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", "--commit-policy", "authorized", "--push-policy", "deny",
     )
     legacy = state(
         env, "authorization", parent, "create", "--authority", "user", "--request-id", "legacy-before-governed",
@@ -176,7 +176,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     run_id = state(
         env, "init", "--run-id", "local-commit-run", "--objective", "local commit test",
         "--repository-root", str(repo), "--branch", branch, "--base-sha", base,
-        "--mode", "autonomous", "--scope", "narrow", "--commit-policy", "authorized", "--push-policy", "deny",
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", "--commit-policy", "authorized", "--push-policy", "deny",
     )
     initialized = state(env, "show", run_id)
     assert initialized["revision"] == 0 and initialized["authorizations"] == []
@@ -215,7 +215,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     recovery_run = "local-commit-recovery"
     recovery_state = state(
         env, "init", "--run-id", recovery_run, "--objective", "recovery test", "--repository-root", str(repo),
-        "--branch", branch, "--base-sha", commit_sha, "--mode", "autonomous", "--scope", "narrow",
+        "--branch", branch, "--base-sha", commit_sha, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto",
         "--commit-policy", "authorized", "--push-policy", "deny",
     )
     recovery_auth = create_authorization(env, recovery_run, repo, branch, commit_sha, "recovered.txt", "feat: recovered")
@@ -280,7 +280,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     state(
         env, "init", "--run-id", guarded_run, "--objective", "guarded paths", "--repository-root", str(repo),
         "--branch", branch, "--base-sha", guarded_head, "--protected-dirty-path", ".atl",
-        "--mode", "autonomous", "--scope", "narrow", "--commit-policy", "authorized", "--push-policy", "deny",
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", "--commit-policy", "authorized", "--push-policy", "deny",
     )
     protected_auth = create_authorization(env, guarded_run, repo, branch, guarded_head, ".atl/blocked.txt", "feat: blocked")
     (repo / ".atl").mkdir()
@@ -331,7 +331,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-local-commit-") as td:
     clean_run = state(
         clean_env, "init", "--run-id", "local-commit-adversarial", "--objective", "adversarial local commit",
         "--repository-root", str(clean_repo), "--branch", clean_branch, "--base-sha", clean_head,
-        "--mode", "autonomous", "--scope", "narrow", "--commit-policy", "authorized", "--push-policy", "deny",
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", "--commit-policy", "authorized", "--push-policy", "deny",
     )
     max_result = command([
         str(STATE), "authorization", clean_run, "create", "--authority", "user", "--request-id", "max-two",

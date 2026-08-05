@@ -19,3 +19,8 @@ Before each browser exchange, persist its stable request/task identity through
 `myrmex-state frontier <run-id> start`; on resume run
 `myrmex-state reconcile <run-id>` first and recover the existing exchange
 rather than sending a duplicate request.
+
+
+For a new persisted run this command is an explicit routing choice; initialize
+with `execution.requested_policy=frontier-gated`. Do not ask the execution-mode
+question again.

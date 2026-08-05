@@ -31,14 +31,20 @@ Run `myrmex-state doctor`. Confirm `~/.local/bin` is on PATH and the XDG state d
 
 ## Frontier resume repeats the same failed exchange
 
-Inspect `myrmex-state reconcile <run-id>`. If the failed operation has
-`effect_stage=none` and the transport evidence proves there was no browser tab,
-outbound request, or message identity, use `myrmex-state frontier <run-id>
-retry` with `--pre-effect-absence-proven`. After the successor returns a
-confirmed response, close the historical operation with `myrmex-state
-operation <run-id> supersede ... --reason PRE_EFFECT_FAILURE`. Do not fabricate
-a `message_id`; if any effect may have happened, use `frontier recover` and
-inspect the saved receipts instead.
+Inspect `myrmex-state reconcile <run-id>`. `FINALIZE_FRONTIER_SUPERSESSION`
+means a confirmed successor already exists: run the typed `recovery
+resolve-frontier` command and do not open the browser.
+`RESOLVE_PRE_EFFECT_FRONTIER_FAILURE` requires complete effect **and** receipt
+evidence showing `browser_tab_opened=false`,
+`outbound_request_observed=false`, and `request_sent=false`; a timeout, missing
+field, contradiction, or absent `message_id` alone is insufficient.
+
+A legacy `blocked/blocked` run must be restored only by the typed recovery
+command, which preserves the failed operation, links its confirmed successor,
+and returns to the persisted active phase after all targeted Frontier attempts
+are resolved. Never edit `state.json` or fabricate a `message_id`. If any effect
+may have happened, keep the run blocked and use `frontier recover` against the
+saved identity.
 
 ## Memory unavailable
 
@@ -72,3 +78,10 @@ write a local artifact and apply the label through the narrow issue-label REST
 fallback when the Projects scope is absent. Persist discovery/receipt through
 the typed `pull_request` operation lifecycle; the helper no longer patches
 state directly.
+
+## A new run does nothing and reconcile requests execution policy
+
+`REQUEST_EXECUTION_POLICY` is a recoverable initialization state, not a failure.
+Use OpenCode `question` once to choose Auto, Direct-only, or Frontier-gated,
+then persist it with `myrmex-state route set`. Do not patch the execution object
+or assume `auto`.

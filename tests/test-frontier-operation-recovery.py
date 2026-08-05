@@ -29,7 +29,7 @@ def state(result: subprocess.CompletedProcess[str]) -> dict:
 def init(env: dict[str, str], repository: str, name: str) -> str:
     return run(
         "init", "--run-id", name, "--objective", name, "--repository-root", repository,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
 
 

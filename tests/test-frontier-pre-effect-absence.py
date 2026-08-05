@@ -42,7 +42,7 @@ FALSE_EVIDENCE = '{"browser_tab_opened":false,"outbound_request_observed":false,
 def init(env: dict[str, str], repository: str, run_id: str) -> str:
     return run(
         "init", "--run-id", run_id, "--objective", run_id,
-        "--repository-root", repository, "--mode", "autonomous", "--scope", "narrow",
+        "--repository-root", repository, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto",
         env=env,
     ).stdout.strip()
 
