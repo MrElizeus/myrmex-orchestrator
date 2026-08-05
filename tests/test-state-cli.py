@@ -110,9 +110,12 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     # A persisted direct-only policy survives ordinary reads/migration and
     # rejects both stateful delegation entry points and Frontier checks.
+    # The run must start with an unresolved policy so `route set` can establish
+    # direct-only as the first (and only) resolution.
     direct = run(
         "init", "--run-id", "myrmex-direct-policy", "--objective", "Direct policy test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        env=env,
     ).stdout.strip()
     direct_only = json.loads(run(
         "route", "set", direct, "--policy", "direct-only", "--authority", "user",
@@ -150,10 +153,14 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert persisted_direct["state"]["execution"]["requested_policy"] == "direct-only"
 
     # The switch into direct-only is rejected while a persisted child task is
-    # still active; it must first be consolidated or recovered.
+    # still active. With the immutability invariant, a run with active delegations
+    # already has a resolved policy (delegations require a resolved policy), so
+    # any subsequent route set is blocked by BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED.
+    # We verify this by using a run with auto (already resolved) + active delegation.
     pending = run(
         "init", "--run-id", "myrmex-route-pending", "--objective", "Route pending test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation", pending, "--agent", "myrmex-worker", "--role", "writer", "--reason", "pending child",
@@ -165,11 +172,15 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "--request-id", "req-user-direct-pending", "--expect-revision", "1", env=env, ok=False,
     )
 
-    # A start must have a durable task identity, and old anonymous started
-    # records still block a switch to direct-only rather than being forgotten.
+    # A start must have a durable task identity. Old anonymous started records
+    # also block a switch to direct-only. With the immutability invariant, a run
+    # that already has delegation activity has a resolved policy, so any subsequent
+    # route set fails with BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED. The run
+    # starts with auto (already resolved) and has an anonymous ledger record injected.
     anonymous = run(
         "init", "--run-id", "myrmex-route-anonymous", "--objective", "Anonymous route test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation", anonymous, "--agent", "myrmex-worker", "--role", "writer", "--reason", "missing identity",
@@ -183,7 +194,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "route", "set", anonymous, "--policy", "direct-only", "--authority", "user",
         "--request-id", "req-user-direct-anonymous", "--expect-revision", "0", env=env, ok=False,
     )
-    assert "anonymous active delegation records" in anonymous_route.stderr
+    # The immutability guard fires before the delegation check for runs with an
+    # already-resolved policy; the failure code is BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED.
+    assert "BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED" in anonymous_route.stderr
 
     run("lock", run_id, "--owner", "test-owner", env=env)
     run("lock", run_id, "--owner", "other-owner", env=env, ok=False)
@@ -635,7 +648,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # from durable operation state before any external transport is repeated.
     recovery_run = run(
         "init", "--run-id", "myrmex-recovery-ledger", "--objective", "Recovery ledger",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto",
+        env=env,
     ).stdout.strip()
     recovery_path = Path(td) / "state" / "runs" / recovery_run / "state.json"
     recovery_before = recovery_path.read_bytes()
@@ -674,16 +689,8 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     ).stdout)
     assert frontier_confirmed["revision"] == 4
     # A terminal Frontier operation no longer leaves the legacy task ID as a
-    # permanent direct-route blocker, but direct-only still rejects new starts.
-    terminal_frontier_route = json.loads(run(
-        "route", "set", recovery_run, "--policy", "direct-only", "--authority", "user",
-        "--request-id", "req-user-direct-after-frontier", "--expect-revision", "4", env=env,
-    ).stdout)
-    assert terminal_frontier_route["revision"] == 5
-    run(
-        "frontier", recovery_run, "start", "--request-id", "req-frontier-forbidden", "--task-id", "forbidden-task",
-        "--expect-revision", "5", env=env, ok=False,
-    )
+    # permanent direct-route blocker. Once a policy is resolved it is immutable;
+    # the direct-only blocking is tested via the `direct` run above.
     run(
         "frontier", direct, "start", "--request-id", "req-frontier-direct", "--task-id", "direct-task",
         "--expect-revision", "1", env=env, ok=False,

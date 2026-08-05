@@ -1894,7 +1894,17 @@ def has_confirmed_frontier_plan(data: dict[str, Any]) -> bool:
 
 
 def ensure_route_allows(data: dict[str, Any], action: str) -> None:
-    """Enforce the persisted execution policy at stateful effect boundaries."""
+    """Enforce the persisted execution policy at stateful effect boundaries.
+
+    Policy/action matrix:
+      unresolved     → all actions blocked
+      auto           → delegation and frontier both allowed
+      direct-only    → delegation and frontier both blocked
+      delegated      → delegation allowed, frontier blocked
+      frontier       → delegation blocked before plan; frontier always allowed
+      frontier-gated → delegation blocked before plan; frontier always allowed
+    `frontier` is a legacy alias for `frontier-gated` with identical enforcement.
+    """
     policy = data["execution"]["requested_policy"]
     if policy == "unresolved":
         raise SystemExit("BLOCKED_EXECUTION_POLICY_UNRESOLVED")
@@ -1902,8 +1912,12 @@ def ensure_route_allows(data: dict[str, Any], action: str) -> None:
         if action in {"delegation", "frontier"}:
             raise SystemExit("BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY")
         raise SystemExit(f"unsupported execution-policy action: {action}")
-    if policy == "frontier-gated" and action == "delegation" and not has_confirmed_frontier_plan(data):
-        raise SystemExit("BLOCKED_FRONTIER_PLAN_REQUIRED_BY_EXECUTION_POLICY")
+    if policy == "delegated":
+        if action == "frontier":
+            raise SystemExit("BLOCKED_FRONTIER_FORBIDDEN_BY_EXECUTION_POLICY")
+    if policy in {"frontier", "frontier-gated"}:
+        if action == "delegation" and not has_confirmed_frontier_plan(data):
+            raise SystemExit("BLOCKED_FRONTIER_PLAN_REQUIRED_BY_EXECUTION_POLICY")
 
 
 def resolve_route_positionals(args: argparse.Namespace) -> tuple[str, str]:
@@ -1965,6 +1979,12 @@ def cmd_route(args: argparse.Namespace) -> int:
         )
     if data["status"] != "active":
         raise SystemExit("route changes require an active run")
+    # A resolved policy is immutable. The only permitted write after the initial
+    # resolution is the exact idempotent replay already handled above. Any other
+    # attempt—including a same-policy change with different authority or digest—
+    # is rejected here before any field is mutated.
+    if current["requested_policy"] != "unresolved":
+        raise SystemExit("BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED")
     if policy == "direct-only" and args.authority != "user":
         raise SystemExit("direct-only execution policy requires --authority user")
     # `direct-only` is a user lock, not merely a policy value.  In particular,
@@ -2747,6 +2767,37 @@ def is_recoverable_frontier_blocker(data: dict[str, Any]) -> bool:
     return recovery_blocker_code(data) in RECOVERABLE_FRONTIER_BLOCKER_CODES
 
 
+def operation_position(data: dict[str, Any], operation_id: str) -> int:
+    """Return the 0-based index of an operation in pending_operations.
+
+    Insertion order in the ledger is the canonical causal ordering.  Using
+    list position avoids timestamp-resolution issues (same-second creates,
+    clock drift) that make `created_at` comparisons unreliable for causality.
+    Raises SystemExit if the operation is not found.
+    """
+    for i, op in enumerate(data.get("pending_operations", [])):
+        if isinstance(op, dict) and op.get("operation_id") == operation_id:
+            return i
+    raise SystemExit(f"operation not found: {operation_id}")
+
+
+def require_later_successor(
+    data: dict[str, Any],
+    predecessor: dict[str, Any],
+    successor: dict[str, Any],
+) -> None:
+    """Enforce that the successor appears later than the predecessor in the ledger.
+
+    A confirmed operation that was inserted BEFORE a failed one cannot act as
+    its causal successor: it was created without knowledge of the failure, so
+    it cannot represent a recovery decision.
+    """
+    if operation_position(data, successor["operation_id"]) <= operation_position(
+        data, predecessor["operation_id"]
+    ):
+        raise SystemExit("OPERATION_SUCCESSOR_NOT_LATER")
+
+
 def frontier_successor_candidates(data: dict[str, Any], predecessor: dict[str, Any]) -> list[dict[str, Any]]:
     explicit = predecessor.get("successor_operation_id")
     operations = [item for item in data.get("pending_operations", []) if isinstance(item, dict)]
@@ -2784,7 +2835,11 @@ def frontier_successor_candidates(data: dict[str, Any], predecessor: dict[str, A
         # explicit successor ID from the typed recovery authority.
         if predecessor_digest is None and generic_legacy_purpose:
             continue
-        if str(item.get("created_at") or "") < str(predecessor.get("created_at") or ""):
+        # Use ledger position instead of created_at for causal ordering.
+        # created_at has second-level resolution and is unreliable when two
+        # operations are created in the same wall-clock second.
+        pred_pos = operation_position(data, predecessor["operation_id"])
+        if operation_position(data, item["operation_id"]) <= pred_pos:
             continue
         candidates.append(item)
     return candidates
@@ -2854,6 +2909,7 @@ def finalize_frontier_supersession(
     if operation_purpose(predecessor) != operation_purpose(successor):
         raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
     validate_purpose_digest_continuity(predecessor, successor)
+    require_later_successor(data, predecessor, successor)
     apply_frontier_resolution_evidence(
         predecessor, resolution_evidence, explicit=explicit_pre_effect_proof,
     )
@@ -2954,6 +3010,7 @@ def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> 
         if args.successor_operation_id is None:
             raise SystemExit("operation supersede requires --successor-operation-id")
         successor = find_operation(data, args.successor_operation_id)
+        require_later_successor(data, operation, successor)
         finalize_frontier_supersession(
             data, operation, successor, reason=reason,
             explicit_pre_effect_proof=explicit_proof,
@@ -2970,6 +3027,7 @@ def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> 
         operation["updated_at"] = now
         if args.successor_operation_id is not None:
             successor = find_operation(data, args.successor_operation_id)
+            require_later_successor(data, operation, successor)
             if not operation_is_effectively_confirmed(successor):
                 raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
             if operation_purpose(operation) != operation_purpose(successor):
@@ -3053,6 +3111,7 @@ def cmd_recovery(args: argparse.Namespace) -> int:
     reason = args.reason or "PRE_EFFECT_FAILURE"
     if args.disposition == "supersede":
         assert successor is not None
+        require_later_successor(data, predecessor, successor)
         finalize_frontier_supersession(
             data, predecessor, successor, reason=reason,
             explicit_pre_effect_proof=bool(args.pre_effect_absence_proven),
