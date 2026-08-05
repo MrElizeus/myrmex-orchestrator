@@ -5,20 +5,41 @@ on:
 permissions:
   contents: write
 jobs:
-  publish-clean:
+  normalize-clean-schema:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'fix/state-recovery-and-execution-policy'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Publish clean stabilization branch
+      - name: Restore focused schema formatting on clean branch
+        run: |
+          echo '45cc6538d297975728117a9d4d41a71a5ef5a9a2dcda2c2d521771547a13c716  .github/schema-intended.xz.b64' | sha256sum --check
+          base64 --decode .github/schema-intended.xz.b64 | xz --decompress > /tmp/frontier-state.schema.json
+          echo 'b1eece5078484a3787cbf0b95294e9d59bac45bbece208feac4cb70255266438  /tmp/frontier-state.schema.json' | sha256sum --check
+          git fetch origin fix/state-recovery-and-execution-policy-clean
+          git switch fix/state-recovery-and-execution-policy-clean
+          cp /tmp/frontier-state.schema.json contracts/frontier-state-v2.schema.json
+          cp /tmp/frontier-state.schema.json skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json
+          cmp contracts/frontier-state-v2.schema.json skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json
+          git diff --check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Verify normalized schema candidate
+        run: |
+          ./scripts/run-tests.sh
+          python3 ./scripts/check-package.py
+      - name: Commit normalized schemas
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git switch --create fix/state-recovery-and-execution-policy-clean cfba4d3615ff9929d5bb2139baa226bca8d978fe
-          git cherry-pick 664b09842801cbfc5cc186279267cd269a2a1da7
-          test "$(git rev-list --count cfba4d3615ff9929d5bb2139baa226bca8d978fe..HEAD)" = "1"
+          git add contracts/frontier-state-v2.schema.json skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json
+          git commit -m 'chore(schema): preserve focused state contract diff'
           git push origin HEAD:fix/state-recovery-and-execution-policy-clean
   package:
     strategy:
