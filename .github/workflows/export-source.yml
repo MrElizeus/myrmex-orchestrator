@@ -1,0 +1,24 @@
+name: Export source snapshot
+
+on:
+  pull_request:
+    branches:
+      - feat/parent-objective-continuity
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create source snapshot
+        run: |
+          tar --exclude=.git -czf /tmp/myrmex-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: myrmex-source-snapshot
+          path: /tmp/myrmex-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
