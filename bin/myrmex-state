@@ -1018,6 +1018,12 @@ def validate_pending_operations(data: dict[str, Any], *, required: bool) -> None
                 not isinstance(link_value, str) or not OPERATION_ID_RE.fullmatch(link_value)
             ):
                 raise SystemExit(f"pending operation {link} must be a valid operation ID or null")
+        purpose_digest = operation.get("purpose_digest")
+        if purpose_digest is not None:
+            if not isinstance(purpose_digest, str) or not SHA256_RE.fullmatch(purpose_digest):
+                raise SystemExit("pending operation purpose_digest must be a lowercase SHA-256 digest")
+            if kind != "frontier_exchange":
+                raise SystemExit("purpose_digest is restricted to frontier_exchange operations")
         validate_frontier_typed_fields(operation)
 
 
@@ -1893,26 +1899,47 @@ def response_type_from_sources(*sources: Any) -> str | None:
     return values[0]
 
 
+PRE_EFFECT_EVIDENCE_KEYS = ("browser_tab_opened", "outbound_request_observed", "request_sent")
+
+
+def pre_effect_absence_evidence_complete(effect: Any, receipt: Any) -> bool:
+    """Require complete, consistent no-effect evidence from every source.
+
+    Absence is never inferred.  Every available effect and receipt source must
+    explicitly record ``browser_tab_opened=false``,
+    ``outbound_request_observed=false`` and ``request_sent=false``; the sources
+    must agree; and no message identity may exist.  Missing fields, any
+    ``true``, a contradiction, or a message_id keep the exchange ambiguous.
+    """
+    for source in (effect, receipt):
+        if not isinstance(source, dict):
+            return False
+        for key in PRE_EFFECT_EVIDENCE_KEYS:
+            value = source.get(key)
+            if value is not True and value is not False:
+                return False
+            if value is True:
+                return False
+    for key in PRE_EFFECT_EVIDENCE_KEYS:
+        if effect.get(key) != receipt.get(key):
+            return False
+    if frontier_message_id(effect) is not None or frontier_message_id(receipt) is not None:
+        return False
+    return True
+
+
 def pre_effect_absence_proven(
     args: argparse.Namespace, effect: dict[str, Any], receipt: dict[str, Any],
 ) -> bool:
-    """Require explicit evidence before classifying a failed exchange as no-effect."""
-    if bool(getattr(args, "pre_effect_absence_proven", False)):
-        return True
-    sources = [source for source in (effect, receipt) if isinstance(source, dict)]
-    if any(source.get("pre_effect_absence_proven") is True for source in sources):
-        return True
-    browser_tab_opened = [source.get("browser_tab_opened") for source in sources]
-    outbound_observed = [
-        source.get("outbound_request_observed", source.get("request_sent"))
-        for source in sources
-    ]
-    return (
-        bool(browser_tab_opened)
-        and all(value is False for value in browser_tab_opened if value is not None)
-        and any(value is False for value in outbound_observed)
-        and all(value is not None for value in outbound_observed)
-    )
+    """Authority assertion plus complete structured evidence; never inferred.
+
+    ``--pre-effect-absence-proven`` asserts the operator's authority; it never
+    manufactures evidence.  The flag is validated against the supplied effect
+    and receipt, which must carry the full no-effect marker set.
+    """
+    if not bool(getattr(args, "pre_effect_absence_proven", False)):
+        return False
+    return pre_effect_absence_evidence_complete(effect, receipt)
 
 
 def requested_effect_stage(
@@ -2474,23 +2501,94 @@ def operation_purpose(operation: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+FRONTIER_REQUEST_TYPE_KEYS = ("type", "purpose")
+FRONTIER_WORK_UNIT_KEYS = ("work_unit_id", "completed_work_unit_id", "next_work_unit_id")
+FRONTIER_REQUEST_PAYLOAD_KEYS = ("outbound_message", "payload", "request", "message", "request_payload")
+# Transport identity fields are the only parts of a Frontier intent a retry may
+# change: task/chat/artifact identity.  Every other intent key defines the
+# immutable purpose and must be rejected on retry.
+FRONTIER_RETRY_ALLOWED_OVERRIDE_KEYS = frozenset({"task_id", "chat_url", "artifact_root"})
+
+
+def frontier_purpose_components(data: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    """Canonical immutable purpose identity for a Frontier exchange.
+
+    The canonical components are objective, request type, parent gate, work
+    unit, request payload, and scope.  Transport identity fields (task, chat,
+    artifact root, message identity) are deliberately excluded so a retry may
+    only touch those.
+    """
+    parent_gate = intent.get("parent_gate") is True or intent.get("purpose") == "parent_gate"
+    request_type = next(
+        (intent[key] for key in FRONTIER_REQUEST_TYPE_KEYS if intent.get(key) is not None),
+        None,
+    )
+    if request_type is None and parent_gate:
+        request_type = "parent_gate"
+    work_unit = next(
+        (intent[key] for key in FRONTIER_WORK_UNIT_KEYS if intent.get(key) is not None),
+        None,
+    )
+    request_payload = next(
+        (intent[key] for key in FRONTIER_REQUEST_PAYLOAD_KEYS if intent.get(key) is not None),
+        None,
+    )
+    scope = intent.get("scope") or data.get("scope")
+    return {
+        "objective": data.get("objective"),
+        "request_type": request_type,
+        "parent_gate": parent_gate,
+        "work_unit": work_unit,
+        "request_payload": request_payload,
+        "scope": scope,
+    }
+
+
+def frontier_purpose_digest(data: dict[str, Any], intent: dict[str, Any]) -> str:
+    """Immutable purpose digest over the canonical purpose components."""
+    encoded = json.dumps(
+        frontier_purpose_components(data, intent),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_purpose_digest_continuity(predecessor: dict[str, Any], successor: dict[str, Any]) -> None:
+    """A successor must match the predecessor's immutable purpose digest.
+
+    Legacy records without a digest are preserved conservatively: no digest is
+    invented for them, so no continuity check applies.
+    """
+    if predecessor.get("purpose_digest") is not None and predecessor["purpose_digest"] != successor.get("purpose_digest"):
+        raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_DIGEST_MISMATCH")
+
+
 def mark_pre_effect_absence_proven(operation: dict[str, Any], *, explicit: bool) -> None:
-    """Promote an operator's explicit absence proof without guessing from a timeout."""
+    """Promote an operator's explicit absence proof without guessing from a timeout.
+
+    The authority assertion is validated against the persisted operation
+    evidence; it never manufactures evidence by itself.  Only Frontier
+    exchanges may use this resolution path.
+    """
     if operation.get("pre_effect_absence_proven") is True:
         return
     if not explicit:
         raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRED")
-    if operation.get("kind") == "frontier_exchange" and operation.get("status") not in {"intent", "failed"}:
+    if operation.get("kind") != "frontier_exchange":
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_FRONTIER_ONLY")
+    if operation.get("status") not in {"intent", "failed"}:
         raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRES_UNRESOLVED_FRONTIER_FAILURE")
     if operation.get("effect_stage") not in {None, "none"}:
         raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_RECORDED_EFFECT")
-    for source_name in ("effect", "receipt"):
-        source = operation.get(source_name)
-        if not isinstance(source, dict):
-            continue
-        if frontier_message_id(source) is not None:
-            raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_MESSAGE_ID")
-        if source.get("transport_status") == "success":
+    effect = operation.get("effect")
+    receipt = operation.get("receipt")
+    if not pre_effect_absence_evidence_complete(
+        effect if isinstance(effect, dict) else {},
+        receipt if isinstance(receipt, dict) else {},
+    ):
+        raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_REQUIRES_COMPLETE_STRUCTURED_EVIDENCE")
+    for source in (effect, receipt):
+        if isinstance(source, dict) and source.get("transport_status") == "success":
             raise SystemExit("PRE_EFFECT_ABSENCE_PROOF_CONFLICTS_WITH_SUCCESS")
     operation["effect_stage"] = "none"
     operation["pre_effect_absence_proven"] = True
@@ -2520,6 +2618,7 @@ def validate_successor_operation(
         raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
     if operation_purpose(operation) != operation_purpose(successor):
         raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+    validate_purpose_digest_continuity(operation, successor)
     require_safe_operation_resolution(
         operation, explicit_pre_effect_proof=explicit_pre_effect_proof,
     )
@@ -2556,6 +2655,7 @@ def cmd_operation_resolution(args: argparse.Namespace, data: dict[str, Any]) -> 
                 raise SystemExit("OPERATION_SUCCESSOR_MUST_BE_CONFIRMED")
             if operation_purpose(operation) != operation_purpose(successor):
                 raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+            validate_purpose_digest_continuity(operation, successor)
 
     now = utcnow()
     operation["status"] = expected_status
@@ -3437,7 +3537,12 @@ def cmd_authorization(args: argparse.Namespace) -> int:
 
 
 def cmd_frontier_retry(args: argparse.Namespace) -> int:
-    """Create a linked, idempotent retry for a proven pre-effect failure."""
+    """Create a linked, idempotent retry for a proven pre-effect failure.
+
+    The retry preserves the predecessor's immutable purpose.  Only transport
+    identity fields (task/chat/artifact identity) may change; any other
+    ``--intent-json`` override is rejected before a successor is recorded.
+    """
     data = read_state(args.run_id)
     require_v2(data, "frontier retry")
     ensure_v2_defaults(data)
@@ -3456,15 +3561,18 @@ def cmd_frontier_retry(args: argparse.Namespace) -> int:
     require_safe_operation_resolution(
         predecessor, explicit_pre_effect_proof=bool(args.pre_effect_absence_proven),
     )
-    task_id = args.task_id or identity["task_id"]
-    if not isinstance(task_id, str) or not task_id:
-        raise SystemExit("Frontier retry requires --task-id when the predecessor has none")
     intent = copy.deepcopy(predecessor.get("intent"))
     if not isinstance(intent, dict):
         raise SystemExit("FRONTIER_RETRY_INVALID_PREDECESSOR_INTENT")
     override = parse_object_json(args.intent_json, "--intent-json")
+    disallowed = sorted(set(override) - FRONTIER_RETRY_ALLOWED_OVERRIDE_KEYS)
+    if disallowed:
+        raise SystemExit("FRONTIER_RETRY_IMMUTABLE_INTENT_FIELDS: " + ", ".join(disallowed))
     if override:
         intent.update(override)
+    task_id = args.task_id or intent.get("task_id") or identity["task_id"]
+    if not isinstance(task_id, str) or not task_id:
+        raise SystemExit("Frontier retry requires --task-id when the predecessor has none")
     intent.update({
         "request_id": args.request_id,
         "task_id": task_id,
@@ -3479,6 +3587,8 @@ def cmd_frontier_retry(args: argparse.Namespace) -> int:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
     operation["predecessor_operation_id"] = predecessor["operation_id"]
+    operation["purpose_digest"] = frontier_purpose_digest(data, operation["intent"])
+    validate_purpose_digest_continuity(predecessor, operation)
     data["last_request_id"] = args.request_id
     data["frontier_task_id"] = task_id
     gate = data.get("parent_gate")
@@ -3570,8 +3680,10 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     if not created:
         print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
         return 0
+    operation["purpose_digest"] = frontier_purpose_digest(data, operation["intent"])
     if predecessor is not None:
         operation["predecessor_operation_id"] = predecessor["operation_id"]
+        validate_purpose_digest_continuity(predecessor, operation)
     data["last_request_id"] = args.request_id
     data["frontier_task_id"] = args.task_id
     if args.chat_url is not None:
@@ -3712,10 +3824,17 @@ def build_frontier_response(
         absence_proven = pre_effect_absence_proven(args, effect_raw, receipt_raw)
         if requested_status == "success":
             errors.append("effect_stage none is incompatible with successful Frontier transport")
+        elif requested_status == "timeout":
+            errors.append("timeout cannot classify an exchange as pre-effect absence")
         elif not absence_proven:
             errors.append("effect_stage none requires proof that no browser tab or outbound request existed")
         elif message_id is not None:
             errors.append("pre-effect Frontier failure cannot have message_id")
+        if errors:
+            # Incomplete or contradictory evidence never persists a no-effect
+            # stage or a retryable proof; keep the failure conservative.
+            absence_proven = False
+            effect_stage = "transport_started"
     elif effect_stage == "response_observed" and requested_status != "success":
         # A response identity is useful recovery evidence, but a transport
         # failure that observed a response must be represented as ambiguous

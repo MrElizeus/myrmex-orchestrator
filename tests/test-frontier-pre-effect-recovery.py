@@ -48,8 +48,8 @@ def fail_before_effect(
         "frontier", run_id, "result", "--operation-id", operation_id,
         "--request-id", request_id, "--transport-status", "transport_error",
         "--effect-stage", "none", "--pre-effect-absence-proven",
-        "--effect-json", '{"browser_tab_opened":false,"outbound_request_observed":false}',
-        "--receipt-json", '{"browser_tab_opened":false,"outbound_request_observed":false}',
+        "--effect-json", '{"browser_tab_opened":false,"outbound_request_observed":false,"request_sent":false}',
+        "--receipt-json", '{"browser_tab_opened":false,"outbound_request_observed":false,"request_sent":false}',
         "--expect-revision", str(revision), env=env,
     ))
 

@@ -1243,6 +1243,10 @@
             "type": "string",
             "pattern": "^op-[0-9a-f]{24}$"
           },
+          "purpose_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
           "status": {
             "enum": [
               "intent",
