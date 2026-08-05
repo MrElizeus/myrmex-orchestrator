@@ -183,7 +183,7 @@ def main() -> int:
     agent_dir = ROOT / "agents"
     require_text(agent_dir / "myrmex-orchestrator.md", [
         '"myrmex-frontier": allow',
-        '"playwright_*": deny', '"git push --force*": deny', "**DIRECT** — default",
+        '"playwright_*": deny', '"git push --force*": deny', "REQUEST_EXECUTION_POLICY",
         "tracking_issue", "policy_digest", "body_digest", "recompute", "github-tracking-issue-recovery.py", "github-pr-recovery.py",
     ], errors)
     require_text(agent_dir / "myrmex-scout.md", [
