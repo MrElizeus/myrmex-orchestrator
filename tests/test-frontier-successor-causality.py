@@ -223,30 +223,40 @@ with tempfile.TemporaryDirectory(prefix="myrmex-successor-causality-") as td:
     assert find_op(resolved_rec, op_y_id)["status"] == "superseded"
     assert find_op(resolved_rec, op_y_id)["successor_operation_id"] == op_z_id
 
-    # ── Case 3: auto-selection never picks an earlier operation ─────────────
-    auto_state = make_run(env, "causality-auto", repo)
+    # ── Case 3: reconcile auto-selection honours ledger position ─────────────
+    recon_state = make_run(env, "causality-recon", repo)
 
-    # op_p: confirmed, position 0
-    op_p_id, auto_state = start_frontier(env, "causality-auto", "req-p", "task-p", auto_state["revision"])
-    auto_state = confirm_frontier(env, "causality-auto", op_p_id, "req-p", "turn-p", auto_state["revision"])
+    # op_earlier: confirmed, position 0
+    op_earlier_id, recon_state = start_frontier(env, "causality-recon", "req-earlier", "task-earlier", recon_state["revision"])
+    recon_state = confirm_frontier(env, "causality-recon", op_earlier_id, "req-earlier", "turn-earlier", recon_state["revision"])
+    assert find_op(recon_state, op_earlier_id)["status"] == "confirmed"
 
-    # op_q: failed, position 1 (same purpose as op_p → auto-select would match on purpose,
-    # but position check must reject it since op_p is at position 0 < position 1)
-    op_q_id, auto_state = start_frontier(env, "causality-auto", "req-q", "task-q", auto_state["revision"])
-    auto_state = fail_frontier(env, "causality-auto", op_q_id, "req-q", auto_state["revision"])
+    # op_failed: failed, position 1
+    op_failed_id, recon_state = start_frontier(env, "causality-recon", "req-failed", "task-failed", recon_state["revision"])
+    recon_state = fail_frontier(env, "causality-recon", op_failed_id, "req-failed", recon_state["revision"])
+    assert find_op(recon_state, op_failed_id)["status"] == "failed"
 
-    # Explicit attempt to use op_p as successor must be rejected regardless
-    blocked_auto = run(
-        "operation", "causality-auto", "supersede",
-        "--operation-id", op_q_id,
-        "--successor-operation-id", op_p_id,
-        "--reason", "PRE_EFFECT_FAILURE",
-        "--pre-effect-absence-proven",
-        "--expect-revision", str(auto_state["revision"]),
-        env=env, ok=False,
+    # Verify that having only an earlier confirmed operation does NOT produce FINALIZE_FRONTIER_SUPERSESSION
+    recon_action_1 = payload(run("reconcile", "causality-recon", env=env))
+    assert recon_action_1["action"] != "FINALIZE_FRONTIER_SUPERSESSION", (
+        f"Expected action other than FINALIZE_FRONTIER_SUPERSESSION, got: {recon_action_1['action']}"
     )
-    assert "OPERATION_SUCCESSOR_NOT_LATER" in blocked_auto.stderr, (
-        f"Auto explicit use of earlier op must be rejected, got: {blocked_auto.stderr}"
+
+    # op_later: confirmed, position 2
+    op_later_id, recon_state = start_frontier(env, "causality-recon", "req-later", "task-later", recon_state["revision"])
+    recon_state = confirm_frontier(env, "causality-recon", op_later_id, "req-later", "turn-later", recon_state["revision"])
+    assert find_op(recon_state, op_later_id)["status"] == "confirmed"
+
+    # Now we have a later confirmed operation. Reconcile MUST return FINALIZE_FRONTIER_SUPERSESSION
+    recon_action_2 = payload(run("reconcile", "causality-recon", env=env))
+    assert recon_action_2["action"] == "FINALIZE_FRONTIER_SUPERSESSION", (
+        f"Expected FINALIZE_FRONTIER_SUPERSESSION, got: {recon_action_2['action']}"
+    )
+
+    # It must contain exactly the expected predecessor/successor IDs
+    expected_ids = [op_failed_id, op_later_id]
+    assert recon_action_2["operation_ids"] == expected_ids, (
+        f"Expected operation_ids {expected_ids}, got: {recon_action_2['operation_ids']}"
     )
 
 print("frontier successor causality test: PASS")

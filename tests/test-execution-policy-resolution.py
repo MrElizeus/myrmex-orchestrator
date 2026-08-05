@@ -202,4 +202,48 @@ with tempfile.TemporaryDirectory(prefix="myrmex-execution-policy-") as td:
         f"Expected BLOCKED_DELEGATION_FORBIDDEN_BY_EXECUTION_POLICY for direct-only frontier, got: {blocked_frontier_direct.stderr}"
     )
 
+    # 7. legacy frontier policy: permits frontier start, blocks delegation before plan, allows after ACCEPT
+    legacy_frontier_id = "run-legacy-frontier-policy"
+    run(
+        "init", "--run-id", legacy_frontier_id, "--objective", legacy_frontier_id,
+        "--repository-root", repo, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "frontier", "--execution-authority", "prompt",
+        "--execution-request-id", "req-legacy-frontier", env=env,
+    )
+    # 7.1. Blocks delegation before plan
+    denied_before_legacy_plan = run(
+        "delegation-preflight", legacy_frontier_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "must await legacy plan", "--task-id", "task-before-legacy-plan",
+        "--work-unit-id", "WU-LF-01", "--workspace", repo, "--expect-revision", "0",
+        env=env, ok=False,
+    )
+    assert "BLOCKED_FRONTIER_PLAN_REQUIRED_BY_EXECUTION_POLICY" in denied_before_legacy_plan.stderr, (
+        f"Expected BLOCKED_FRONTIER_PLAN_REQUIRED_BY_EXECUTION_POLICY, got: {denied_before_legacy_plan.stderr}"
+    )
+    # 7.2. Allows frontier start
+    started_legacy_plan = payload(run(
+        "frontier", legacy_frontier_id, "start", "--request-id", "req-legacy-gated-plan",
+        "--task-id", "task-legacy-gated-plan", "--intent-json", '{"purpose":"planning"}',
+        "--expect-revision", "0", env=env,
+    ))
+    legacy_plan_id = started_legacy_plan["pending_operations"][0]["operation_id"]
+    # Confirm it
+    payload(run(
+        "frontier", legacy_frontier_id, "result", "--operation-id", legacy_plan_id,
+        "--request-id", "req-legacy-gated-plan", "--message-id", "turn-legacy-gated-plan",
+        "--transport-status", "success", "--frontier-decision", "ACCEPT",
+        "--response-type", "plan", "--plan-json", '{"work_unit_id":"WU-LF-01"}',
+        "--effect-json", '{"request_id":"req-legacy-gated-plan","message_id":"turn-legacy-gated-plan"}',
+        "--receipt-json", '{"request_id":"req-legacy-gated-plan","message_id":"turn-legacy-gated-plan"}',
+        "--expect-revision", "1", env=env,
+    ))
+    # 7.3. Allows delegation after ACCEPT
+    allowed_legacy = payload(run(
+        "delegation-preflight", legacy_frontier_id, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "approved legacy work", "--task-id", "task-after-legacy-plan",
+        "--work-unit-id", "WU-LF-01", "--workspace", repo, "--expect-revision", "2",
+        env=env,
+    ))
+    assert allowed_legacy["delegation_ledger"][-1]["task_id"] == "task-after-legacy-plan"
+
 print("execution policy resolution test: PASS")
