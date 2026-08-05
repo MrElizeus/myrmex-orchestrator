@@ -42,6 +42,26 @@ jobs:
             echo 'Candidate patch neither applies nor matches the current tree.' >&2
             exit 1
           fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema_paths = (
+              Path('contracts/frontier-state-v2.schema.json'),
+              Path('skills/myrmex-frontier-delegation/assets/schemas/frontier-state.schema.json'),
+          )
+          definition = {
+              'type': ['string', 'null'],
+              'pattern': '^attempt-[0-9a-f]{24}$',
+          }
+          for path in schema_paths:
+              data = json.loads(path.read_text(encoding='utf-8'))
+              properties = data['properties']['delegation_ledger']['items']['properties']
+              properties['attempt_group_id'] = definition
+              path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          if schema_paths[0].read_bytes() != schema_paths[1].read_bytes():
+              raise SystemExit('Frontier schemas diverged after delegation attempt metadata update')
+          PY
           git diff --check
       - uses: actions/setup-python@v5
         with:
