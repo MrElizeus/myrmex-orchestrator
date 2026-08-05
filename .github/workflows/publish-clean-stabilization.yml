@@ -1,0 +1,29 @@
+name: Publish clean stabilization branch
+
+on:
+  push:
+    branches:
+      - fix/state-recovery-and-execution-policy
+    paths:
+      - .github/workflows/publish-clean-stabilization.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.head_commit.message == 'ci: publish clean stabilization branch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create clean branch from reviewed base and candidate commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin feat/parent-objective-continuity
+          git switch --create fix/state-recovery-and-execution-policy-clean cfba4d3615ff9929d5bb2139baa226bca8d978fe
+          git cherry-pick 664b09842801cbfc5cc186279267cd269a2a1da7
+          test "$(git rev-list --count cfba4d3615ff9929d5bb2139baa226bca8d978fe..HEAD)" = "1"
+          git push origin HEAD:fix/state-recovery-and-execution-policy-clean
