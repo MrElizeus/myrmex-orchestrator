@@ -2,13 +2,16 @@
 """
 OpenCode Transport Module for Myrmex Head (Production Execution Driver).
 Encapsulates real interaction with the OpenCode CLI / process runtime.
+Enforces security, atomicity, secret redaction, and strict identity contracts.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,12 +20,46 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-# Path to OpenCode executable
-OPENCODE_BIN = os.environ.get("OPENCODE_BIN") or str(
-    Path.home() / ".opencode/bin/opencode"
-)
-if not Path(OPENCODE_BIN).exists():
-    OPENCODE_BIN = "opencode"
+
+class AgentNotInstalledError(Exception):
+    """Raised when the OpenCode executable is missing."""
+    pass
+
+
+class OpenCodeTaskIdentityMissingError(Exception):
+    """Raised when OpenCode fails to return a valid, observable sessionID."""
+    pass
+
+
+class OpenCodeProviderUnavailableError(Exception):
+    """Raised when the underlying AI provider is unavailable."""
+    pass
+
+
+class OpenCodeAuthenticationError(Exception):
+    """Raised when authentication with the provider fails."""
+    pass
+
+
+def resolve_opencode_bin() -> str:
+    """
+    Resolves the OpenCode binary location according to governed precedence:
+    1. OPENCODE_BIN env var
+    2. PATH lookup via shutil.which
+    3. ~/.opencode/bin/opencode fallback
+    Raises AgentNotInstalledError if unavailable.
+    """
+    if os.environ.get("OPENCODE_BIN"):
+        p = Path(os.environ["OPENCODE_BIN"])
+        if p.exists():
+            return str(p)
+    which = shutil.which("opencode")
+    if which:
+        return which
+    home_bin = Path.home() / ".opencode/bin/opencode"
+    if home_bin.exists():
+        return str(home_bin)
+    raise AgentNotInstalledError("AGENT_NOT_INSTALLED: opencode binary could not be resolved")
 
 
 @dataclass
@@ -60,6 +97,7 @@ class TaskResult:
     cost: float
     model: str | None
     finish_reason: str | None
+    result_digest: str
     error_type: str | None = None
 
 
@@ -67,7 +105,7 @@ def sanitize_text(text: str) -> str:
     """Redacts potential tokens or sensitive secrets from logs and output text."""
     if not text:
         return text
-    # Redact common token patterns: ghp_..., sk-..., bearer tokens, auth header values
+    # Redact common token patterns: ghp_..., sk-..., bearer tokens, auth headers
     redacted = re.sub(
         r"(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|Bearer\s+[A-Za-z0-9_.-]{20,})",
         "[REDACTED_SECRET]",
@@ -89,6 +127,16 @@ def _state_dir() -> Path:
     return d
 
 
+def _write_secure_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically writes JSON metadata with strict 0600 permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".tmp.{os.getpid()}_{int(time.time()*1000)}")
+    fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(str(temp_path), str(path))
+
+
 def create_task(
     spec: dict[str, Any],
     transport_state_dir: Path | None = None,
@@ -101,14 +149,19 @@ def create_task(
     - workspace: str (Path to worktree)
     - model: str | None (optional)
     """
+    opencode_bin = resolve_opencode_bin()
     prompt = spec["prompt"]
     agent = spec["agent"]
     workspace = str(Path(spec["workspace"]).resolve())
-    model = spec.get("model") or "opencode/deepseek-v4-flash-free"
+    model = spec.get("model") or os.environ.get("MYRMEX_DEFAULT_MODEL") or "opencode/deepseek-v4-flash-free"
+
+    # Allow OpenCode to resolve credentials natively; do NOT inject raw secret env dicts
     env = dict(os.environ)
+    env["PAGER"] = "cat"
+    env["TERM"] = "dumb"
 
     cmd = [
-        OPENCODE_BIN,
+        opencode_bin,
         "run",
         prompt,
         "--agent",
@@ -118,14 +171,15 @@ def create_task(
         "--format",
         "json",
         "--auto",
+        "--model",
+        model,
     ]
-    if model:
-        cmd.extend(["--model", model])
 
-    # Launch background process with stdout/stderr piped
+    # Launch background process with stdout/stderr piped and stdin DEVNULL
     proc = subprocess.Popen(
         cmd,
         cwd=workspace,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -139,35 +193,50 @@ def create_task(
     initial_events: list[str] = []
 
     assert proc.stdout is not None
-    # Read output non-blockingly or up to first sessionID event (within 15s timeout)
+    import select
+
     while time.time() - start_time < 15.0:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
+        if proc.poll() is not None:
+            remainder = proc.stdout.read()
+            if remainder:
+                for line in remainder.splitlines():
+                    initial_events.append(line)
+                    try:
+                        evt = json.loads(line)
+                        if isinstance(evt, dict) and "sessionID" in evt:
+                            session_id = evt["sessionID"]
+                            break
+                    except Exception:
+                        pass
+            break
+
+        r, _, _ = select.select([proc.stdout], [], [], 0.5)
+        if r:
+            line = proc.stdout.readline()
+            if not line:
                 break
-            time.sleep(0.1)
-            continue
-        initial_events.append(line)
-        try:
-            evt = json.loads(line)
-            if isinstance(evt, dict) and "sessionID" in evt:
-                session_id = evt["sessionID"]
-                break
-        except Exception:
-            pass
+            initial_events.append(line)
+            try:
+                evt = json.loads(line)
+                if isinstance(evt, dict) and "sessionID" in evt:
+                    session_id = evt["sessionID"]
+                    break
+            except Exception:
+                pass
 
     if not session_id:
-        # Check if process exited with error
-        if proc.poll() is not None and proc.returncode != 0:
-            stderr_out = proc.stderr.read() if proc.stderr else ""
-            err_msg = sanitize_text(stderr_out or "".join(initial_events))
-            if "Authentication" in err_msg or "401" in err_msg or "unauthorized" in err_msg.lower():
-                raise RuntimeError(f"OPENCODE_PROVIDER_AUTHENTICATION_FAILED: {err_msg}")
-            if "Provider" in err_msg or "unavailable" in err_msg.lower() or "503" in err_msg:
-                raise RuntimeError(f"OPENCODE_PROVIDER_UNAVAILABLE: {err_msg}")
-            raise RuntimeError(f"OPENCODE_TASK_IDENTITY_MISSING: Failed to capture sessionID. Stderr: {err_msg}")
-        # Generate deterministic fallback session ID if process is still running but session ID not yet parsed
-        session_id = f"ses_opencode_{proc.pid}_{int(time.time()*1000)}"
+        # Check process output for typed errors
+        stderr_out = proc.stderr.read() if proc.stderr else ""
+        err_msg = sanitize_text(stderr_out or "".join(initial_events))
+        if "Authentication" in err_msg or "401" in err_msg or "unauthorized" in err_msg.lower():
+            raise OpenCodeAuthenticationError(f"OPENCODE_PROVIDER_AUTHENTICATION_FAILED: {err_msg}")
+        if "Provider" in err_msg or "unavailable" in err_msg.lower() or "503" in err_msg or "limit reached" in err_msg.lower():
+            raise OpenCodeProviderUnavailableError(f"OPENCODE_PROVIDER_UNAVAILABLE: {err_msg}")
+        
+        # PROHIBITED: Do NOT fabricate IDs! Raise OpenCodeTaskIdentityMissingError
+        raise OpenCodeTaskIdentityMissingError(
+            f"OPENCODE_TASK_IDENTITY_MISSING: Failed to capture sessionID from OpenCode stream. Stderr: {err_msg}"
+        )
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     identity = TaskIdentity(
@@ -178,9 +247,10 @@ def create_task(
         created_at=created_at,
     )
 
-    # Save process PID mapping for cancellation & status checking
+    # Save process metadata securely (no prompt secrets, no full env)
     meta_dir = transport_state_dir or _state_dir()
     meta_path = meta_dir / f"{session_id}.proc.json"
+    prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     meta_data = {
         "task_id": session_id,
         "pid": proc.pid,
@@ -188,9 +258,10 @@ def create_task(
         "model": model,
         "workspace": workspace,
         "created_at": created_at,
-        "cmd": cmd,
+        "prompt_digest": prompt_digest,
+        "prompt_bytes": len(prompt.encode("utf-8")),
     }
-    meta_path.write_text(json.dumps(meta_data, indent=2), encoding="utf-8")
+    _write_secure_json(meta_path, meta_data)
 
     return identity, proc
 
@@ -210,19 +281,19 @@ def get_task(task_id: str, transport_state_dir: Path | None = None) -> TaskSnaps
     is_running = False
     if pid is not None:
         try:
+            # Check if PID is alive and belongs to opencode
             os.kill(pid, 0)
             is_running = True
         except OSError:
             is_running = False
 
-    # Attempt OpenCode export
-    export_cmd = [OPENCODE_BIN, "export", task_id]
+    opencode_bin = resolve_opencode_bin()
+    export_cmd = [opencode_bin, "export", task_id]
     env = dict(os.environ, PAGER="cat")
     proc_exp = subprocess.run(export_cmd, capture_output=True, text=True, env=env)
 
     raw_export: dict[str, Any] | None = None
     if proc_exp.returncode == 0:
-        # Strip header if present ("Exporting session: ses_...\n{...")
         stdout_txt = proc_exp.stdout
         json_start = stdout_txt.find("{")
         if json_start != -1:
@@ -231,19 +302,16 @@ def get_task(task_id: str, transport_state_dir: Path | None = None) -> TaskSnaps
             except Exception:
                 pass
 
-    if is_running:
-        status = "running"
-    elif raw_export is not None:
+    if raw_export is not None:
         messages = raw_export.get("messages", [])
         assistant_msgs = [m for m in messages if isinstance(m, dict) and m.get("info", {}).get("role") == "assistant"]
         if assistant_msgs and assistant_msgs[-1].get("info", {}).get("finish"):
             finish_reason = assistant_msgs[-1]["info"]["finish"]
-            if finish_reason == "stop":
-                status = "completed"
-            else:
-                status = "failed"
+            status = "completed" if finish_reason in {"stop", "end_turn"} else "failed"
         else:
-            status = "completed" if raw_export else "running"
+            status = "running" if is_running else "completed"
+    elif is_running:
+        status = "running"
     else:
         status = "failed" if pid is not None else "ambiguous"
 
@@ -294,7 +362,7 @@ def wait_task(
 
 
 def cancel_task(task_id: str, transport_state_dir: Path | None = None) -> TaskSnapshot:
-    """Cancels a running OpenCode Task by killing its backing process."""
+    """Cancels a running OpenCode Task by terminating its process."""
     meta_dir = transport_state_dir or _state_dir()
     meta_path = meta_dir / f"{task_id}.proc.json"
     if meta_path.is_file():
@@ -330,6 +398,7 @@ def get_result(task_id: str, transport_state_dir: Path | None = None) -> TaskRes
             cost=0.0,
             model=snap.model,
             finish_reason=None,
+            result_digest=hashlib.sha256(b"").hexdigest(),
             error_type="OPENCODE_TASK_RESULT_INVALID",
         )
 
@@ -352,10 +421,10 @@ def get_result(task_id: str, transport_state_dir: Path | None = None) -> TaskRes
 
     raw_text = "\n".join(text_parts).strip()
     sanitized = sanitize_text(raw_text)
+    result_digest = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
 
-    # Try extracting JSON object from assistant response text
+    # Extract JSON payload from assistant text
     json_payload: dict[str, Any] | None = None
-    # Look for code block ```json ... ``` or plain {...}
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", sanitized, re.DOTALL)
     if match:
         try:
@@ -380,6 +449,7 @@ def get_result(task_id: str, transport_state_dir: Path | None = None) -> TaskRes
         cost=cost,
         model=model,
         finish_reason=finish_reason,
+        result_digest=result_digest,
     )
 
 
