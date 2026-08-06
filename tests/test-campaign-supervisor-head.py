@@ -22,13 +22,22 @@ def run_cmd(cmd: list[str], state_home: str) -> subprocess.CompletedProcess[str]
 
 
 def test_supervisor_once_flow() -> None:
-    with tempfile.TemporaryDirectory(prefix="myrmex-head-test-") as td:
+    with tempfile.TemporaryDirectory(prefix="myrmex-head-test-") as td, \
+         tempfile.TemporaryDirectory(prefix="myrmex-head-repo-") as repo_dir:
+        # Initialize test repo
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test Runner"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+        (Path(repo_dir) / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "chore: initial baseline"], cwd=repo_dir, check=True)
+
         # Initialize campaign with 2 sequential WUs
         proc_init = run_cmd([
             sys.executable, str(BIN_CAMPAIGN),
             "init", "--id", "camp-head-test",
             "--title", "Head Test",
-            "--repo-root", str(ROOT),
+            "--repo-root", repo_dir,
         ], td)
         assert proc_init.returncode == 0
 
@@ -37,7 +46,8 @@ def test_supervisor_once_flow() -> None:
             "wu-add", "camp-head-test",
             "--wu-id", "WU-001",
             "--objective", "First task",
-            "--verify-cmd", "true",
+            "--implementation-cmd", f"{sys.executable} -c \"from pathlib import Path; Path('task1.txt').write_text('task 1 done', encoding='utf-8')\"",
+            "--verify-cmd", f"{sys.executable} -c \"from pathlib import Path; assert Path('task1.txt').exists()\"",
         ], td)
 
         run_cmd([
@@ -46,13 +56,13 @@ def test_supervisor_once_flow() -> None:
             "--wu-id", "WU-002",
             "--objective", "Second task",
             "--dependencies", "WU-001",
-            "--verify-cmd", "true",
+            "--implementation-cmd", f"{sys.executable} -c \"from pathlib import Path; Path('task2.txt').write_text('task 2 done', encoding='utf-8')\"",
+            "--verify-cmd", f"{sys.executable} -c \"from pathlib import Path; assert Path('task2.txt').exists()\"",
         ], td)
 
-        # Step 1: Run head --once -> should process WU-001
         proc_head1 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
         assert proc_head1.returncode == 0, f"head1 failed: {proc_head1.stderr}"
-        assert "Work unit WU-001 COMPLETED" in proc_head1.stdout
+        assert "Work unit WU-001 COMPLETED" in proc_head1.stdout, f"proc_head1 output: stdout={proc_head1.stdout}, stderr={proc_head1.stderr}"
 
         # Verify WU-001 completed, evidence recorded
         proc_show1 = run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", "camp-head-test", "--json"], td)
@@ -62,10 +72,9 @@ def test_supervisor_once_flow() -> None:
         assert wu1["evidence"] is not None
         assert wu1["evidence"]["objective"] == "First task"
 
-        # Step 2: Run head --once -> should process WU-002
         proc_head2 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
         assert proc_head2.returncode == 0, f"head2 failed: {proc_head2.stderr}"
-        assert "Work unit WU-002 COMPLETED" in proc_head2.stdout
+        assert "Work unit WU-002 COMPLETED" in proc_head2.stdout, f"proc_head2 output: stdout={proc_head2.stdout}, stderr={proc_head2.stderr}"
 
         # Step 3: Run head --once -> all done, should mark campaign complete
         proc_head3 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
