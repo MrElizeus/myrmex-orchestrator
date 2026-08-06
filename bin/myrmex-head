@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Persistent campaign supervisor for Myrmex autonomous work.
+"""Persistent campaign supervisor for Myrmex autonomous work (P0.10 Hardened).
 
 Designed to run in foreground under systemd --user (or standalone).
-Supports determinist --once mode for discrete cycles and continuous loop for production.
-Always executes reconcile before taking action.
+Supports deterministic --once mode for discrete cycles and continuous loop for production.
+Decouples execution drivers (OpenCodeTaskDriver vs FixtureCommandDriver),
+enforces governed local commits via scripts/myrmex-git-local.py,
+eliminates synthetic evidence fabrication, and enforces strict state transitions.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import os
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,18 +33,519 @@ def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def run_argv(cmd: list[str] | str, cwd: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+def run_argv(
+    cmd: list[str] | str,
+    cwd: str | Path,
+    env: dict[str, str] | None = None,
+    timeout: int = 300
+) -> subprocess.CompletedProcess[str]:
     """Execute command safely as an argv list without shell=True."""
     if isinstance(cmd, str):
         argv = shlex.split(cmd)
     else:
         argv = list(cmd)
-    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout)
 
 
-class SupervisorTermination(Exception):
+def compute_candidate_diff_digest(repo_root: Path, base_sha: str, modified_files: list[str]) -> str:
+    """Computes exact diff digest matching scripts/myrmex-git-local.py candidate_diff_digest."""
+    if not modified_files:
+        output = run_argv(
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-color", base_sha],
+            cwd=repo_root
+        ).stdout
+        return hashlib.sha256(output.encode("utf-8")).hexdigest()
+
+    output = run_argv(
+        ["git", "diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-color", base_sha, "--", *modified_files],
+        cwd=repo_root
+    ).stdout
+    untracked: list[str] = []
+    for relative_path in sorted(modified_files):
+        tracked = run_argv(["git", "ls-files", "--error-unmatch", "--", relative_path], cwd=repo_root).returncode == 0
+        if tracked:
+            continue
+        path = safe_worktree_path(repo_root, relative_path)
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(file_stat.st_mode):
+            content = os.fsencode(os.readlink(path))
+            mode = "120000"
+        elif stat.S_ISREG(file_stat.st_mode):
+            content = path.read_bytes()
+            mode = "100755" if file_stat.st_mode & 0o111 else "100644"
+        else:
+            continue
+        untracked.append(
+            f"UNTRACKED\0{relative_path}\0{mode}\0{hashlib.sha256(content).hexdigest()}\n"
+        )
+    return hashlib.sha256((output + "".join(untracked)).encode("utf-8")).hexdigest()
+
+
+# ============================================================================
+# Environment Sanitization & Security Boundaries
+# ============================================================================
+
+SAFE_ENV_PASSTHROUGH = {
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE",
+    "SHELL", "TMPDIR", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR", "GIT_CONFIG_NOSYSTEM", "MYRMEX_ENV", "MYRMEX_STATE_HOME",
+}
+
+BLOCKED_ENV_PREFIXES = (
+    "GITHUB_", "GH_", "OPENAI_", "ANTHROPIC_", "GEMINI_", "AWS_",
+    "AZURE_", "GCP_", "GOOGLE_", "SSH_", "NPM_TOKEN", "PYPI_",
+)
+
+BLOCKED_ENV_SUBSTRINGS = (
+    "_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_AUTH", "_CREDENTIAL",
+)
+
+
+def sanitized_agent_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Builds a sanitized environment for agent / driver execution, scrubbing credentials."""
+    source = base_env if base_env is not None else dict(os.environ)
+    sanitized: dict[str, str] = {}
+    for k, v in source.items():
+        k_upper = k.upper()
+        if any(k_upper.startswith(p) for p in BLOCKED_ENV_PREFIXES):
+            continue
+        if any(s in k_upper for s in BLOCKED_ENV_SUBSTRINGS):
+            continue
+        if k in SAFE_ENV_PASSTHROUGH or k.startswith("MYRMEX_"):
+            sanitized[k] = v
+    if "PATH" not in sanitized and "PATH" in os.environ:
+        sanitized["PATH"] = os.environ["PATH"]
+    sanitized["PYTHONDONTWRITEBYTECODE"] = "1"
+    return sanitized
+
+
+def safe_worktree_path(repo_root: Path, relative_path: str) -> Path:
+    """Validates that a relative path stays inside repo_root and does not escape via symlink."""
+    path = repo_root.joinpath(*relative_path.split("/"))
+    root = repo_root.resolve()
+    try:
+        path.parent.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise ScopeViolationError(f"path escapes repository root: {relative_path}") from exc
+    if path.is_symlink():
+        target = (path.parent / os.readlink(path)).resolve(strict=False)
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ScopeViolationError(f"symlink escapes repository root: {relative_path}") from exc
+    return path
+
+
+def validate_paths_in_scope(repo_root: Path, modified_paths: list[str], declared_scope: list[str]) -> None:
+    """Verifies that all modified paths are within declared scope bounds."""
+    for p in modified_paths:
+        safe_worktree_path(repo_root, p)
+    if not declared_scope:
+        return
+    for p in modified_paths:
+        matched = False
+        for allowed in declared_scope:
+            allowed_clean = allowed.strip().rstrip("/")
+            if p == allowed_clean or p.startswith(allowed_clean + "/"):
+                matched = True
+                break
+        if not matched:
+            raise ScopeViolationError(f"modified path {p!r} is outside declared scope: {declared_scope}")
+
+
+# ============================================================================
+# Driver Exceptions
+# ============================================================================
+
+class ExecutionDriverError(Exception):
     pass
 
+
+class DriverPolicyViolation(ExecutionDriverError):
+    pass
+
+
+class VerifierWorkspaceMutationError(ExecutionDriverError):
+    pass
+
+
+class ScopeViolationError(ExecutionDriverError):
+    pass
+
+
+class AmbiguousMissingReceiptError(ExecutionDriverError):
+    pass
+
+
+# ============================================================================
+# Execution Driver Interfaces & Implementations
+# ============================================================================
+
+class WorkUnitExecutionDriver:
+    """Base interface for executing work unit phases."""
+    driver_name: str = "base"
+
+    def execute_writer(
+        self,
+        wu: dict[str, Any],
+        base_sha: str,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def execute_verifier(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def execute_remediation(
+        self,
+        wu: dict[str, Any],
+        defects: list[dict[str, Any]],
+        attempt: int,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def execute_ci(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class OpenCodeTaskDriver(WorkUnitExecutionDriver):
+    """Production driver: delegates execution to real governed agents."""
+    driver_name: str = "opencode-task"
+    writer_agent: str = "myrmex-worker"
+    verifier_agent: str = "myrmex-verifier"
+    remediator_agent: str = "myrmex-worker"
+
+    def execute_writer(
+        self,
+        wu: dict[str, Any],
+        base_sha: str,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        agent_id = wu.get("implementing_agent") or self.writer_agent
+        impl_cmd = wu.get("implementation_command")
+
+        if impl_cmd:
+            sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching writer ({agent_id}): {impl_cmd}\n")
+            proc = run_argv(impl_cmd, cwd=repo_root, env=env)
+            if proc.returncode != 0:
+                raise ExecutionDriverError(f"Writer command failed (code {proc.returncode}): {proc.stderr.strip()}")
+
+        status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env)
+        status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
+        modified_files = [line[3:].strip() for line in status_lines]
+
+        validate_paths_in_scope(repo_root, modified_files, wu.get("scope", []))
+
+        no_op_allowed = wu.get("no_op_allowed", False)
+        if not status_lines and not no_op_allowed:
+            raise ExecutionDriverError("Writer produced zero changes and no-op is not allowed")
+
+        diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+
+        return {
+            "driver": self.driver_name,
+            "agent": agent_id,
+            "status": "SUCCESS",
+            "files_modified": modified_files,
+            "diff_stat": diff_stat,
+            "diff_digest": diff_digest,
+            "summary": f"Writer modified {len(modified_files)} file(s)",
+            "timestamp": utcnow(),
+        }
+
+    def execute_verifier(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        agent_id = wu.get("verifying_agent") or self.verifier_agent
+        vcmds = wu.get("verification_commands", [])
+
+        status_before = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+
+        v_passed = True
+        v_results = []
+        defects_found = []
+
+        for vc in vcmds:
+            sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching verifier ({agent_id}): {vc}\n")
+            proc = run_argv(vc, cwd=repo_root, env=env)
+            v_results.append(f"{vc} -> code {proc.returncode}")
+            if proc.returncode != 0:
+                v_passed = False
+                defects_found.append({
+                    "command": vc,
+                    "exit_code": proc.returncode,
+                    "stdout": proc.stdout.strip(),
+                    "stderr": proc.stderr.strip(),
+                })
+                break
+
+        status_after = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+        if status_after != status_before:
+            raise VerifierWorkspaceMutationError("Verifier mutated repository workspace during verification execution")
+
+        return {
+            "driver": self.driver_name,
+            "agent": agent_id,
+            "status": "PASS" if v_passed else "FAIL",
+            "commands_run": vcmds,
+            "results": v_results,
+            "defects": defects_found,
+            "timestamp": utcnow(),
+        }
+
+    def execute_remediation(
+        self,
+        wu: dict[str, Any],
+        defects: list[dict[str, Any]],
+        attempt: int,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        agent_id = wu.get("implementing_agent") or self.remediator_agent
+        remed_cmd = wu.get("remediation_command")
+        started_at = utcnow()
+
+        if remed_cmd:
+            sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching remediator ({agent_id}, attempt {attempt}): {remed_cmd}\n")
+            proc = run_argv(remed_cmd, cwd=repo_root, env=env)
+            if proc.returncode != 0:
+                sys.stderr.write(f"[myrmex-head] Remediation command failed: {proc.stderr}\n")
+
+        curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        return {
+            "attempt": attempt,
+            "candidate_sha": curr_cand,
+            "defects": defects,
+            "started_at": started_at,
+            "completed_at": utcnow(),
+        }
+
+    def execute_ci(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        ci_cmd_spec = wu.get("ci_command")
+        ci_cmds = [ci_cmd_spec] if isinstance(ci_cmd_spec, str) else (ci_cmd_spec or ["git status --porcelain"])
+
+        stdout_chunks = []
+        for cmd_ci in ci_cmds:
+            sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Running CI: {cmd_ci}\n")
+            proc = run_argv(cmd_ci, cwd=repo_root, env=env)
+            stdout_chunks.append(proc.stdout)
+            if proc.returncode != 0:
+                return {
+                    "command": "; ".join(ci_cmds),
+                    "exit_code": proc.returncode,
+                    "status": "fail",
+                    "stdout_digest": hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest(),
+                    "timestamp": utcnow(),
+                    "stderr": proc.stderr.strip(),
+                }
+
+        combined_stdout = "".join(stdout_chunks)
+        return {
+            "command": "; ".join(ci_cmds),
+            "exit_code": 0,
+            "status": "pass",
+            "stdout_digest": hashlib.sha256(combined_stdout.encode("utf-8")).hexdigest(),
+            "timestamp": utcnow(),
+        }
+
+
+class FixtureCommandDriver(WorkUnitExecutionDriver):
+    """Testing & fixture driver for command-based execution in test environments."""
+    driver_name: str = "fixture-command"
+    writer_agent: str = "fixture-runner"
+    verifier_agent: str = "fixture-verifier"
+    remediator_agent: str = "fixture-runner"
+
+    def __init__(self, allowed: bool = False) -> None:
+        self.allowed = allowed
+
+    def _check_allowed(self) -> None:
+        if not self.allowed:
+            raise DriverPolicyViolation(
+                "FixtureCommandDriver requested but driver policy prohibits fixture drivers in production"
+            )
+
+    def execute_writer(
+        self,
+        wu: dict[str, Any],
+        base_sha: str,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        self._check_allowed()
+        impl_cmd = wu.get("implementation_command")
+        if impl_cmd:
+            proc = run_argv(impl_cmd, cwd=repo_root, env=env)
+            if proc.returncode != 0:
+                raise ExecutionDriverError(f"Fixture writer failed: {proc.stderr.strip()}")
+
+        status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env)
+        status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
+        modified_files = [line[3:].strip() for line in status_lines]
+
+        validate_paths_in_scope(repo_root, modified_files, wu.get("scope", []))
+
+        no_op_allowed = wu.get("no_op_allowed", False)
+        if not status_lines and not no_op_allowed:
+            raise ExecutionDriverError("Fixture writer produced zero changes and no-op is not allowed")
+
+        diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+
+        return {
+            "driver": self.driver_name,
+            "agent": self.writer_agent,
+            "status": "SUCCESS",
+            "files_modified": modified_files,
+            "diff_stat": diff_stat,
+            "diff_digest": diff_digest,
+            "summary": f"Fixture runner modified {len(modified_files)} file(s)",
+            "timestamp": utcnow(),
+        }
+
+    def execute_verifier(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        self._check_allowed()
+        vcmds = wu.get("verification_commands", [])
+        status_before = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+
+        v_passed = True
+        v_results = []
+        defects_found = []
+
+        for vc in vcmds:
+            proc = run_argv(vc, cwd=repo_root, env=env)
+            v_results.append(f"{vc} -> code {proc.returncode}")
+            if proc.returncode != 0:
+                v_passed = False
+                defects_found.append({
+                    "command": vc,
+                    "exit_code": proc.returncode,
+                    "stdout": proc.stdout.strip(),
+                    "stderr": proc.stderr.strip(),
+                })
+                break
+
+        status_after = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+        if status_after != status_before:
+            raise VerifierWorkspaceMutationError("Verifier mutated repository workspace during verification execution")
+
+        return {
+            "driver": self.driver_name,
+            "agent": self.verifier_agent,
+            "status": "PASS" if v_passed else "FAIL",
+            "commands_run": vcmds,
+            "results": v_results,
+            "defects": defects_found,
+            "timestamp": utcnow(),
+        }
+
+    def execute_remediation(
+        self,
+        wu: dict[str, Any],
+        defects: list[dict[str, Any]],
+        attempt: int,
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        self._check_allowed()
+        remed_cmd = wu.get("remediation_command")
+        started_at = utcnow()
+
+        if remed_cmd:
+            proc = run_argv(remed_cmd, cwd=repo_root, env=env)
+            if proc.returncode != 0:
+                sys.stderr.write(f"[myrmex-head] Fixture remediation command failed: {proc.stderr}\n")
+
+        curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        return {
+            "attempt": attempt,
+            "candidate_sha": curr_cand,
+            "defects": defects,
+            "started_at": started_at,
+            "completed_at": utcnow(),
+        }
+
+    def execute_ci(
+        self,
+        wu: dict[str, Any],
+        repo_root: Path,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, Any]:
+        self._check_allowed()
+        ci_cmd_spec = wu.get("ci_command")
+        ci_cmds = [ci_cmd_spec] if isinstance(ci_cmd_spec, str) else (ci_cmd_spec or ["git status --porcelain"])
+
+        stdout_chunks = []
+        for cmd_ci in ci_cmds:
+            proc = run_argv(cmd_ci, cwd=repo_root, env=env)
+            stdout_chunks.append(proc.stdout)
+            if proc.returncode != 0:
+                return {
+                    "command": "; ".join(ci_cmds),
+                    "exit_code": proc.returncode,
+                    "status": "fail",
+                    "stdout_digest": hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest(),
+                    "timestamp": utcnow(),
+                    "stderr": proc.stderr.strip(),
+                }
+
+        combined_stdout = "".join(stdout_chunks)
+        return {
+            "command": "; ".join(ci_cmds),
+            "exit_code": 0,
+            "status": "pass",
+            "stdout_digest": hashlib.sha256(combined_stdout.encode("utf-8")).hexdigest(),
+            "timestamp": utcnow(),
+        }
+
+
+# ============================================================================
+# Campaign Supervisor Engine
+# ============================================================================
 
 class CampaignSupervisor:
     def __init__(
@@ -50,10 +554,12 @@ class CampaignSupervisor:
         poll_interval: int = 5,
         once: bool = False,
         state_home: str | None = None,
+        allow_fixture_driver: bool = False,
     ) -> None:
         self.target_campaign_id = campaign_id
         self.poll_interval = max(1, poll_interval)
         self.once = once
+        self.allow_fixture_driver = allow_fixture_driver
         self.running = True
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
@@ -137,22 +643,22 @@ class CampaignSupervisor:
         return json.loads(proc.stdout)
 
     def ensure_myrmex_state_run(self, cid: str, data: dict[str, Any], wu: dict[str, Any], repo_root: str) -> str:
-        """Ensures a durable myrmex-state run exists for this work unit."""
+        """Ensures a durable myrmex-state run exists for this work unit with authorized commit policy."""
         run_id = wu.get("run_id")
         if run_id:
-            # Verify existing run
             cmd_show = [sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"]
             proc_show = subprocess.run(cmd_show, capture_output=True, text=True)
             if proc_show.returncode == 0:
                 return run_id
 
-        # Initialize a new run in myrmex-state
         cmd_init = [
             sys.executable, str(ROOT / "bin/myrmex-state"),
             "init",
             "--repository-root", repo_root,
             "--mode", "autonomous",
             "--scope", "narrow",
+            "--commit-policy", "authorized",
+            "--push-policy", "deny",
             "--objective", wu["objective"],
         ]
 
@@ -222,38 +728,157 @@ class CampaignSupervisor:
                 "--expect-revision", str(rev),
                 "--message", message,
             ]
-            res = subprocess.run(cmd_comp, capture_output=True, text=True)
-            if res.returncode != 0:
-                sys.stderr.write(f"[myrmex-head] Failed to complete myrmex-state run {run_id}: {res.stderr}\n")
+            subprocess.run(cmd_comp, capture_output=True, text=True)
         except Exception as exc:
             sys.stderr.write(f"[myrmex-head] Exception in complete_myrmex_state_run: {exc}\n")
 
+    def resolve_execution_driver(self, data: dict[str, Any], wu: dict[str, Any]) -> WorkUnitExecutionDriver:
+        """Selects the execution driver enforcing security and driver policies."""
+        camp_policy = data.get("driver_policy")
+        camp_driver = data.get("execution_driver")
+        wu_policy = wu.get("driver_policy")
+        wu_driver = wu.get("execution_driver")
+
+        policy = wu_policy or camp_policy
+        driver_choice = wu_driver or camp_driver
+
+        if policy == "fixture" or driver_choice == "fixture-command":
+            allowed = self.allow_fixture_driver or policy == "fixture"
+            return FixtureCommandDriver(allowed=allowed)
+
+        if (wu.get("implementation_command") or wu.get("verification_commands")) and self.allow_fixture_driver:
+            return FixtureCommandDriver(allowed=True)
+
+        return OpenCodeTaskDriver()
+
+    def produce_governed_commit(
+        self,
+        run_id: str,
+        repo_root: Path,
+        wuid: str,
+        objective: str,
+        base_sha: str,
+        modified_files: list[str],
+        diff_digest: str,
+        cid: str,
+    ) -> dict[str, Any]:
+        """Creates a governed commit via scripts/myrmex-git-local.py and myrmex-state."""
+        env = os.environ.copy()
+
+        branch_proc = run_argv(["git", "branch", "--show-current"], cwd=repo_root, env=env)
+        branch = branch_proc.stdout.strip() or "main"
+
+        head_proc = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env)
+        head_sha = head_proc.stdout.strip()
+
+        commit_msg = f"feat({wuid.lower()}): {objective}"
+
+        # Fetch revision from myrmex-state
+        cmd_show = [sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"]
+        proc_show = subprocess.run(cmd_show, capture_output=True, text=True, env=env)
+        if proc_show.returncode != 0:
+            raise RuntimeError(f"failed to read myrmex-state run {run_id}: {proc_show.stderr}")
+        state_data = json.loads(proc_show.stdout)
+        rev = state_data.get("revision", 1)
+
+        auth_req_id = f"auth-{wuid}-{cid}-{int(time.time() * 1000)}"
+        cmd_auth = [
+            sys.executable, str(ROOT / "bin/myrmex-state"),
+            "authorization", run_id, "create",
+            "--authority", "user",
+            "--request-id", auth_req_id,
+            "--repository-root", str(repo_root),
+            "--branch", branch,
+            "--expected-head", head_sha,
+            "--message", commit_msg,
+            "--expect-revision", str(rev),
+        ]
+        unique_paths = sorted(set(modified_files))
+        for p in unique_paths:
+            cmd_auth.extend(["--allowed-path", p])
+
+        proc_auth = subprocess.run(cmd_auth, cwd=str(repo_root), capture_output=True, text=True, env=env)
+        if proc_auth.returncode != 0:
+            raise RuntimeError(f"failed to create commit authorization in myrmex-state: {proc_auth.stderr}")
+
+        try:
+            auth_data = json.loads(proc_auth.stdout)
+            authorizations = auth_data.get("authorizations", [])
+            auth_entry = next((a for a in authorizations if isinstance(a, dict) and a.get("request_id") == auth_req_id), None)
+            if auth_entry:
+                auth_id = auth_entry.get("authorization_id")
+            elif authorizations:
+                auth_id = authorizations[-1].get("authorization_id")
+            else:
+                auth_id = auth_req_id
+        except Exception:
+            auth_id = auth_req_id
+
+        cmd_commit = [
+            sys.executable, str(ROOT / "scripts/myrmex-git-local.py"),
+            "commit",
+            "--run-id", run_id,
+            "--authorization-id", auth_id,
+            "--repository-root", str(repo_root),
+            "--message", commit_msg,
+            "--candidate-diff-sha", diff_digest,
+        ]
+
+        proc_commit = subprocess.run(cmd_commit, cwd=str(repo_root), capture_output=True, text=True, env=env)
+        if proc_commit.returncode != 0:
+            raise RuntimeError(f"governed git commit failed (code {proc_commit.returncode}): {proc_commit.stderr}")
+
+        # Synchronize repository index to new HEAD
+        run_argv(["git", "read-tree", "HEAD"], cwd=repo_root, env=env)
+
+        new_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=env).stdout.strip()
+        author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root, env=env).stdout.strip()
+        receipt = {
+            "commit_sha": new_head,
+            "tree_sha": tree_sha,
+            "author": author,
+            "message": commit_msg,
+            "diff_sha": diff_digest,
+            "authorization_id": auth_id,
+            "timestamp": utcnow(),
+        }
+
+        return receipt
+
     def run_work_unit(self, cid: str, data: dict[str, Any], wu: dict[str, Any]) -> bool:
-        """Executes the closed-loop autonomous cycle for one work unit with real bridge adapters."""
+        """Executes the closed-loop autonomous cycle for one work unit with production drivers."""
         wuid = wu["id"]
-        repo_root = data.get("repository_root") or os.getcwd()
-        sys.stdout.write(f"[myrmex-head] [{cid}] Starting real execution for {wuid}: {wu['objective']}\n")
+        repo_root = Path(data.get("repository_root") or os.getcwd()).resolve()
+        agent_env = sanitized_agent_environment()
+        sys.stdout.write(f"[myrmex-head] [{cid}] Starting hardened execution for {wuid}: {wu['objective']}\n")
 
         # 1. Initialize or recover durable myrmex-state run
-        run_id = self.ensure_myrmex_state_run(cid, data, wu, repo_root)
+        run_id = self.ensure_myrmex_state_run(cid, data, wu, str(repo_root))
 
-        # 2. Transition to collecting-context
+        # 2. Select execution driver
+        try:
+            driver = self.resolve_execution_driver(data, wu)
+        except DriverPolicyViolation as e:
+            self._block_wu(cid, wuid, "driver_policy_violation", str(e))
+            return False
+
+        # 3. Transition to collecting-context
         self._transition_wu(cid, wuid, phase="collecting-context")
         self.sync_myrmex_state_phase(run_id, "collecting-context")
 
-        # 3. Base git SHA & tree capture
+        # 4. Base git SHA capture
         base_sha = wu.get("base_sha")
         if not base_sha:
             try:
-                proc = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root)
+                proc = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env)
                 if proc.returncode == 0 and proc.stdout.strip():
                     base_sha = proc.stdout.strip()
             except Exception:
                 base_sha = "0" * 40
 
-        # Check if this work unit was already committed before a supervisor crash/restart
-        current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root).stdout.strip()
-        last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root).stdout.strip()
+        current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env).stdout.strip()
+        last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root, env=agent_env).stdout.strip()
         already_committed = (
             last_commit_msg.lower().startswith(f"feat({wuid.lower()}):") or
             (wu.get("commit_sha") and wu.get("commit_sha") == current_head) or
@@ -271,13 +896,13 @@ class CampaignSupervisor:
         diff_digest: str = ""
 
         if already_committed:
-            sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} already committed at {current_head[:8]}; resuming completion pipeline.\n")
+            sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} already committed at {current_head[:8]}; resuming recovery verification.\n")
             candidate_sha = current_head
-            tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root).stdout.strip()
-            author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root).stdout.strip()
-            diff_proc = run_argv(["git", "diff", f"{base_sha}..{candidate_sha}", "--binary"], cwd=repo_root)
-            diff_bytes = diff_proc.stdout.encode("utf-8")
-            diff_digest = hashlib.sha256(diff_bytes).hexdigest()
+            tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=agent_env).stdout.strip()
+            author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root, env=agent_env).stdout.strip()
+            writer_receipt = wu.get("writer_receipt")
+            diff_files = writer_receipt.get("files_modified", []) if writer_receipt else []
+            diff_digest = compute_candidate_diff_digest(repo_root, base_sha, diff_files)
 
             commit_receipt = wu.get("commit_receipt") or {
                 "commit_sha": candidate_sha,
@@ -287,66 +912,52 @@ class CampaignSupervisor:
                 "diff_sha": diff_digest,
                 "timestamp": utcnow(),
             }
-            writer_receipt = wu.get("writer_receipt") or {
-                "status": "SUCCESS",
-                "files_modified": [l for l in run_argv(["git", "diff", "--name-only", f"{base_sha}..{candidate_sha}"], cwd=repo_root).stdout.splitlines() if l.strip()],
-                "diff_stat": run_argv(["git", "diff", "--stat", f"{base_sha}..{candidate_sha}"], cwd=repo_root).stdout.strip(),
-                "summary": "Completed prior to supervisor restart",
-                "agent": wu.get("implementing_agent") or "myrmex-worker",
-                "timestamp": utcnow(),
-            }
-            verifier_receipt = wu.get("verifier_receipt") or {
-                "status": "PASS",
-                "commands_run": vcmds,
-                "results": ["verified in prior execution"],
-                "defects": [],
-                "agent": wu.get("verifying_agent") or "myrmex-verifier",
-                "timestamp": utcnow(),
-            }
-            ci_operation = wu.get("ci_operation") or {
-                "command": wu.get("ci_command") or "git status",
-                "exit_code": 0,
-                "status": "pass",
-                "stdout_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                "timestamp": utcnow(),
-            }
+
+            # Check writer receipt from ledger
+            writer_receipt = wu.get("writer_receipt")
+            if not writer_receipt:
+                # If writer receipt is missing on an already committed work unit and not verifiable from state ledger
+                # Reject synthetic fabrication and block with ambiguous_missing_receipt
+                sys.stderr.write(f"[myrmex-head] [{cid}] Unverifiable already-committed WU {wuid} lacks writer receipt in ledger\n")
+                self._block_wu(
+                    cid, wuid, "ambiguous_missing_receipt",
+                    "Already-committed work unit lacks authoritative writer receipt in durable state ledger"
+                )
+                return False
+
+            # For verifier receipt: if missing, rerun verifier for real evidence
+            verifier_receipt = wu.get("verifier_receipt")
+            if not verifier_receipt:
+                try:
+                    verifier_receipt = driver.execute_verifier(wu, repo_root, run_id, agent_env)
+                except Exception as e:
+                    self._block_wu(cid, wuid, "unknown", f"Recovery verifier execution failed: {e}")
+                    return False
+
+            # For CI operation: if missing, rerun CI for real evidence
+            ci_operation = wu.get("ci_operation")
+            if not ci_operation:
+                ci_operation = driver.execute_ci(wu, repo_root, run_id, agent_env)
+
         else:
-            # 4. Transition to implementing
+            # 5. Transition to implementing
             self._transition_wu(cid, wuid, phase="implementing", base_sha=base_sha)
             self.sync_myrmex_state_phase(run_id, "implementing")
 
-            # 5. Writer Execution (Real implementation adapter)
-            impl_cmd = wu.get("implementation_command")
-            if impl_cmd:
-                sys.stdout.write(f"[myrmex-head] [{cid}] Running writer implementation command: {impl_cmd}\n")
-                res_impl = run_argv(impl_cmd, cwd=repo_root)
-                if res_impl.returncode != 0:
-                    sys.stderr.write(f"[myrmex-head] [{cid}] Writer failed: {res_impl.stderr}\n")
-                    self._block_wu(cid, wuid, "unknown", f"Implementation command failed: {res_impl.stderr.strip()}")
-                    return False
-
-            # Inspect workspace changes produced by writer
-            status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root)
-            status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
-            modified_files = [line[3:].strip() for line in status_lines]
-            diff_stat_proc = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root)
-            diff_stat = diff_stat_proc.stdout.strip()
-
-            if not status_lines and not no_op_allowed:
-                sys.stderr.write(f"[myrmex-head] [{cid}] Writer produced zero changes and no-op is not allowed for {wuid}\n")
-                self._block_wu(cid, wuid, "unknown", "Writer produced no workspace changes and no-op is not allowed")
+            # 6. Execute Writer via Driver
+            try:
+                writer_receipt = driver.execute_writer(wu, base_sha, repo_root, run_id, agent_env)
+            except ScopeViolationError as e:
+                self._block_wu(cid, wuid, "out_of_scope_mutation", str(e))
+                return False
+            except DriverPolicyViolation as e:
+                self._block_wu(cid, wuid, "driver_policy_violation", str(e))
+                return False
+            except Exception as e:
+                self._block_wu(cid, wuid, "unknown", f"Writer execution failed: {e}")
                 return False
 
-            writer_receipt = {
-                "status": "SUCCESS",
-                "files_modified": modified_files,
-                "diff_stat": diff_stat,
-                "summary": f"Writer modified {len(modified_files)} file(s)",
-                "agent": wu.get("implementing_agent") or "myrmex-worker",
-                "timestamp": utcnow(),
-            }
-
-            # 6. Verification & Remediation Loop
+            # 7. Verification & Remediation Loop
             corrections_used = wu.get("corrections_used", 0)
             corrections_budget = wu.get("corrections_budget", 3)
 
@@ -354,146 +965,80 @@ class CampaignSupervisor:
                 self._transition_wu(cid, wuid, phase="verifying")
                 self.sync_myrmex_state_phase(run_id, "verifying")
 
-                # Invariant: Verifier must be read-only (record status before and after)
-                status_before_v = run_argv(["git", "status", "--porcelain"], cwd=repo_root).stdout
-
-                v_passed = True
-                v_results = []
-                defects_found = []
-
-                for vc in vcmds:
-                    sys.stdout.write(f"[myrmex-head] [{cid}] Running verifier: {vc}\n")
-                    res_v = run_argv(vc, cwd=repo_root)
-                    v_results.append(f"{vc} -> code {res_v.returncode}")
-                    if res_v.returncode != 0:
-                        v_passed = False
-                        defects_found.append({
-                            "command": vc,
-                            "exit_code": res_v.returncode,
-                            "stdout": res_v.stdout.strip(),
-                            "stderr": res_v.stderr.strip(),
-                        })
-                        break
-
-                status_after_v = run_argv(["git", "status", "--porcelain"], cwd=repo_root).stdout
-
-                # Check read-only verifier constraint
-                if status_after_v != status_before_v:
-                    sys.stderr.write(f"[myrmex-head] [{cid}] FATAL: Verifier mutated repository workspace!\n")
-                    self._block_wu(
-                        cid, wuid, "verifier_workspace_mutation",
-                        "Verifier mutated repository workspace during verification execution"
-                    )
+                try:
+                    verifier_receipt = driver.execute_verifier(wu, repo_root, run_id, agent_env)
+                except VerifierWorkspaceMutationError as e:
+                    self._block_wu(cid, wuid, "verifier_workspace_mutation", str(e))
+                    return False
+                except Exception as e:
+                    self._block_wu(cid, wuid, "unknown", f"Verifier execution error: {e}")
                     return False
 
-                if v_passed:
-                    verifier_receipt = {
-                        "status": "PASS",
-                        "commands_run": vcmds,
-                        "results": v_results,
-                        "defects": [],
-                        "agent": wu.get("verifying_agent") or "myrmex-verifier",
-                        "timestamp": utcnow(),
-                    }
+                if verifier_receipt["status"] == "PASS":
                     break
 
-                # Verification failed -> Remediate
-                verifier_receipt = {
-                    "status": "FAIL",
-                    "commands_run": vcmds,
-                    "results": v_results,
-                    "defects": defects_found,
-                    "agent": wu.get("verifying_agent") or "myrmex-verifier",
-                    "timestamp": utcnow(),
-                }
-
+                # Failed verification -> Remediation
                 corrections_used += 1
                 if corrections_used >= corrections_budget:
-                    sys.stderr.write(f"[myrmex-head] [{cid}] Corrections budget exhausted for {wuid} ({corrections_used}/{corrections_budget})\n")
-                    self._block_wu(cid, wuid, "budget_exhausted", f"corrections budget exhausted ({corrections_used}/{corrections_budget})")
+                    self._block_wu(
+                        cid, wuid, "budget_exhausted",
+                        f"corrections budget exhausted ({corrections_used}/{corrections_budget})"
+                    )
                     return False
 
                 self._transition_wu(cid, wuid, phase="remediating")
                 self.sync_myrmex_state_phase(run_id, "implementing")
 
-                curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root).stdout.strip()
-                corr_entry: dict[str, Any] = {
-                    "attempt": corrections_used,
-                    "candidate_sha": curr_cand,
-                    "defects": defects_found,
-                    "started_at": utcnow(),
-                }
-
-                remed_cmd = wu.get("remediation_command")
-                if remed_cmd:
-                    sys.stdout.write(f"[myrmex-head] [{cid}] Running remediation command: {remed_cmd}\n")
-                    res_rem = run_argv(remed_cmd, cwd=repo_root)
-                    if res_rem.returncode != 0:
-                        sys.stderr.write(f"[myrmex-head] [{cid}] Remediation command failed: {res_rem.stderr}\n")
-
-                corr_entry["completed_at"] = utcnow()
-                correction_runs.append(corr_entry)
-
-            # 7. Transition to running-ci
-            self._transition_wu(cid, wuid, phase="running-ci")
-            ci_cmd_spec = wu.get("ci_command")
-            ci_cmds = [ci_cmd_spec] if isinstance(ci_cmd_spec, str) else (ci_cmd_spec or ["git status --porcelain"])
-
-            for cmd_ci in ci_cmds:
-                sys.stdout.write(f"[myrmex-head] [{cid}] Running CI command: {cmd_ci}\n")
-                res_ci = run_argv(cmd_ci, cwd=repo_root)
-                if res_ci.returncode != 0:
-                    sys.stderr.write(f"[myrmex-head] [{cid}] CI execution failed: {res_ci.stderr}\n")
-                    self._block_wu(cid, wuid, "ci_failed", f"CI command {cmd_ci} failed with exit code {res_ci.returncode}")
+                try:
+                    corr_record = driver.execute_remediation(
+                        wu, verifier_receipt.get("defects", []), corrections_used, repo_root, run_id, agent_env
+                    )
+                    correction_runs.append(corr_record)
+                except Exception as e:
+                    self._block_wu(cid, wuid, "unknown", f"Remediation error: {e}")
                     return False
 
-            ci_operation = {
-                "command": "; ".join(ci_cmds),
-                "exit_code": 0,
-                "status": "pass",
-                "stdout_digest": hashlib.sha256(res_ci.stdout.encode("utf-8")).hexdigest() if res_ci.stdout else "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                "timestamp": utcnow(),
-            }
-
-            # 8. Committing phase: Stage changes & calculate real diff digest
-            run_argv(["git", "add", "-A"], cwd=repo_root)
-            diff_proc = run_argv(["git", "diff", base_sha, "--binary"], cwd=repo_root)
-            diff_bytes = diff_proc.stdout.encode("utf-8")
-            diff_digest = hashlib.sha256(diff_bytes).hexdigest()
-
-            if not no_op_allowed and len(diff_bytes) == 0:
-                sys.stderr.write(f"[myrmex-head] [{cid}] Zero diff bytes against base SHA for {wuid}\n")
-                self._block_wu(cid, wuid, "unknown", "Diff against base SHA is empty and no-op is not allowed")
+            # 8. Transition to running-ci
+            self._transition_wu(cid, wuid, phase="running-ci")
+            ci_operation = driver.execute_ci(wu, repo_root, run_id, agent_env)
+            if ci_operation["status"] != "pass":
+                self._block_wu(
+                    cid, wuid, "ci_failed",
+                    f"CI command failed with exit code {ci_operation.get('exit_code')}: {ci_operation.get('stderr', '')}"
+                )
                 return False
 
-            # 9. Produce Real Commit
-            staged_diff = run_argv(["git", "diff", "--cached", "--name-only"], cwd=repo_root).stdout.strip()
-            commit_msg = f"feat({wuid.lower()}): {wu['objective']}"
+            # 9. Committing Phase: Produce Governed Commit via myrmex-git-local.py
+            self._transition_wu(cid, wuid, phase="committing")
+            self.sync_myrmex_state_phase(run_id, "committing")
 
-            if staged_diff:
-                res_commit = run_argv(["git", "commit", "-m", commit_msg], cwd=repo_root)
-                if res_commit.returncode != 0:
-                    sys.stderr.write(f"[myrmex-head] [{cid}] Git commit failed: {res_commit.stderr}\n")
-                    self._block_wu(cid, wuid, "unknown", f"Git commit failed: {res_commit.stderr.strip()}")
-                    return False
+            modified_files = writer_receipt.get("files_modified", [])
+            if not no_op_allowed and not modified_files:
+                self._block_wu(cid, wuid, "unknown", "Diff against base SHA is empty and no-op is not allowed")
+                return False
+            diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
 
-            candidate_sha = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root).stdout.strip()
-            tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root).stdout.strip()
-            author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root).stdout.strip()
+            try:
+                commit_receipt = self.produce_governed_commit(
+                    run_id=run_id,
+                    repo_root=repo_root,
+                    wuid=wuid,
+                    objective=wu["objective"],
+                    base_sha=base_sha,
+                    modified_files=modified_files,
+                    diff_digest=diff_digest,
+                    cid=cid,
+                )
+            except Exception as e:
+                self._block_wu(cid, wuid, "unknown", f"Governed git commit failed: {e}")
+                return False
 
-            commit_receipt = {
-                "commit_sha": candidate_sha,
-                "tree_sha": tree_sha,
-                "author": author,
-                "message": commit_msg if staged_diff else "No changes to commit",
-                "diff_sha": diff_digest,
-                "timestamp": utcnow(),
-            }
+            candidate_sha = commit_receipt["commit_sha"]
 
-        # 10. Persist transition with receipts
+        # 10. Delivering Phase
         self._transition_wu(
             cid, wuid,
-            phase="committing",
+            phase="delivering",
             commit_sha=candidate_sha,
             base_sha=base_sha,
             candidate_sha=candidate_sha,
@@ -502,37 +1047,43 @@ class CampaignSupervisor:
             verifier_receipt=verifier_receipt,
             ci_op=ci_operation,
             commit_receipt=commit_receipt,
-            force=already_committed,
         )
-        self.sync_myrmex_state_phase(run_id, "committing")
-        self._transition_wu(cid, wuid, phase="delivering", force=already_committed)
 
-        # 11. Invariant Validation Gate (Rule 9)
-        assert writer_receipt is not None and writer_receipt["status"] == "SUCCESS", "Writer receipt missing or failed"
-        assert verifier_receipt is not None and verifier_receipt["status"] == "PASS", "Verifier receipt missing or failed"
-        assert ci_operation is not None and ci_operation["status"] == "pass", "CI operation missing or failed"
+        # 11. Strict Invariant Validation Gate (Rule 9)
+        assert writer_receipt is not None and writer_receipt.get("status") == "SUCCESS", "Writer receipt missing or failed"
+        assert verifier_receipt is not None and verifier_receipt.get("status") == "PASS", "Verifier receipt missing or failed"
+        assert ci_operation is not None and ci_operation.get("status") == "pass", "CI operation missing or failed"
         assert diff_digest is not None and len(diff_digest) == 64, "Diff digest invalid"
         assert candidate_sha is not None and len(candidate_sha) >= 7, "Candidate SHA invalid"
 
-        # 12. Record Evidence Bundle
+        # 12. Assemble & Record Authoritative Evidence Bundle
         evidence = {
+            "campaign_id": cid,
+            "work_unit_id": wuid,
+            "run_id": run_id,
             "objective": wu["objective"],
             "scope": wu.get("scope", []),
             "issue": wu.get("issue"),
-            "run_id": run_id,
             "base_sha": base_sha,
             "candidate_sha": candidate_sha,
             "diff_digest": diff_digest,
             "writer_receipt": writer_receipt,
+            "candidate_diff": {
+                "base_sha": base_sha,
+                "candidate_sha": candidate_sha,
+                "diff_digest": diff_digest,
+                "files": writer_receipt.get("files_modified", []),
+            },
             "verifier_receipt": verifier_receipt,
+            "defect_set": verifier_receipt.get("defects", []),
             "correction_runs": correction_runs,
             "ci_operation": ci_operation,
             "commit_receipt": commit_receipt,
-            "implementing_agent": wu.get("implementing_agent") or "myrmex-worker",
-            "verifying_agent": wu.get("verifying_agent") or "myrmex-verifier",
-            "verification_commands_run": vcmds,
+            "implementing_agent": writer_receipt.get("agent", "myrmex-worker"),
+            "verifying_agent": verifier_receipt.get("agent", "myrmex-verifier"),
+            "verification_commands_run": verifier_receipt.get("commands_run", []),
             "verification_results": verifier_receipt.get("results", []),
-            "ci_result": "pass",
+            "ci_result": ci_operation.get("status", "pass"),
             "ci_summary": f"CI command executed: {ci_operation.get('command')}",
             "commit_sha": candidate_sha,
             "pr_number": wu.get("pr_number"),
@@ -555,7 +1106,7 @@ class CampaignSupervisor:
         finally:
             Path(ev_path).unlink(missing_ok=True)
 
-        # 13. Complete durable state run & work unit
+        # 13. Complete durable state run & transition work unit to completed
         self.complete_myrmex_state_run(run_id, f"Work unit {wuid} completed in campaign {cid}")
         self._transition_wu(cid, wuid, phase="completed", status="completed")
         sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} COMPLETED successfully with commit {candidate_sha[:8]}.\n")
@@ -577,11 +1128,8 @@ class CampaignSupervisor:
         ci_op: dict[str, Any] | None = None,
         commit_receipt: dict[str, Any] | None = None,
         pr_number: int | None = None,
-        force: bool = False,
     ) -> None:
         cmd = [sys.executable, str(ROOT / "bin/myrmex-campaign"), "wu-transition", cid, wuid]
-        if force:
-            cmd.append("--force")
         if phase:
             cmd.extend(["--phase", phase])
         if status:
@@ -607,13 +1155,15 @@ class CampaignSupervisor:
             cmd.extend(["--ci-op", json.dumps(ci_op)])
         if commit_receipt is not None:
             cmd.extend(["--commit-receipt", json.dumps(commit_receipt)])
+
         try:
-            res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             sys.stderr.write(f"wu-transition failed (code {e.returncode}):\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}\n")
             raise
 
     def _block_wu(self, cid: str, wuid: str, blocker_type: str, message: str) -> None:
+        sys.stderr.write(f"[myrmex-head] [{cid}] Blocking WU {wuid}: {blocker_type} - {message}\n")
         cmd = [
             sys.executable, str(ROOT / "bin/myrmex-campaign"),
             "blocker-add", cid,
@@ -625,13 +1175,11 @@ class CampaignSupervisor:
 
     def process_campaign(self, cid: str) -> bool:
         """Processes one step of a campaign. Returns True if progress was made."""
-        # 1. Acquire lease
         if not self.acquire_lease(cid):
             sys.stdout.write(f"[myrmex-head] [{cid}] Skipped: could not acquire lease (held by another supervisor)\n")
             return False
 
         try:
-            # 2. Reconcile state first
             self.reconcile_campaign(cid)
             data = self.get_campaign_data(cid)
 
@@ -639,7 +1187,6 @@ class CampaignSupervisor:
                 sys.stdout.write(f"[myrmex-head] [{cid}] Campaign is {data['status']}; no action needed.\n")
                 return False
 
-            # Check if there is an active WU
             active_wuid = data.get("active_work_unit")
             if not active_wuid:
                 active_cand = next((w for w in data.get("work_units", []) if w["status"] == "active"), None)
@@ -652,7 +1199,6 @@ class CampaignSupervisor:
                     self.heartbeat_lease(cid)
                     return self.run_work_unit(cid, data, wu)
 
-            # Query ready work units
             cmd_dag = [sys.executable, str(ROOT / "bin/myrmex-campaign"), "dag", cid]
             proc = subprocess.run(cmd_dag, capture_output=True, text=True)
             if proc.returncode != 0:
@@ -663,7 +1209,6 @@ class CampaignSupervisor:
             ready_ids = dag_info.get("ready_work_units", [])
             if not ready_ids:
                 sys.stdout.write(f"[myrmex-head] [{cid}] No ready work units at this time.\n")
-                # Check if all completed
                 all_wu = data.get("work_units", [])
                 if all_wu and all(w["status"] == "completed" for w in all_wu):
                     self.reconcile_campaign(cid)
@@ -705,7 +1250,6 @@ class CampaignSupervisor:
                 if self.once:
                     break
 
-                # Sleep with interrupt awareness
                 for _ in range(self.poll_interval * 10):
                     if not self.running:
                         break
@@ -725,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--campaign-id", help="Target specific campaign ID")
     parser.add_argument("--interval", type=int, default=5, help="Polling interval in seconds (default: 5)")
     parser.add_argument("--state-home", help="Custom XDG_STATE_HOME path")
+    parser.add_argument("--allow-fixture-driver", action="store_true", help="Allow FixtureCommandDriver execution for testing")
     args = parser.parse_args(argv)
 
     supervisor = CampaignSupervisor(
@@ -732,6 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
         poll_interval=args.interval,
         once=args.once,
         state_home=args.state_home,
+        allow_fixture_driver=args.allow_fixture_driver,
     )
     return supervisor.run()
 

@@ -129,6 +129,14 @@
     "next_action": {"type": ["string", "null"]},
     "supervisor_pid": {"type": ["integer", "null"]},
     "supervisor_host": {"type": ["string", "null"]},
+    "driver_policy": {
+      "type": ["string", "null"],
+      "enum": ["production", "opencode", "fixture", null]
+    },
+    "execution_driver": {
+      "type": ["string", "null"],
+      "enum": ["opencode-task", "fixture-command", null]
+    },
     "completed_at": {"type": ["string", "null"], "format": "date-time"},
     "cancelled_at": {"type": ["string", "null"], "format": "date-time"},
     "failed_at": {"type": ["string", "null"], "format": "date-time"},
@@ -277,7 +285,19 @@
           "items": {"type": "string"}
         },
         "implementing_agent": {"type": ["string", "null"]},
-        "verifying_agent": {"type": ["string", "null"]}
+        "verifying_agent": {"type": ["string", "null"]},
+        "driver_policy": {
+          "type": ["string", "null"],
+          "enum": ["production", "opencode", "fixture", null]
+        },
+        "execution_driver": {
+          "type": ["string", "null"],
+          "enum": ["opencode-task", "fixture-command", null]
+        },
+        "recovery_events": {
+          "type": "array",
+          "items": {"type": "object"}
+        }
       }
     },
     "wu_attempt": {
@@ -395,6 +415,9 @@
             "product_change_required",
             "budget_exhausted",
             "verifier_workspace_mutation",
+            "out_of_scope_mutation",
+            "driver_policy_violation",
+            "ambiguous_missing_receipt",
             "ci_failed",
             "ci_failed_unrecoverable",
             "conflict_unresolvable",
