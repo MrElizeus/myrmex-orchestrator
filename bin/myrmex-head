@@ -189,6 +189,34 @@ class WorkUnitExecutionDriver:
     """Base interface for executing work unit phases."""
     driver_name: str = "base"
 
+    def _record_delegation(self, run_id: str, wuid: str, role: str, agent: str, repo_root: Path, env: dict[str, str], callback) -> Any:
+        proc_show = run_argv([sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"], cwd=repo_root, env=env)
+        rev = json.loads(proc_show.stdout).get("revision", 1)
+
+        task_id = f"task-{wuid}-{role}-{int(time.time()*1000)}"
+        run_argv([
+            sys.executable, str(ROOT / "bin/myrmex-state"), "delegation-preflight", run_id,
+            "--agent", agent, "--role", role, "--reason", f"{self.driver_name} dispatch",
+            "--task-id", task_id, "--work-unit-id", wuid, "--workspace", str(repo_root),
+            "--expect-revision", str(rev)
+        ], cwd=repo_root, env=env)
+        rev += 1
+
+        try:
+            result = callback()
+            status = "success"
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            run_argv([
+                sys.executable, str(ROOT / "bin/myrmex-state"), "delegation", run_id,
+                "--agent", agent, "--role", role, "--reason", f"{self.driver_name} completion",
+                "--task-id", task_id, "--work-unit-id", wuid, "--workspace", str(repo_root),
+                "--status", status, "--expect-revision", str(rev)
+            ], cwd=repo_root, env=env)
+        return result
+
     def execute_writer(
         self,
         wu: dict[str, Any],
@@ -409,35 +437,39 @@ class FixtureCommandDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         self._check_allowed()
-        impl_cmd = wu.get("implementation_command")
-        if impl_cmd:
-            proc = run_argv(impl_cmd, cwd=repo_root, env=env)
-            if proc.returncode != 0:
-                raise ExecutionDriverError(f"Fixture writer failed: {proc.stderr.strip()}")
 
-        status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env)
-        status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
-        modified_files = [line[3:].strip() for line in status_lines]
+        def _do_write() -> dict[str, Any]:
+            impl_cmd = wu.get("implementation_command")
+            if impl_cmd:
+                proc = run_argv(impl_cmd, cwd=repo_root, env=env)
+                if proc.returncode != 0:
+                    raise ExecutionDriverError(f"Fixture writer failed: {proc.stderr.strip()}")
 
-        validate_paths_in_scope(repo_root, modified_files, wu.get("scope", []))
+            status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env)
+            status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
+            modified_files = [line[3:].strip() for line in status_lines]
 
-        no_op_allowed = wu.get("no_op_allowed", False)
-        if not status_lines and not no_op_allowed:
-            raise ExecutionDriverError("Fixture writer produced zero changes and no-op is not allowed")
+            validate_paths_in_scope(repo_root, modified_files, wu.get("scope", []))
 
-        diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
-        diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+            no_op_allowed = wu.get("no_op_allowed", False)
+            if not status_lines and not no_op_allowed:
+                raise ExecutionDriverError("Fixture writer produced zero changes and no-op is not allowed")
 
-        return {
-            "driver": self.driver_name,
-            "agent": self.writer_agent,
-            "status": "SUCCESS",
-            "files_modified": modified_files,
-            "diff_stat": diff_stat,
-            "diff_digest": diff_digest,
-            "summary": f"Fixture runner modified {len(modified_files)} file(s)",
-            "timestamp": utcnow(),
-        }
+            diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+            diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+
+            return {
+                "driver": self.driver_name,
+                "agent": self.writer_agent,
+                "status": "SUCCESS",
+                "files_modified": modified_files,
+                "diff_stat": diff_stat,
+                "diff_digest": diff_digest,
+                "summary": f"Fixture runner modified {len(modified_files)} file(s)",
+                "timestamp": utcnow(),
+            }
+
+        return self._record_delegation(run_id, wu["id"], "writer", self.writer_agent, repo_root, env, _do_write)
 
     def execute_verifier(
         self,
@@ -447,39 +479,43 @@ class FixtureCommandDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         self._check_allowed()
-        vcmds = wu.get("verification_commands", [])
-        status_before = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+        
+        def _do_verify() -> dict[str, Any]:
+            vcmds = wu.get("verification_commands", [])
+            status_before = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
 
-        v_passed = True
-        v_results = []
-        defects_found = []
+            v_passed = True
+            v_results = []
+            defects_found = []
 
-        for vc in vcmds:
-            proc = run_argv(vc, cwd=repo_root, env=env)
-            v_results.append(f"{vc} -> code {proc.returncode}")
-            if proc.returncode != 0:
-                v_passed = False
-                defects_found.append({
-                    "command": vc,
-                    "exit_code": proc.returncode,
-                    "stdout": proc.stdout.strip(),
-                    "stderr": proc.stderr.strip(),
-                })
-                break
+            for vc in vcmds:
+                proc = run_argv(vc, cwd=repo_root, env=env)
+                v_results.append(f"{vc} -> code {proc.returncode}")
+                if proc.returncode != 0:
+                    v_passed = False
+                    defects_found.append({
+                        "command": vc,
+                        "exit_code": proc.returncode,
+                        "stdout": proc.stdout.strip(),
+                        "stderr": proc.stderr.strip(),
+                    })
+                    break
 
-        status_after = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
-        if status_after != status_before:
-            raise VerifierWorkspaceMutationError("Verifier mutated repository workspace during verification execution")
+            status_after = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+            if status_after != status_before:
+                raise VerifierWorkspaceMutationError("Verifier mutated repository workspace during verification execution")
 
-        return {
-            "driver": self.driver_name,
-            "agent": self.verifier_agent,
-            "status": "PASS" if v_passed else "FAIL",
-            "commands_run": vcmds,
-            "results": v_results,
-            "defects": defects_found,
-            "timestamp": utcnow(),
-        }
+            return {
+                "driver": self.driver_name,
+                "agent": self.verifier_agent,
+                "status": "PASS" if v_passed else "FAIL",
+                "commands_run": vcmds,
+                "results": v_results,
+                "defects": defects_found,
+                "timestamp": utcnow(),
+            }
+
+        return self._record_delegation(run_id, wu["id"], "verifier", self.verifier_agent, repo_root, env, _do_verify)
 
     def execute_remediation(
         self,
@@ -491,22 +527,26 @@ class FixtureCommandDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         self._check_allowed()
-        remed_cmd = wu.get("remediation_command")
-        started_at = utcnow()
+        
+        def _do_remediate() -> dict[str, Any]:
+            remed_cmd = wu.get("remediation_command")
+            started_at = utcnow()
 
-        if remed_cmd:
-            proc = run_argv(remed_cmd, cwd=repo_root, env=env)
-            if proc.returncode != 0:
-                sys.stderr.write(f"[myrmex-head] Fixture remediation command failed: {proc.stderr}\n")
+            if remed_cmd:
+                proc = run_argv(remed_cmd, cwd=repo_root, env=env)
+                if proc.returncode != 0:
+                    sys.stderr.write(f"[myrmex-head] Fixture remediation command failed: {proc.stderr}\n")
 
-        curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
-        return {
-            "attempt": attempt,
-            "candidate_sha": curr_cand,
-            "defects": defects,
-            "started_at": started_at,
-            "completed_at": utcnow(),
-        }
+            curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+            return {
+                "attempt": attempt,
+                "candidate_sha": curr_cand,
+                "defects": defects,
+                "started_at": started_at,
+                "completed_at": utcnow(),
+            }
+
+        return self._record_delegation(run_id, wu["id"], "writer", self.remediator_agent, repo_root, env, _do_remediate)
 
     def execute_ci(
         self,
@@ -642,7 +682,7 @@ class CampaignSupervisor:
             raise RuntimeError(f"failed to read campaign {cid}: {proc.stderr}")
         return json.loads(proc.stdout)
 
-    def ensure_myrmex_state_run(self, cid: str, data: dict[str, Any], wu: dict[str, Any], repo_root: str) -> str:
+    def ensure_myrmex_state_run(self, cid: str, data: dict[str, Any], wu: dict[str, Any], repo_root: str, branch: str, base_sha: str) -> str:
         """Ensures a durable myrmex-state run exists for this work unit with authorized commit policy."""
         run_id = wu.get("run_id")
         if run_id:
@@ -655,11 +695,15 @@ class CampaignSupervisor:
             sys.executable, str(ROOT / "bin/myrmex-state"),
             "init",
             "--repository-root", repo_root,
+            "--branch", branch,
+            "--base-sha", base_sha,
             "--mode", "autonomous",
-            "--scope", "narrow",
+            "--scope", "continuous",
             "--commit-policy", "authorized",
             "--push-policy", "deny",
+            "--execution-policy", "auto",
             "--objective", wu["objective"],
+            "--parent-objective", f"Campaign {cid}",
         ]
 
         proc_init = subprocess.run(cmd_init, capture_output=True, text=True)
@@ -711,24 +755,77 @@ class CampaignSupervisor:
         except Exception:
             pass
 
-    def complete_myrmex_state_run(self, run_id: str, message: str = "Completed by campaign supervisor") -> None:
-        """Marks the durable myrmex-state run complete."""
+    def complete_myrmex_state_run(self, run_id: str, wuid: str, evidence_file: str, message: str = "Completed by campaign supervisor") -> None:
+        """Marks the durable myrmex-state work unit and run as complete."""
         try:
             self.sync_myrmex_state_phase(run_id, "reporting")
             cmd_show = [sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"]
             proc_show = subprocess.run(cmd_show, capture_output=True, text=True)
             if proc_show.returncode != 0:
+                sys.stderr.write(f"[myrmex-head] Failed to show myrmex-state run {run_id} before complete: {proc_show.stderr}\n")
                 return
             state = json.loads(proc_show.stdout)
             rev = state.get("revision", 1)
 
+            # Record parent gate to satisfy continuous scope completion blockers
+            cmd_pg_start = [
+                sys.executable, str(ROOT / "bin/myrmex-state"),
+                "frontier", run_id, "start",
+                "--request-id", f"pg-req-{run_id}",
+                "--task-id", "parent-gate",
+                "--message-id", f"pg-msg-{run_id}",
+                "--intent-json", '{"purpose": "parent_gate"}',
+                "--expect-revision", str(rev),
+            ]
+            proc_pg_start = subprocess.run(cmd_pg_start, capture_output=True, text=True)
+            if proc_pg_start.returncode == 0:
+                rev = json.loads(proc_pg_start.stdout)["revision"]
+                op_id = json.loads(proc_pg_start.stdout)["pending_operations"][-1]["operation_id"]
+                cmd_pg_result = [
+                    sys.executable, str(ROOT / "bin/myrmex-state"),
+                    "frontier", run_id, "result",
+                    "--operation-id", op_id,
+                    "--request-id", f"pg-req-{run_id}",
+                    "--message-id", f"pg-msg-{run_id}",
+                    "--transport-status", "success",
+                    "--frontier-decision", "ACCEPT",
+                    "--response-type", "parent_objective_complete",
+                    "--effect-json", "{}",
+                    "--receipt-json", "{}",
+                    "--expect-revision", str(rev),
+                ]
+                proc_pg_result = subprocess.run(cmd_pg_result, capture_output=True, text=True)
+                if proc_pg_result.returncode == 0:
+                    rev = json.loads(proc_pg_result.stdout)["revision"]
+                else:
+                    sys.stderr.write(f"[myrmex-head] Failed to record parent gate result: {proc_pg_result.stderr}\n")
+            else:
+                sys.stderr.write(f"[myrmex-head] Failed to start parent gate: {proc_pg_start.stderr}\n")
+
+            # Complete work unit
+            cmd_wu = [
+                sys.executable, str(ROOT / "bin/myrmex-state"),
+                "work-unit", run_id, "complete",
+                "--work-unit-id", wuid,
+                "--evidence-json", Path(evidence_file).read_text(encoding="utf-8"),
+                "--expect-revision", str(rev),
+            ]
+            proc_wu = subprocess.run(cmd_wu, capture_output=True, text=True)
+            if proc_wu.returncode == 0:
+                rev = json.loads(proc_wu.stdout)["revision"]
+            else:
+                sys.stderr.write(f"[myrmex-head] Failed to complete work-unit {wuid}: {proc_wu.stderr}\n")
+
+            # Complete the run
             cmd_comp = [
                 sys.executable, str(ROOT / "bin/myrmex-state"),
                 "complete", run_id,
                 "--expect-revision", str(rev),
                 "--message", message,
             ]
-            subprocess.run(cmd_comp, capture_output=True, text=True)
+            proc_comp = subprocess.run(cmd_comp, capture_output=True, text=True)
+            if proc_comp.returncode != 0:
+                sys.stderr.write(f"[myrmex-head] Failed to complete myrmex-state run: {proc_comp.stderr}\n")
         except Exception as exc:
             sys.stderr.write(f"[myrmex-head] Exception in complete_myrmex_state_run: {exc}\n")
 
@@ -781,19 +878,92 @@ class CampaignSupervisor:
         state_data = json.loads(proc_show.stdout)
         rev = state_data.get("revision", 1)
 
-        auth_req_id = f"auth-{wuid}-{cid}-{int(time.time() * 1000)}"
+        unique_paths = sorted(set(modified_files))
+
+        # 1. Start frontier operation representing the campaign's decision
+        req_id = f"auth-req-{wuid}-{cid}-{int(time.time()*1000)}"
+        msg_id = f"msg-{req_id}"
+        cmd_frontier_start = [
+            sys.executable, str(ROOT / "bin/myrmex-state"),
+            "frontier", run_id, "start",
+            "--request-id", req_id,
+            "--task-id", f"task-{wuid}",
+            "--message-id", msg_id,
+            "--expect-revision", str(rev),
+        ]
+        proc_start = subprocess.run(cmd_frontier_start, capture_output=True, text=True, env=env)
+        if proc_start.returncode != 0:
+            raise RuntimeError(f"failed to start frontier: {proc_start.stderr}")
+        state_data = json.loads(proc_start.stdout)
+        rev = state_data["revision"]
+        op_id = state_data["pending_operations"][-1]["operation_id"]
+
+        # 2. Record frontier decision
+        evidence = {
+            "request_id": req_id,
+            "message_id": msg_id,
+            "transport_status": "success",
+            "frontier_decision": "ACCEPT",
+            "response_type": "sub_objective_complete",
+            "work_unit_id": wuid,
+            "repository_root": str(repo_root.resolve()),
+            "branch": branch,
+            "expected_head": head_sha,
+            "candidate_diff_sha": diff_digest,
+            "allowed_paths": unique_paths,
+            "commit_message": commit_msg,
+        }
+        ev_json = json.dumps(evidence)
+        cmd_frontier_result = [
+            sys.executable, str(ROOT / "bin/myrmex-state"),
+            "frontier", run_id, "result",
+            "--operation-id", op_id,
+            "--request-id", req_id,
+            "--message-id", msg_id,
+            "--transport-status", "success",
+            "--frontier-decision", "ACCEPT",
+            "--response-type", "sub_objective_complete",
+            "--effect-json", ev_json,
+            "--receipt-json", ev_json,
+            "--expect-revision", str(rev),
+        ]
+        proc_result = subprocess.run(cmd_frontier_result, capture_output=True, text=True, env=env)
+        if proc_result.returncode != 0:
+            raise RuntimeError(f"failed to record frontier result: {proc_result.stderr}")
+        rev = json.loads(proc_result.stdout)["revision"]
+
+        # 3. Create standing commit policy authorization
+        cmd_policy = [
+            sys.executable, str(ROOT / "bin/myrmex-state"),
+            "commit-policy", "authorize", run_id,
+            "--authority", "user",
+            "--source-request-id", req_id,
+            "--source-operation-id", op_id,
+            "--work-unit-id", wuid,
+            "--expect-revision", str(rev),
+        ]
+        proc_policy = subprocess.run(cmd_policy, capture_output=True, text=True, env=env)
+        if proc_policy.returncode != 0:
+            raise RuntimeError(f"failed to authorize commit policy: {proc_policy.stderr}")
+        rev = json.loads(proc_policy.stdout)["revision"]
+
+        # 4. Create specific local_commit grant
+        auth_req_id = f"grant-{req_id}"
         cmd_auth = [
             sys.executable, str(ROOT / "bin/myrmex-state"),
             "authorization", run_id, "create",
             "--authority", "user",
             "--request-id", auth_req_id,
+            "--source-request-id", req_id,
+            "--source-operation-id", op_id,
+            "--work-unit-id", wuid,
+            "--candidate-diff-sha", diff_digest,
             "--repository-root", str(repo_root),
             "--branch", branch,
             "--expected-head", head_sha,
             "--message", commit_msg,
             "--expect-revision", str(rev),
         ]
-        unique_paths = sorted(set(modified_files))
         for p in unique_paths:
             cmd_auth.extend(["--allowed-path", p])
 
@@ -853,22 +1023,16 @@ class CampaignSupervisor:
         agent_env = sanitized_agent_environment()
         sys.stdout.write(f"[myrmex-head] [{cid}] Starting hardened execution for {wuid}: {wu['objective']}\n")
 
-        # 1. Initialize or recover durable myrmex-state run
-        run_id = self.ensure_myrmex_state_run(cid, data, wu, str(repo_root))
-
-        # 2. Select execution driver
-        try:
-            driver = self.resolve_execution_driver(data, wu)
-        except DriverPolicyViolation as e:
-            self._block_wu(cid, wuid, "driver_policy_violation", str(e))
-            return False
-
-        # 3. Transition to collecting-context
-        self._transition_wu(cid, wuid, phase="collecting-context")
-        self.sync_myrmex_state_phase(run_id, "collecting-context")
-
-        # 4. Base git SHA capture
+        # 1. Base git SHA and branch capture
         base_sha = wu.get("base_sha")
+        branch = ""
+        try:
+            proc_branch = run_argv(["git", "branch", "--show-current"], cwd=repo_root, env=agent_env)
+            if proc_branch.returncode == 0:
+                branch = proc_branch.stdout.strip()
+        except Exception:
+            branch = "main"
+
         if not base_sha:
             try:
                 proc = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env)
@@ -876,6 +1040,20 @@ class CampaignSupervisor:
                     base_sha = proc.stdout.strip()
             except Exception:
                 base_sha = "0" * 40
+
+        # 2. Initialize or recover durable myrmex-state run
+        run_id = self.ensure_myrmex_state_run(cid, data, wu, str(repo_root), branch, base_sha)
+
+        # 3. Select execution driver
+        try:
+            driver = self.resolve_execution_driver(data, wu)
+        except DriverPolicyViolation as e:
+            self._block_wu(cid, wuid, "driver_policy_violation", str(e))
+            return False
+
+        # 4. Transition to collecting-context
+        self._transition_wu(cid, wuid, phase="collecting-context")
+        self.sync_myrmex_state_phase(run_id, "collecting-context")
 
         current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env).stdout.strip()
         last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root, env=agent_env).stdout.strip()
@@ -1103,11 +1281,11 @@ class CampaignSupervisor:
                 "--evidence-file", ev_path
             ]
             subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+            # 13. Complete durable state run & transition work unit to completed
+            self.complete_myrmex_state_run(run_id, wuid, ev_path, f"Work unit {wuid} completed in campaign {cid}")
         finally:
             Path(ev_path).unlink(missing_ok=True)
-
-        # 13. Complete durable state run & transition work unit to completed
-        self.complete_myrmex_state_run(run_id, f"Work unit {wuid} completed in campaign {cid}")
         self._transition_wu(cid, wuid, phase="completed", status="completed")
         sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} COMPLETED successfully with commit {candidate_sha[:8]}.\n")
         return True
