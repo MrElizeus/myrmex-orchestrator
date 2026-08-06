@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:plan-revision:v1",
+  "title": "Myrmex Immutable Plan Revision v1",
+  "description": "Immutable, digest-addressed plan revision artifact used by Myrmex Campaign Intelligence. A plan revision is a proposal/persistence artifact: it preserves provenance and lifecycle history but never by itself authorizes repository effects, plan activation, or completion of continuous objectives. Canonical digest rules: every SHA-256 digest (record_digest, plan_digest, input_digests[].sha256, parent_revision.artifact_digest) is computed over the canonical serialized artifact using UTF-8, LF line endings, deterministic key ordering for structured fields, and no insignificant trailing whitespace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "record_id",
+    "plan_revision_id",
+    "campaign_id",
+    "objective_id",
+    "planning_request_id",
+    "base_sha",
+    "parent_revision",
+    "input_digests",
+    "assumptions",
+    "work_units",
+    "edges",
+    "lifecycle_status",
+    "previous_record_id",
+    "plan_digest",
+    "record_digest",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.plan-revision/v1"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^planrec_[0-9a-f]{64}$",
+      "description": "Immutable record identity of this plan revision. Once created, a plan revision record is never rewritten; lifecycle history is expressed by creating new records linked through previous_record_id."
+    },
+    "plan_revision_id": {
+      "type": "string",
+      "pattern": "^plan_[0-9a-f]{64}$",
+      "description": "Stable plan revision identifier, derived from the canonical plan payload digest."
+    },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$",
+      "description": "Stable, globally unique campaign identifier."
+    },
+    "objective_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "planning_request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Exact planning request identity that produced this plan revision."
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Repository base commit SHA the plan was produced against."
+    },
+    "parent_revision": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["artifact_id", "artifact_digest"],
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "artifact_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Canonical SHA-256 digest of the parent plan artifact."
+        }
+      },
+      "description": "Directly superseded plan revision, or null for the first revision."
+    },
+    "input_digests": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "identity", "sha256"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Kind of planning input, e.g. repository-context, campaign-state, backlog-snapshot."
+          },
+          "identity": {
+            "type": "string",
+            "description": "Exact external identity of the input (e.g. base SHA or artifact ID)."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Canonical SHA-256 digest of the input artifact."
+          }
+        }
+      },
+      "description": "Non-empty, unique set of exact planning input digests the revision binds to."
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assumption_id", "statement", "evidence_status", "impact", "resolution_gate"],
+        "properties": {
+          "assumption_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence_status": {
+            "enum": ["supported", "safe_default", "unverified"]
+          },
+          "impact": {
+            "type": "string",
+            "description": "What depends on the assumption; effect if it fails."
+          },
+          "resolution_gate": {
+            "type": ["string", "null"],
+            "description": "Gate that resolves the assumption, or null when not yet bound to a gate."
+          }
+        }
+      }
+    },
+    "work_units": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "objective",
+          "non_goals",
+          "dependencies",
+          "scope",
+          "acceptance_criteria",
+          "verification",
+          "risk_class",
+          "required_route",
+          "human_gates",
+          "required_evidence",
+          "terminal_gate"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1
+          },
+          "non_goals": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"
+            },
+            "description": "Work unit IDs this work unit depends on. Dependencies must reference existing work units and never the work unit itself (enforced by plan semantics)."
+          },
+          "scope": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allowed_paths", "forbidden_paths"],
+            "properties": {
+              "allowed_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "forbidden_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["commands", "manual_checks", "discover_when_missing"],
+            "properties": {
+              "commands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "manual_checks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "discover_when_missing": {
+                "type": "boolean"
+              }
+            }
+          },
+          "risk_class": {
+            "enum": ["bounded", "unbounded"]
+          },
+          "required_route": {
+            "enum": ["auto", "direct-only", "delegated", "frontier", "frontier-gated"]
+          },
+          "human_gates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["gate_id", "decision_type", "reason", "required_before"],
+              "properties": {
+                "gate_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "decision_type": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "required_before": {
+                  "enum": ["plan_activation", "work_unit_ready", "repository_effect", "delivery"]
+                }
+              }
+            }
+          },
+          "required_evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "terminal_gate": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "description": "Non-empty array of work units with exact scope, gates, and authority boundaries."
+    },
+    "edges": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {
+            "type": "string",
+            "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"
+          },
+          {
+            "type": "string",
+            "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"
+          }
+        ],
+        "items": false
+      },
+      "description": "Directed [from, to] pairs of existing work unit IDs; to depends on from. Self-edges and references to undefined work units are rejected by plan semantics."
+    },
+    "lifecycle_status": {
+      "enum": ["proposed", "reviewed", "validated", "active", "rejected", "superseded", "withdrawn"],
+      "description": "Lifecycle status of the plan revision. Revisions are immutable; status changes are expressed by new records linked through previous_record_id."
+    },
+    "previous_record_id": {
+      "type": ["string", "null"],
+      "pattern": "^planrec_[0-9a-f]{64}$",
+      "description": "Record identity this revision succeeds, or null for the first revision."
+    },
+    "plan_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the plan payload (the record excluding record envelope fields record_id, record_digest, plan_revision_id, previous_record_id, lifecycle_status, created_at, and plan_digest itself). plan_revision_id is derived from this digest as 'plan_' + plan_digest."
+    },
+    "record_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the complete record (all fields except record_digest and record_id itself). record_id is derived from this digest as 'planrec_' + record_digest. Any mutation invalidates the record digest, enforcing immutability."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

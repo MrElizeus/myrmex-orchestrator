@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:planning-result:v1",
+  "title": "Myrmex Planning Result v1",
+  "description": "A planning result is a proposal only. It is not plan activation authority, not human authority, not Frontier validation authority, and not commit, delivery, merge, release, or deployment authority. It never authorizes repository effects; the authority block pins every authorization flag to false. Canonical digest rules: result_digest is the canonical SHA-256 digest of the complete result envelope (all fields except result_digest itself) using UTF-8, LF line endings, deterministic key ordering for structured fields, and no insignificant trailing whitespace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "request_id",
+    "run_id",
+    "campaign_id",
+    "objective_id",
+    "base_sha",
+    "response_type",
+    "plan_revision",
+    "clarification",
+    "completion_evidence",
+    "authority",
+    "result_digest",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.planning-result/v1"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Exact planning request identity this result answers."
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"
+    },
+    "objective_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "response_type": {
+      "enum": ["plan", "blocking_clarification", "already_complete"]
+    },
+    "plan_revision": {
+      "description": "Embedded plan revision (see plan-revision-v1.schema.json). For plan responses the embedded lifecycle_status must be proposed and the envelope identity must equal the revision identity; null for other response types.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "plan-revision-v1.schema.json"
+        }
+      ]
+    },
+    "clarification": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["question", "options", "recommended_default"],
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "recommended_default": {
+          "type": ["string", "null"]
+        }
+      },
+      "description": "Strict blocking clarification for response_type blocking_clarification; null otherwise."
+    },
+    "completion_evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Evidence of already-complete state; empty for plan and blocking_clarification responses, non-empty for already_complete responses (enforced by plan semantics)."
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "plan_activation_authorized",
+        "repository_write_authorized",
+        "commit_authorized",
+        "push_authorized",
+        "merge_authorized",
+        "release_authorized",
+        "deployment_authorized"
+      ],
+      "properties": {
+        "scope": {
+          "const": "planning_only"
+        },
+        "plan_activation_authorized": {
+          "const": false
+        },
+        "repository_write_authorized": {
+          "const": false
+        },
+        "commit_authorized": {
+          "const": false
+        },
+        "push_authorized": {
+          "const": false
+        },
+        "merge_authorized": {
+          "const": false
+        },
+        "release_authorized": {
+          "const": false
+        },
+        "deployment_authorized": {
+          "const": false
+        }
+      },
+      "description": "A planning result is a proposal only: it does not activate plans, grant human/Frontier authority, authorize repository writes or commits, or trigger delivery, merge, release, or deployment."
+    },
+    "result_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the complete result envelope (all fields except result_digest itself)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
