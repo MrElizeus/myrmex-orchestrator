@@ -27,6 +27,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
+sys.path.insert(0, str(ROOT))
+
+import scripts.opencode_transport as opencode_transport
+import scripts.myrmex_worktree as myrmex_worktree
+import scripts.myrmex_task_operation as myrmex_task_operation
 
 
 def utcnow() -> str:
@@ -258,7 +263,7 @@ class WorkUnitExecutionDriver:
 
 
 class OpenCodeTaskDriver(WorkUnitExecutionDriver):
-    """Production driver: delegates execution to real governed agents."""
+    """Production driver: delegates execution to real governed agents via OpenCode."""
     driver_name: str = "opencode-task"
     writer_agent: str = "myrmex-worker"
     verifier_agent: str = "myrmex-verifier"
@@ -273,26 +278,121 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         agent_id = wu.get("implementing_agent") or self.writer_agent
-        impl_cmd = wu.get("implementation_command")
+        wuid = wu["id"]
+        campaign_id = wu.get("campaign_id", "default-campaign")
+        allowed_scope = wu.get("scope", [])
 
+        # 1. Create / retrieve isolated worktree for WU
+        wt_dir, wt_receipt = myrmex_worktree.create_wu_worktree(
+            source_repo=repo_root,
+            campaign_id=campaign_id,
+            wu_id=wuid,
+            base_sha=base_sha,
+            allowed_scope=allowed_scope,
+        )
+
+        # 2. Check existing task operation for idempotency / recovery
+        existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "writer", 1)
+        if existing_op and existing_op.task_id:
+            snap = opencode_transport.recover_existing_task(existing_op.task_id)
+            if snap.status == "completed":
+                res = opencode_transport.get_result(existing_op.task_id)
+                sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Recovered existing writer task {existing_op.task_id}\n")
+                status_proc = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env)
+                status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
+                modified_files = [line[3:].strip() for line in status_lines]
+                diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+                diff_digest = compute_candidate_diff_digest(wt_dir, base_sha, modified_files)
+                return {
+                    "driver": self.driver_name,
+                    "agent": agent_id,
+                    "status": "SUCCESS",
+                    "files_modified": modified_files,
+                    "diff_stat": diff_stat,
+                    "diff_digest": diff_digest,
+                    "summary": f"Writer modified {len(modified_files)} file(s)",
+                    "timestamp": utcnow(),
+                    "task_id": existing_op.task_id,
+                    "worktree": str(wt_dir),
+                }
+
+        # 3. Construct writer prompt
+        prompt = (
+            f"Objective: {wu.get('title')}\n"
+            f"Description: {wu.get('description', '')}\n"
+            f"Acceptance Criteria: {json.dumps(wu.get('acceptance_criteria', []))}\n"
+            f"Allowed Scope: {json.dumps(allowed_scope)}\n"
+            f"Base SHA: {base_sha}\n"
+            f"Verification Commands: {json.dumps(wu.get('verification_commands', []))}\n"
+            f"Constraints: Do NOT execute git commit, git push, git pr, or git merge. "
+            f"Produce your modifications directly in the workspace.\n"
+            f"Format response as JSON: {{\"decision\": \"COMPLETED\", \"summary\": \"...\", \"files_touched\": []}}"
+        )
+
+        # 4. Record TASK_INTENT before contacting OpenCode
+        op = myrmex_task_operation.create_task_intent(
+            campaign_id=campaign_id,
+            work_unit_id=wuid,
+            run_id=run_id,
+            role="writer",
+            agent=agent_id,
+            workspace=str(wt_dir),
+            base_sha=base_sha,
+            prompt=prompt,
+            model=wu.get("model", "opencode/deepseek-v4-flash-free"),
+            attempt=1,
+        )
+
+        # 5. Execute implementation command or OpenCode task
+        impl_cmd = wu.get("implementation_command")
         if impl_cmd:
             sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching writer ({agent_id}): {impl_cmd}\n")
-            proc = run_argv(impl_cmd, cwd=repo_root, env=env)
+            proc = run_argv(impl_cmd, cwd=wt_dir, env=env)
             if proc.returncode != 0:
+                myrmex_task_operation.record_task_terminal(op, "failed", proc.stderr, error_type="WRITER_COMMAND_FAILED")
                 raise ExecutionDriverError(f"Writer command failed (code {proc.returncode}): {proc.stderr.strip()}")
+            task_id = f"cmd-{op.operation_id}"
+            myrmex_task_operation.record_task_observed(op, task_id)
+            res_text = proc.stdout
+        else:
+            sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching writer task to OpenCode ({agent_id})...\n")
+            task_identity, task_proc = opencode_transport.create_task({
+                "prompt": prompt,
+                "agent": agent_id,
+                "workspace": str(wt_dir),
+                "model": wu.get("model"),
+            })
+            task_id = task_identity.task_id
+            myrmex_task_operation.record_task_observed(op, task_id)
+            snap = opencode_transport.wait_task(task_id, proc=task_proc, timeout_seconds=300)
+            task_res = opencode_transport.get_result(task_id)
+            res_text = task_res.text_content
 
-        status_proc = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env)
+        # 6. Verify worktree & scope
+        violations = myrmex_worktree.verify_workspace_scope(wt_dir, base_sha, allowed_scope)
+        if violations:
+            myrmex_task_operation.record_task_terminal(op, "failed", "; ".join(violations), error_type="WORKTREE_SCOPE_VIOLATION")
+            raise ExecutionDriverError(f"Writer violated worktree scope: {violations}")
+
+        status_proc = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env)
         status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
-        modified_files = [line[3:].strip() for line in status_lines]
-
-        validate_paths_in_scope(repo_root, modified_files, wu.get("scope", []))
+        modified_files = [line[3:].strip() for line in status_lines if line[3:].strip() != ".myrmex-worktree-receipt.json"]
 
         no_op_allowed = wu.get("no_op_allowed", False)
-        if not status_lines and not no_op_allowed:
+        if not modified_files and not no_op_allowed:
+            myrmex_task_operation.record_task_terminal(op, "failed", "Zero changes produced", error_type="NO_OP_DISALLOWED")
             raise ExecutionDriverError("Writer produced zero changes and no-op is not allowed")
 
-        diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
-        diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+        diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+        diff_digest = compute_candidate_diff_digest(wt_dir, base_sha, modified_files)
+
+        myrmex_task_operation.record_task_terminal(
+            op,
+            "completed",
+            res_text,
+            diff_digest=diff_digest,
+        )
+        myrmex_task_operation.record_receipt_confirmed(op)
 
         return {
             "driver": self.driver_name,
@@ -303,6 +403,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             "diff_digest": diff_digest,
             "summary": f"Writer modified {len(modified_files)} file(s)",
             "timestamp": utcnow(),
+            "task_id": task_id,
+            "worktree": str(wt_dir),
         }
 
     def execute_verifier(
@@ -313,9 +415,34 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         agent_id = wu.get("verifying_agent") or self.verifier_agent
+        wuid = wu["id"]
+        campaign_id = wu.get("campaign_id", "default-campaign")
         vcmds = wu.get("verification_commands", [])
 
-        status_before = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+        wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
+        if not wt_dir.exists():
+            wt_dir = repo_root
+
+        # Record TASK_INTENT for verifier
+        prompt = (
+            f"Verification Task for Work Unit {wuid}\n"
+            f"Verification Commands: {json.dumps(vcmds)}\n"
+            f"Inspect workspace and return PASS/FAIL decision."
+        )
+        op = myrmex_task_operation.create_task_intent(
+            campaign_id=campaign_id,
+            work_unit_id=wuid,
+            run_id=run_id,
+            role="verifier",
+            agent=agent_id,
+            workspace=str(wt_dir),
+            base_sha=wu.get("base_sha", "HEAD"),
+            prompt=prompt,
+            model=wu.get("model", "opencode/deepseek-v4-flash-free"),
+            attempt=1,
+        )
+
+        status_before = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env).stdout
 
         v_passed = True
         v_results = []
@@ -323,7 +450,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
 
         for vc in vcmds:
             sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching verifier ({agent_id}): {vc}\n")
-            proc = run_argv(vc, cwd=repo_root, env=env)
+            proc = run_argv(vc, cwd=wt_dir, env=env)
             v_results.append(f"{vc} -> code {proc.returncode}")
             if proc.returncode != 0:
                 v_passed = False
@@ -335,9 +462,17 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                 })
                 break
 
-        status_after = run_argv(["git", "status", "--porcelain"], cwd=repo_root, env=env).stdout
+        status_after = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env).stdout
         if status_after != status_before:
+            myrmex_task_operation.record_task_terminal(op, "failed", "Verifier workspace mutation detected", error_type="VERIFIER_MUTATION")
             raise VerifierWorkspaceMutationError("Verifier mutated repository workspace during verification execution")
+
+        myrmex_task_operation.record_task_terminal(
+            op,
+            "completed" if v_passed else "failed",
+            json.dumps({"decision": "PASS" if v_passed else "FAIL", "defects": defects_found}),
+        )
+        myrmex_task_operation.record_receipt_confirmed(op)
 
         return {
             "driver": self.driver_name,
@@ -347,6 +482,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             "results": v_results,
             "defects": defects_found,
             "timestamp": utcnow(),
+            "task_id": op.operation_id,
         }
 
     def execute_remediation(
@@ -359,22 +495,49 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         env: dict[str, str],
     ) -> dict[str, Any]:
         agent_id = wu.get("implementing_agent") or self.remediator_agent
+        wuid = wu["id"]
+        campaign_id = wu.get("campaign_id", "default-campaign")
         remed_cmd = wu.get("remediation_command")
         started_at = utcnow()
 
+        wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
+        if not wt_dir.exists():
+            wt_dir = repo_root
+
+        prompt = (
+            f"Remediation Task (Attempt {attempt}) for WU {wuid}\n"
+            f"Defects to fix: {json.dumps(defects)}\n"
+            f"Remediation Command: {remed_cmd}"
+        )
+        op = myrmex_task_operation.create_task_intent(
+            campaign_id=campaign_id,
+            work_unit_id=wuid,
+            run_id=run_id,
+            role="remediator",
+            agent=agent_id,
+            workspace=str(wt_dir),
+            base_sha=wu.get("base_sha", "HEAD"),
+            prompt=prompt,
+            attempt=attempt,
+        )
+
         if remed_cmd:
             sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Dispatching remediator ({agent_id}, attempt {attempt}): {remed_cmd}\n")
-            proc = run_argv(remed_cmd, cwd=repo_root, env=env)
+            proc = run_argv(remed_cmd, cwd=wt_dir, env=env)
             if proc.returncode != 0:
                 sys.stderr.write(f"[myrmex-head] Remediation command failed: {proc.stderr}\n")
 
-        curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
+        curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+        myrmex_task_operation.record_task_terminal(op, "completed", f"Remediation attempt {attempt} finished", candidate_sha=curr_cand)
+        myrmex_task_operation.record_receipt_confirmed(op)
+
         return {
             "attempt": attempt,
             "candidate_sha": curr_cand,
             "defects": defects,
             "started_at": started_at,
             "completed_at": utcnow(),
+            "task_id": op.operation_id,
         }
 
     def execute_ci(
