@@ -56,6 +56,8 @@ REQUIRED_CONTRACTS = {
     "plan-revision-v1.schema.json",
     "planning-request-v1.schema.json",
     "planning-result-v1.schema.json",
+    "source-observation-v1.schema.json",
+    "import-operation-v1.schema.json",
     "procedural-experiment-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }

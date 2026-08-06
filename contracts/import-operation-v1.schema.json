@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:import-operation:v1",
+  "title": "Myrmex Import Operation v1",
+  "description": "Immutable lifecycle record for a read-only backlog import operation. An import operation observes an external source and records the observation and a deterministic receipt; it never creates work units, never activates plans, and never writes to the repository: the authority block pins every effect flag to false (including create_work_units) and allows only external reads. Canonical digest rules: operation_id is 'importop-' + the first 24 hex characters of SHA256(canonical {campaign_id, idempotency_key}) and does NOT include request content; request_digest is SHA256(canonical request); receipt_digest is SHA256(canonical receipt excluding receipt_id and receipt_digest); receipt_id is 'imprcpt_' + receipt_digest; record_digest is SHA256(canonical record excluding record_id and record_digest); record_id is 'importrec_' + record_digest. Status conditionals: intent has effect_stage none, null observation, null receipt, null previous_record_id; effect-observed has effect_stage response_observed, a non-null observation, null receipt, and previous_record_id pointing at the intent record; receipt-recorded has a non-null observation and receipt with previous_record_id pointing at the effect-observed record; confirmed has a non-null observation and receipt with previous_record_id pointing at the receipt-recorded record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "record_id",
+    "record_digest",
+    "operation_id",
+    "idempotency_key",
+    "campaign_id",
+    "source_identity",
+    "adapter",
+    "request",
+    "request_digest",
+    "previous_content_digest",
+    "status",
+    "effect_stage",
+    "observation",
+    "receipt",
+    "previous_record_id",
+    "authority",
+    "created_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.import-operation/v1"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^importrec_[0-9a-f]{64}$",
+      "description": "Derived identity: 'importrec_' + record_digest."
+    },
+    "record_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the complete record excluding record_id and record_digest."
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^importop-[0-9a-f]{24}$",
+      "description": "Derived identity: 'importop-' + first 24 hex of SHA256(canonical {campaign_id, idempotency_key}); does not include request content."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "canonical_id"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+        },
+        "canonical_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "description": "Stable identity of the external source being imported."
+    },
+    "adapter": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request": {
+      "type": "object",
+      "description": "The adapter-specific import request. Generic object; adapter-specific members are allowed. Secret/raw-content fields are rejected by the import operation policy before any artifact is persisted."
+    },
+    "request_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the request object."
+    },
+    "previous_content_digest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Content digest of the previously observed state, or null when none exists."
+    },
+    "status": {
+      "enum": ["intent", "effect-observed", "receipt-recorded", "confirmed"]
+    },
+    "effect_stage": {
+      "enum": ["none", "response_observed"]
+    },
+    "observation": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observation_id", "observation_digest", "outcome"],
+          "properties": {
+            "observation_id": {
+              "type": "string",
+              "pattern": "^srcobs_[0-9a-f]{64}$"
+            },
+            "observation_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "outcome": {
+              "enum": ["changed", "unchanged", "unavailable", "invalid", "ambiguous"]
+            }
+          },
+          "description": "Reference to the persisted source observation (id, digest, outcome)."
+        }
+      ]
+    },
+    "receipt": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receipt_id",
+            "receipt_digest",
+            "operation_id",
+            "observation_id",
+            "observation_digest",
+            "request_digest",
+            "outcome"
+          ],
+          "properties": {
+            "receipt_id": {
+              "type": "string",
+              "pattern": "^imprcpt_[0-9a-f]{64}$",
+              "description": "Derived identity: 'imprcpt_' + receipt_digest."
+            },
+            "receipt_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "Canonical SHA-256 digest of the receipt excluding receipt_id and receipt_digest."
+            },
+            "operation_id": {
+              "type": "string",
+              "pattern": "^importop-[0-9a-f]{24}$"
+            },
+            "observation_id": {
+              "type": "string",
+              "pattern": "^srcobs_[0-9a-f]{64}$"
+            },
+            "observation_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "request_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "outcome": {
+              "enum": ["changed", "unchanged", "unavailable", "invalid", "ambiguous"]
+            }
+          }
+        }
+      ]
+    },
+    "previous_record_id": {
+      "type": ["string", "null"],
+      "pattern": "^importrec_[0-9a-f]{64}$",
+      "description": "record_id of the previous lifecycle record in the chain; null only for intent."
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "external_read",
+        "repository_write",
+        "create_work_units",
+        "activate_plan",
+        "commit",
+        "push",
+        "merge",
+        "release",
+        "deploy"
+      ],
+      "properties": {
+        "scope": {
+          "const": "read_only_backlog_import"
+        },
+        "external_read": {
+          "const": true
+        },
+        "repository_write": {
+          "const": false
+        },
+        "create_work_units": {
+          "const": false
+        },
+        "activate_plan": {
+          "const": false
+        },
+        "commit": {
+          "const": false
+        },
+        "push": {
+          "const": false
+        },
+        "merge": {
+          "const": false
+        },
+        "release": {
+          "const": false
+        },
+        "deploy": {
+          "const": false
+        }
+      },
+      "description": "Bounded authority: read-only backlog import. Only external_read is true; every effect flag including create_work_units is pinned false."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "intent"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "effect_stage": {
+            "const": "none"
+          },
+          "observation": {
+            "type": "null"
+          },
+          "receipt": {
+            "type": "null"
+          },
+          "previous_record_id": {
+            "type": "null"
+          }
+        },
+        "description": "intent: effect_stage none, null observation, null receipt, null previous_record_id."
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "effect-observed"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "effect_stage": {
+            "const": "response_observed"
+          },
+          "observation": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "receipt": {
+            "type": "null"
+          },
+          "previous_record_id": {
+            "type": "string",
+            "pattern": "^importrec_[0-9a-f]{64}$"
+          }
+        },
+        "description": "effect-observed: response_observed, non-null observation, null receipt, previous_record_id links the intent record."
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "receipt-recorded"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "effect_stage": {
+            "const": "response_observed"
+          },
+          "observation": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "receipt": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "previous_record_id": {
+            "type": "string",
+            "pattern": "^importrec_[0-9a-f]{64}$"
+          }
+        },
+        "description": "receipt-recorded: response_observed, non-null observation and receipt, previous_record_id links the effect-observed record."
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "confirmed"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "effect_stage": {
+            "const": "response_observed"
+          },
+          "observation": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "receipt": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "previous_record_id": {
+            "type": "string",
+            "pattern": "^importrec_[0-9a-f]{64}$"
+          }
+        },
+        "description": "confirmed: response_observed, non-null observation and receipt, previous_record_id links the receipt-recorded record."
+      }
+    }
+  ]
+}

@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:source-observation:v1",
+  "title": "Myrmex Source Observation v1",
+  "description": "A single immutable observation of an external backlog/source, produced by a read-only import operation. A source observation has no repository authority: the authority block pins every effect flag to false and allows only external reads. Canonical digest rules: observation_digest is the canonical SHA-256 digest of the complete observation (all fields except observation_id and observation_digest) using UTF-8, LF line endings, deterministic key ordering for structured fields, and no insignificant trailing whitespace; observation_id is 'srcobs_' + observation_digest. Outcome semantics: unchanged requires previous_content_digest to be non-null and content_digest to equal previous_content_digest; changed requires previous_content_digest to be null or content_digest to differ from previous_content_digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "observation_id",
+    "observation_digest",
+    "campaign_id",
+    "operation_id",
+    "source_identity",
+    "adapter",
+    "request_digest",
+    "previous_content_digest",
+    "observed_version",
+    "content_digest",
+    "outcome",
+    "reason_code",
+    "observed_at",
+    "authority"
+  ],
+  "properties": {
+    "schema": {
+      "const": "myrmex.source-observation/v1"
+    },
+    "observation_id": {
+      "type": "string",
+      "pattern": "^srcobs_[0-9a-f]{64}$",
+      "description": "Derived identity: 'srcobs_' + observation_digest."
+    },
+    "observation_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the complete observation excluding observation_id and observation_digest."
+    },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^importop-[0-9a-f]{24}$",
+      "description": "The import operation that produced this observation."
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "canonical_id"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+        },
+        "canonical_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "description": "Stable identity of the external source this observation came from."
+    },
+    "adapter": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The import adapter that read the source."
+    },
+    "request_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the import request that produced this observation."
+    },
+    "previous_content_digest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Content digest of the previously observed state, or null when none exists."
+    },
+    "observed_version": {
+      "type": ["string", "null"],
+      "description": "Source-reported version string when observed; null for unavailable/invalid outcomes."
+    },
+    "content_digest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Canonical SHA-256 digest of the observed source content; null when no content was observed."
+    },
+    "outcome": {
+      "enum": ["changed", "unchanged", "unavailable", "invalid", "ambiguous"]
+    },
+    "reason_code": {
+      "type": ["string", "null"],
+      "description": "Typed reason for unavailable/invalid/ambiguous outcomes; null for changed/unchanged."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "external_read",
+        "repository_write",
+        "create_work_units",
+        "activate_plan",
+        "commit",
+        "push",
+        "merge",
+        "release",
+        "deploy"
+      ],
+      "properties": {
+        "scope": {
+          "const": "source_observation_only"
+        },
+        "external_read": {
+          "const": true
+        },
+        "repository_write": {
+          "const": false
+        },
+        "create_work_units": {
+          "const": false
+        },
+        "activate_plan": {
+          "const": false
+        },
+        "commit": {
+          "const": false
+        },
+        "push": {
+          "const": false
+        },
+        "merge": {
+          "const": false
+        },
+        "release": {
+          "const": false
+        },
+        "deploy": {
+          "const": false
+        }
+      },
+      "description": "Bounded authority: source observation only. Only external_read is true; every effect flag is pinned false."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": ["changed", "unchanged"]
+          }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "observed_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "content_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "reason_code": {
+            "type": "null"
+          }
+        },
+        "description": "changed/unchanged: non-empty observed_version, 64-hex content_digest, null reason_code."
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": ["unavailable", "invalid"]
+          }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "observed_version": {
+            "type": "null"
+          },
+          "content_digest": {
+            "type": "null"
+          },
+          "reason_code": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "description": "unavailable/invalid: null observed_version and content_digest, non-empty reason_code."
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "ambiguous"
+          }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "content_digest": {
+            "type": "null"
+          },
+          "reason_code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "observed_version": {
+            "type": ["string", "null"]
+          }
+        },
+        "description": "ambiguous: null content_digest, non-empty reason_code, observed_version string or null."
+      }
+    }
+  ]
+}
