@@ -43,6 +43,9 @@ BLOCKER_TYPES = {
     "product_change_required",
     "budget_exhausted",
     "verifier_workspace_mutation",
+    "out_of_scope_mutation",
+    "driver_policy_violation",
+    "ambiguous_missing_receipt",
     "ci_failed",
     "ci_failed_unrecoverable",
     "conflict_unresolvable",
@@ -53,15 +56,15 @@ BLOCKER_TYPES = {
 
 ALLOWED_PHASE_TRANSITIONS = {
     "ready": {"collecting-context", "blocked", "cancelled"},
-    "collecting-context": {"collecting-context", "implementing", "verifying", "remediating", "running-ci", "committing", "delivering", "completed", "blocked", "failed", "cancelled"},
-    "implementing": {"collecting-context", "verifying", "blocked", "failed", "cancelled"},
-    "verifying": {"collecting-context", "remediating", "running-ci", "blocked", "failed", "cancelled"},
-    "remediating": {"collecting-context", "verifying", "blocked", "failed", "cancelled"},
-    "running-ci": {"collecting-context", "committing", "remediating", "blocked", "failed", "cancelled"},
-    "committing": {"collecting-context", "delivering", "completed", "blocked", "failed", "cancelled"},
-    "delivering": {"collecting-context", "completed", "blocked", "failed", "cancelled"},
-    "blocked": {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "cancelled", "superseded"},
-    "failed": {"ready", "cancelled", "superseded"},
+    "collecting-context": {"implementing", "blocked", "cancelled"},
+    "implementing": {"verifying", "blocked", "failed", "cancelled"},
+    "verifying": {"remediating", "running-ci", "blocked", "failed", "cancelled"},
+    "remediating": {"verifying", "blocked", "failed", "cancelled"},
+    "running-ci": {"committing", "remediating", "blocked", "failed", "cancelled"},
+    "committing": {"delivering", "blocked", "failed", "cancelled"},
+    "delivering": {"completed", "blocked", "failed", "cancelled"},
+    "blocked": set(),
+    "failed": set(),
     "cancelled": set(),
     "completed": set(),
     "superseded": set(),
@@ -305,6 +308,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "next_action": "add work units or start supervisor",
         "supervisor_pid": None,
         "supervisor_host": None,
+        "driver_policy": getattr(args, "driver_policy", None),
+        "execution_driver": getattr(args, "execution_driver", None),
         "completed_at": None,
         "cancelled_at": None,
         "failed_at": None,
@@ -387,6 +392,9 @@ def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
         "corrections_applied": [],
         "implementing_agent": None,
         "verifying_agent": None,
+        "driver_policy": wu_spec.get("driver_policy"),
+        "execution_driver": wu_spec.get("execution_driver"),
+        "recovery_events": wu_spec.get("recovery_events", []),
     }
     data["work_units"].append(wu)
 
@@ -622,8 +630,8 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
         return 1
 
     cur_phase = wu["phase"]
-    if not args.force and target_phase and target_phase not in ALLOWED_PHASE_TRANSITIONS.get(cur_phase, set()):
-        sys.stderr.write(f"error: invalid phase transition {cur_phase} -> {target_phase}\n")
+    if not getattr(args, "force", False) and target_phase and target_phase not in ALLOWED_PHASE_TRANSITIONS.get(cur_phase, set()):
+        sys.stderr.write(f"error: invalid phase transition {cur_phase} -> {target_phase}; use wu-recover for recovery transitions\n")
         return 1
 
     if target_phase:
@@ -706,6 +714,108 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
         "wu_id": wuid, "phase": wu["phase"], "status": wu["status"]
     })
     print(json.dumps({"ok": True, "wu_id": wuid, "phase": wu["phase"], "status": wu["status"]}, indent=2))
+    return 0
+
+
+def cmd_wu_recover(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    wuid = args.wu_id
+    wu = next((w for w in data["work_units"] if w["id"] == wuid), None)
+    if not wu:
+        sys.stderr.write(f"error: work unit {wuid} not found\n")
+        return 1
+
+    from_phase = args.from_phase
+    resume_phase = args.resume_phase
+    reason = args.reason
+
+    if not reason or not reason.strip():
+        sys.stderr.write("error: --reason is required for work unit recovery\n")
+        return 1
+
+    if resume_phase not in WU_PHASES:
+        sys.stderr.write(f"error: unknown resume phase {resume_phase!r}\n")
+        return 1
+
+    # Validate from_phase matches actual state
+    if wu["phase"] != from_phase and wu["status"] != from_phase:
+        sys.stderr.write(f"error: work unit current phase is {wu['phase']!r} (status={wu['status']!r}), expected from-phase {from_phase!r}\n")
+        return 1
+
+    valid_resume_targets = {
+        "blocked": {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "committing", "delivering"},
+        "failed": {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "committing", "delivering"},
+        "ready": {"ready", "collecting-context"},
+        "collecting-context": {"collecting-context", "implementing"},
+        "implementing": {"implementing", "verifying"},
+        "verifying": {"verifying", "remediating", "running-ci"},
+        "remediating": {"remediating", "verifying"},
+        "running-ci": {"running-ci", "committing", "remediating"},
+        "committing": {"committing", "delivering"},
+        "delivering": {"delivering", "completed"},
+    }
+
+    allowed_targets = valid_resume_targets.get(from_phase, set())
+    if resume_phase not in allowed_targets:
+        sys.stderr.write(f"error: cannot recover from {from_phase!r} to resume phase {resume_phase!r}; allowed: {sorted(allowed_targets)}\n")
+        return 1
+
+    evidence_data = None
+    if args.evidence_file:
+        ev_p = Path(args.evidence_file)
+        if not ev_p.is_file():
+            sys.stderr.write(f"error: evidence file {args.evidence_file} not found\n")
+            return 1
+        try:
+            evidence_data = json.loads(ev_p.read_text(encoding="utf-8"))
+        except Exception as e:
+            sys.stderr.write(f"error: invalid JSON in evidence file: {e}\n")
+            return 1
+        wu["evidence"] = evidence_data
+
+    # Clear blocker if any
+    wu["blocker"] = None
+
+    # Update phase & status
+    wu["phase"] = resume_phase
+    if resume_phase == "ready":
+        wu["status"] = "ready"
+    elif resume_phase == "completed":
+        wu["status"] = "completed"
+        wu["completed_at"] = utcnow()
+    else:
+        wu["status"] = "active"
+        data["active_work_unit"] = wuid
+
+    now_str = utcnow()
+    recovery_event = {
+        "timestamp": now_str,
+        "from_phase": from_phase,
+        "resume_phase": resume_phase,
+        "reason": reason,
+        "evidence_attached": bool(evidence_data),
+    }
+    wu.setdefault("recovery_events", []).append(recovery_event)
+
+    rev = data["revision"]
+    if args.expect_revision is not None and args.expect_revision != rev:
+        sys.stderr.write(f"error: revision mismatch; expected {args.expect_revision}, found {rev}\n")
+        return 1
+
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "WORK_UNIT_RECOVERED", f"{wuid} recovered from {from_phase} -> {resume_phase}: {reason}", {
+        "wu_id": wuid, "from_phase": from_phase, "resume_phase": resume_phase, "reason": reason
+    })
+
+    res = {
+        "ok": True,
+        "wu_id": wuid,
+        "from_phase": from_phase,
+        "phase": resume_phase,
+        "status": wu["status"],
+        "revision": data["revision"]
+    }
+    print(json.dumps(res, indent=2))
     return 0
 
 
@@ -996,6 +1106,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--cost-limit-usd", type=float)
     p_init.add_argument("--max-consecutive-failures", type=int, default=5)
     p_init.add_argument("--max-stalled-seconds", type=int, default=3600)
+    p_init.add_argument("--driver-policy", choices=["production", "opencode", "fixture"])
+    p_init.add_argument("--execution-driver", choices=["opencode-task", "fixture-command"])
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=cmd_init)
 
@@ -1030,6 +1142,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_wu_add.add_argument("--no-op-allowed", action="store_true", help="Allow completing without workspace diff")
     p_wu_add.add_argument("--risk-class", choices=["bounded", "unbounded"], default="bounded")
     p_wu_add.add_argument("--required-route", choices=["auto", "direct-only", "delegated", "frontier", "frontier-gated"], default="delegated")
+    p_wu_add.add_argument("--driver-policy", choices=["production", "opencode", "fixture"])
+    p_wu_add.add_argument("--execution-driver", choices=["opencode-task", "fixture-command"])
     p_wu_add.add_argument("--issue", type=int, help="Linked GitHub issue number")
     p_wu_add.add_argument("--corrections-budget", type=int)
     p_wu_add.set_defaults(func=cmd_wu_add)
@@ -1054,6 +1168,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_wut.add_argument("--pr-number", type=int, help="Pull request number")
     p_wut.add_argument("--force", action="store_true")
     p_wut.set_defaults(func=cmd_wu_transition)
+
+    # wu-recover
+    p_wurec = sub.add_parser("wu-recover", help="Recover or resume an interrupted/blocked work unit")
+    p_wurec.add_argument("id", help="Campaign ID")
+    p_wurec.add_argument("wu_id", help="Work Unit ID")
+    p_wurec.add_argument("--from-phase", required=True, choices=list(WU_PHASES) + ["blocked", "failed"])
+    p_wurec.add_argument("--resume-phase", required=True, choices=list(WU_PHASES))
+    p_wurec.add_argument("--reason", required=True, help="Auditable justification for recovery")
+    p_wurec.add_argument("--evidence-file", help="Path to evidence JSON file to attach")
+    p_wurec.add_argument("--expect-revision", type=int, help="Expected revision for CAS check")
+    p_wurec.set_defaults(func=cmd_wu_recover)
 
     # lease
     p_la = sub.add_parser("lease-acquire", help="Acquire exclusive campaign lease")
