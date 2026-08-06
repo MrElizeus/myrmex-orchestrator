@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""Atomic local campaign store and DAG orchestrator for Myrmex autonomous workflows.
+
+Zero external dependencies. Manages durable campaign lifecycles, work-unit DAGs,
+budgets, compare-and-swap atomic state mutations, append-only event logs,
+and evidence bundles.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+SCHEMA_V1 = "myrmex.campaign/v1"
+SCHEMA_VERSION = 1
+
+CAMPAIGN_STATUSES = {"active", "paused", "completed", "failed", "cancelled"}
+WU_STATUSES = {
+    "pending", "ready", "active", "verifying",
+    "remediating", "ci", "delivering",
+    "completed", "blocked", "failed", "cancelled", "superseded"
+}
+WU_PHASES = {
+    "ready", "collecting-context", "implementing",
+    "verifying", "remediating", "running-ci",
+    "committing", "delivering", "completed",
+    "blocked", "failed", "cancelled", "superseded"
+}
+BLOCKER_TYPES = {
+    "human_decision_required",
+    "credential_required",
+    "destructive_action_required",
+    "product_change_required",
+    "budget_exhausted",
+    "ci_failed_unrecoverable",
+    "conflict_unresolvable",
+    "stalled_no_progress",
+    "frontier_unavailable",
+    "unknown"
+}
+
+ALLOWED_PHASE_TRANSITIONS = {
+    "ready": {"collecting-context", "blocked", "cancelled"},
+    "collecting-context": {"implementing", "blocked", "failed", "cancelled"},
+    "implementing": {"verifying", "blocked", "failed", "cancelled"},
+    "verifying": {"remediating", "running-ci", "blocked", "failed", "cancelled"},
+    "remediating": {"verifying", "blocked", "failed", "cancelled"},
+    "running-ci": {"committing", "remediating", "blocked", "failed", "cancelled"},
+    "committing": {"delivering", "completed", "blocked", "failed", "cancelled"},
+    "delivering": {"completed", "blocked", "failed", "cancelled"},
+    "blocked": {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "cancelled", "superseded"},
+    "failed": {"ready", "cancelled", "superseded"},
+    "cancelled": set(),
+    "completed": set(),
+    "superseded": set(),
+}
+
+
+def utcnow() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def campaign_state_home() -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        base = Path(xdg) / "myrmex" / "campaigns"
+    else:
+        base = Path.home() / ".local" / "state" / "myrmex" / "campaigns"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def campaign_dir(campaign_id: str) -> Path:
+    validate_campaign_id(campaign_id)
+    return campaign_state_home() / campaign_id
+
+
+def validate_campaign_id(cid: str) -> None:
+    if not re.match(r"^camp-[a-z0-9][a-z0-9-]{4,60}$", cid):
+        raise ValueError(f"invalid campaign id {cid!r}; must match ^camp-[a-z0-9][a-z0-9-]{{4,60}}$")
+
+
+def validate_wu_id(wuid: str) -> None:
+    if not re.match(r"^WU-[A-Z0-9][A-Z0-9-]{0,30}$", wuid):
+        raise ValueError(f"invalid work unit id {wuid!r}; must match ^WU-[A-Z0-9][A-Z0-9-]{{0,30}}$")
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, sort_keys=False) + "\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), delete=False) as tf:
+        tf.write(payload)
+        temp_path = Path(tf.name)
+    temp_path.replace(path)
+
+
+def read_campaign(campaign_id: str) -> dict[str, Any]:
+    cdir = campaign_dir(campaign_id)
+    cfile = cdir / "campaign.json"
+    if not cfile.is_file():
+        raise FileNotFoundError(f"campaign {campaign_id!r} not found at {cfile}")
+    with cfile.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    validate_campaign_data(data)
+    return data
+
+
+def write_campaign(data: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
+    validate_campaign_data(data)
+    cid = data["id"]
+    cdir = campaign_dir(cid)
+    cfile = cdir / "campaign.json"
+
+    if expected_revision is not None:
+        if not cfile.is_file():
+            if expected_revision != 0:
+                raise ValueError(f"conflict: expected revision {expected_revision}, but file does not exist")
+        else:
+            current = json.loads(cfile.read_text(encoding="utf-8"))
+            cur_rev = current.get("revision", 0)
+            if cur_rev != expected_revision:
+                raise ValueError(f"compare-and-swap conflict: expected revision {expected_revision}, found {cur_rev}")
+
+    data["revision"] = data.get("revision", 0) + 1
+    data["updated_at"] = utcnow()
+    validate_campaign_data(data)
+    atomic_write_json(cfile, data)
+    return data
+
+
+def append_event(campaign_id: str, event_type: str, message: str, payload: dict[str, Any] | None = None) -> None:
+    cdir = campaign_dir(campaign_id)
+    cdir.mkdir(parents=True, exist_ok=True)
+    efile = cdir / "events.jsonl"
+    record = {
+        "timestamp": utcnow(),
+        "campaign_id": campaign_id,
+        "event_type": event_type,
+        "message": message,
+        "payload": payload or {},
+    }
+    line = json.dumps(record, sort_keys=True) + "\n"
+    with efile.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def validate_campaign_data(data: dict[str, Any]) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("campaign data must be a JSON object")
+    if data.get("schema") != SCHEMA_V1:
+        raise ValueError(f"unsupported schema {data.get('schema')!r}, expected {SCHEMA_V1!r}")
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema_version {data.get('schema_version')!r}")
+    validate_campaign_id(data.get("id", ""))
+    if data.get("status") not in CAMPAIGN_STATUSES:
+        raise ValueError(f"invalid status {data.get('status')!r}")
+    if not data.get("title"):
+        raise ValueError("title cannot be empty")
+    if not data.get("objective"):
+        raise ValueError("objective cannot be empty")
+    if not data.get("repository_root"):
+        raise ValueError("repository_root cannot be empty")
+    if not isinstance(data.get("work_units"), list):
+        raise ValueError("work_units must be a list")
+    if not isinstance(data.get("dag"), dict) or "edges" not in data["dag"]:
+        raise ValueError("dag must be an object with an 'edges' list")
+    if not isinstance(data.get("budgets"), dict):
+        raise ValueError("budgets must be an object")
+    if not isinstance(data.get("lease"), dict):
+        raise ValueError("lease must be an object")
+
+    # Validate work units
+    wu_ids = set()
+    for wu in data["work_units"]:
+        if not isinstance(wu, dict):
+            raise ValueError("each work unit must be an object")
+        wuid = wu.get("id", "")
+        validate_wu_id(wuid)
+        if wuid in wu_ids:
+            raise ValueError(f"duplicate work unit ID {wuid!r}")
+        wu_ids.add(wuid)
+        if wu.get("status") not in WU_STATUSES:
+            raise ValueError(f"invalid WU status {wu.get('status')!r} on {wuid}")
+        if wu.get("phase") not in WU_PHASES:
+            raise ValueError(f"invalid WU phase {wu.get('phase')!r} on {wuid}")
+
+    # Validate DAG edges references
+    for edge in data["dag"]["edges"]:
+        if not isinstance(edge, list) or len(edge) != 2:
+            raise ValueError(f"invalid edge format: {edge!r}")
+        from_id, to_id = edge
+        if from_id not in wu_ids:
+            raise ValueError(f"DAG edge references nonexistent source WU {from_id!r}")
+        if to_id not in wu_ids:
+            raise ValueError(f"DAG edge references nonexistent target WU {to_id!r}")
+
+
+def compute_dag_order(work_units: list[dict[str, Any]], edges: list[list[str]]) -> list[str]:
+    wu_map = {wu["id"]: wu for wu in work_units}
+    adj: dict[str, list[str]] = {wuid: [] for wuid in wu_map}
+    in_degree: dict[str, int] = {wuid: 0 for wuid in wu_map}
+
+    # Edges format: [dep, target] -> target depends on dep
+    for dep, target in edges:
+        adj[dep].append(target)
+        in_degree[target] += 1
+
+    # Kahn's algorithm for topological sorting and cycle detection
+    queue = [wuid for wuid, deg in in_degree.items() if deg == 0]
+    order = []
+    while queue:
+        curr = queue.pop(0)
+        order.append(curr)
+        for nxt in adj[curr]:
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                queue.append(nxt)
+
+    if len(order) != len(wu_map):
+        raise ValueError("circular dependency detected in campaign DAG")
+    return order
+
+
+def get_ready_work_units(data: dict[str, Any]) -> list[dict[str, Any]]:
+    completed_ids = {wu["id"] for wu in data["work_units"] if wu["status"] == "completed"}
+    ready = []
+    for wu in data["work_units"]:
+        if wu["status"] in {"pending", "ready"}:
+            deps = set(wu.get("dependencies", []))
+            if deps.issubset(completed_ids):
+                ready.append(wu)
+    return ready
+
+
+# CLI Subcommands
+
+def cmd_init(args: argparse.Namespace) -> int:
+    cid = args.id or f"camp-{hashlib.sha256((args.title + utcnow()).encode('utf-8')).hexdigest()[:10]}"
+    validate_campaign_id(cid)
+
+    cdir = campaign_dir(cid)
+    if (cdir / "campaign.json").exists() and not args.force:
+        sys.stderr.write(f"error: campaign {cid} already exists (use --force to overwrite)\n")
+        return 1
+
+    repo_root = os.path.abspath(args.repo_root or os.getcwd())
+    now = utcnow()
+
+    source = {"type": "local", "path": args.backlog_file} if args.backlog_file else {"type": "local", "path": None}
+
+    data: dict[str, Any] = {
+        "schema": SCHEMA_V1,
+        "schema_version": SCHEMA_VERSION,
+        "revision": 0,
+        "id": cid,
+        "created_at": now,
+        "updated_at": now,
+        "status": "active",
+        "title": args.title,
+        "objective": args.objective or args.title,
+        "repository_root": repo_root,
+        "source": source,
+        "work_units": [],
+        "dag": {"edges": []},
+        "active_work_unit": None,
+        "budgets": {
+            "max_concurrent_wu": 1,
+            "corrections_per_wu": args.corrections_per_wu or 3,
+            "corrections_global": args.corrections_global or 30,
+            "corrections_global_used": 0,
+            "frontier_calls": args.frontier_calls or 50,
+            "frontier_calls_used": 0,
+            "estimated_cost_usd": None,
+            "cost_limit_usd": args.cost_limit_usd,
+            "max_consecutive_failures": args.max_consecutive_failures or 5,
+            "consecutive_failures": 0,
+            "max_time_without_progress_seconds": args.max_stalled_seconds or 3600,
+            "last_progress_at": now,
+            "external_operations": 0,
+            "total_diff_bytes": 0,
+        },
+        "lease": {
+            "holder": None,
+            "acquired_at": None,
+            "expires_at": None,
+            "heartbeat_at": None,
+            "heartbeat_interval_seconds": 30,
+            "lease_duration_seconds": 120,
+        },
+        "pause_reason": None,
+        "paused_at": None,
+        "blockers": [],
+        "next_action": "add work units or start supervisor",
+        "supervisor_pid": None,
+        "supervisor_host": None,
+        "completed_at": None,
+        "cancelled_at": None,
+        "failed_at": None,
+        "failure_reason": None,
+    }
+
+    if args.backlog_file:
+        bf = Path(args.backlog_file)
+        if not bf.is_file():
+            sys.stderr.write(f"error: backlog file {bf} not found\n")
+            return 1
+        backlog_data = json.loads(bf.read_text(encoding="utf-8"))
+        if isinstance(backlog_data, list):
+            for item in backlog_data:
+                add_wu_to_data(data, item)
+        elif isinstance(backlog_data, dict) and "work_units" in backlog_data:
+            for item in backlog_data["work_units"]:
+                add_wu_to_data(data, item)
+
+    write_campaign(data, expected_revision=0)
+    append_event(cid, "CAMPAIGN_INITIALIZED", f"Campaign initialized: {args.title}", {"repository_root": repo_root})
+    print(json.dumps({"ok": True, "id": cid, "status": "active", "path": str(cdir / "campaign.json")}, indent=2))
+    return 0
+
+
+def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
+    wuid = wu_spec.get("id")
+    if not wuid:
+        wuid = f"WU-{len(data['work_units']) + 1:03d}"
+    validate_wu_id(wuid)
+
+    deps = wu_spec.get("dependencies", [])
+    for d in deps:
+        validate_wu_id(d)
+        data["dag"]["edges"].append([d, wuid])
+
+    wu: dict[str, Any] = {
+        "id": wuid,
+        "status": "pending",
+        "phase": "ready",
+        "objective": wu_spec.get("objective", f"Execute {wuid}"),
+        "dependencies": deps,
+        "scope": wu_spec.get("scope", []),
+        "acceptance_criteria": wu_spec.get("acceptance_criteria", []),
+        "verification_commands": wu_spec.get("verification_commands", []),
+        "risk_class": wu_spec.get("risk_class", "bounded"),
+        "required_route": wu_spec.get("required_route", "delegated"),
+        "issue": wu_spec.get("issue"),
+        "branch": None,
+        "worktree": None,
+        "run_id": None,
+        "base_sha": None,
+        "candidate_sha": None,
+        "diff_digest": None,
+        "commit_sha": None,
+        "pr_number": None,
+        "pr_url": None,
+        "started_at": None,
+        "completed_at": None,
+        "corrections_used": 0,
+        "corrections_budget": wu_spec.get("corrections_budget", data["budgets"]["corrections_per_wu"]),
+        "attempts": [],
+        "evidence": None,
+        "blocker": None,
+        "next_action": "awaiting dependencies or supervisor dispatch",
+        "ci_result": None,
+        "ci_summary": None,
+        "defects_found": [],
+        "corrections_applied": [],
+        "implementing_agent": None,
+        "verifying_agent": None,
+    }
+    data["work_units"].append(wu)
+
+
+def cmd_wu_add(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    wuid = args.wu_id
+    if not wuid:
+        wuid = f"WU-{len(data['work_units']) + 1:03d}"
+    validate_wu_id(wuid)
+
+    deps = args.dependencies.split(",") if args.dependencies else []
+    deps = [d.strip() for d in deps if d.strip()]
+    scope = args.scope.split(",") if args.scope else []
+    scope = [s.strip() for s in scope if s.strip()]
+    vcmds = [args.verify_cmd] if args.verify_cmd else []
+
+    wu_spec = {
+        "id": wuid,
+        "objective": args.objective,
+        "dependencies": deps,
+        "scope": scope,
+        "acceptance_criteria": [args.criteria] if args.criteria else [],
+        "verification_commands": vcmds,
+        "risk_class": args.risk_class or "bounded",
+        "required_route": args.required_route or "delegated",
+        "issue": args.issue,
+        "corrections_budget": args.corrections_budget or data["budgets"]["corrections_per_wu"],
+    }
+    add_wu_to_data(data, wu_spec)
+
+    # Validate DAG for cycles immediately
+    try:
+        compute_dag_order(data["work_units"], data["dag"]["edges"])
+    except ValueError as e:
+        sys.stderr.write(f"error: adding WU creates DAG cycle: {e}\n")
+        return 1
+
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "WORK_UNIT_ADDED", f"Added {wuid}: {args.objective}", {"wu_id": wuid})
+    print(json.dumps({"ok": True, "wu_id": wuid, "campaign_id": args.id}, indent=2))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    print(f"Campaign:     {data['id']}")
+    print(f"Title:        {data['title']}")
+    print(f"Status:       {data['status'].upper()}")
+    print(f"Revision:     {data['revision']}")
+    print(f"Repo Root:    {data['repository_root']}")
+    print(f"Active WU:    {data.get('active_work_unit') or '<none>'}")
+    print(f"Next Action:  {data.get('next_action') or '<none>'}")
+    print(f"Progress At:  {data['budgets'].get('last_progress_at')}")
+    print("\nBudgets:")
+    b = data["budgets"]
+    print(f"  Corrections (Global): {b['corrections_global_used']}/{b['corrections_global']}")
+    print(f"  Frontier Calls:       {b['frontier_calls_used']}/{b['frontier_calls']}")
+    print(f"  Consecutive Failures: {b['consecutive_failures']}/{b['max_consecutive_failures']}")
+
+    print(f"\nWork Units ({len(data['work_units'])}):")
+    for wu in data["work_units"]:
+        marker = "▶" if wu["id"] == data.get("active_work_unit") else " "
+        print(f" {marker} [{wu['status'].upper():10}] {wu['id']}: {wu['objective']} (Phase: {wu['phase']})")
+        if wu.get("dependencies"):
+            print(f"              Deps: {', '.join(wu['dependencies'])}")
+        if wu.get("blocker"):
+            print(f"              Blocker: {wu['blocker'].get('type')} - {wu['blocker'].get('message')}")
+
+    if data.get("blockers"):
+        print(f"\nActive Campaign Blockers ({len(data['blockers'])}):")
+        for blk in data["blockers"]:
+            print(f"  ! [{blk.get('type')}] {blk.get('message')}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    base = campaign_state_home()
+    campaigns = []
+    for cdir in sorted(base.glob("camp-*")):
+        cfile = cdir / "campaign.json"
+        if cfile.is_file():
+            try:
+                data = json.loads(cfile.read_text(encoding="utf-8"))
+                total_wu = len(data.get("work_units", []))
+                completed_wu = sum(1 for w in data.get("work_units", []) if w.get("status") == "completed")
+                campaigns.append({
+                    "id": data.get("id"),
+                    "title": data.get("title"),
+                    "status": data.get("status"),
+                    "revision": data.get("revision"),
+                    "active_wu": data.get("active_work_unit"),
+                    "progress": f"{completed_wu}/{total_wu}",
+                    "updated_at": data.get("updated_at"),
+                })
+            except Exception:
+                continue
+
+    if args.json:
+        print(json.dumps(campaigns, indent=2))
+    else:
+        if not campaigns:
+            print("No campaigns found.")
+            return 0
+        print(f"{'CAMPAIGN ID':<20} {'STATUS':<12} {'PROGRESS':<10} {'ACTIVE WU':<12} {'TITLE'}")
+        print("-" * 75)
+        for c in campaigns:
+            print(f"{c['id']:<20} {c['status']:<12} {c['progress']:<10} {str(c['active_wu'] or '-'):<12} {c['title']}")
+    return 0
+
+
+def cmd_dag(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    try:
+        order = compute_dag_order(data["work_units"], data["dag"]["edges"])
+        ready = get_ready_work_units(data)
+        res = {
+            "ok": True,
+            "campaign_id": data["id"],
+            "topological_order": order,
+            "ready_work_units": [w["id"] for w in ready],
+            "total": len(data["work_units"]),
+        }
+        print(json.dumps(res, indent=2))
+        return 0
+    except ValueError as e:
+        sys.stderr.write(f"DAG Error: {e}\n")
+        return 1
+
+
+def cmd_lease_acquire(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    holder = args.holder or f"{socket.gethostname()}:{os.getpid()}"
+    duration = args.duration or data["lease"].get("lease_duration_seconds", 120)
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now_str = now_dt.isoformat()
+    exp_str = (now_dt + dt.timedelta(seconds=duration)).isoformat()
+
+    current_lease = data["lease"]
+    if current_lease.get("holder") and current_lease.get("expires_at"):
+        try:
+            exp_dt = dt.datetime.fromisoformat(current_lease["expires_at"])
+            if exp_dt > now_dt and current_lease["holder"] != holder:
+                sys.stderr.write(f"error: lease held by {current_lease['holder']} until {current_lease['expires_at']}\n")
+                return 1
+        except Exception:
+            pass
+
+    current_lease["holder"] = holder
+    current_lease["acquired_at"] = now_str
+    current_lease["expires_at"] = exp_str
+    current_lease["heartbeat_at"] = now_str
+    current_lease["lease_duration_seconds"] = duration
+    data["supervisor_pid"] = os.getpid()
+    data["supervisor_host"] = socket.gethostname()
+
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "LEASE_ACQUIRED", f"Lease acquired by {holder}", {"holder": holder, "expires_at": exp_str})
+    print(json.dumps({"ok": True, "holder": holder, "expires_at": exp_str}, indent=2))
+    return 0
+
+
+def cmd_lease_heartbeat(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    holder = args.holder or f"{socket.gethostname()}:{os.getpid()}"
+    duration = args.duration or data["lease"].get("lease_duration_seconds", 120)
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now_str = now_dt.isoformat()
+    exp_str = (now_dt + dt.timedelta(seconds=duration)).isoformat()
+
+    current_lease = data["lease"]
+    if current_lease.get("holder") != holder:
+        sys.stderr.write(f"error: lease holder mismatch; held by {current_lease.get('holder')!r}, requesting {holder!r}\n")
+        return 1
+
+    current_lease["heartbeat_at"] = now_str
+    current_lease["expires_at"] = exp_str
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    print(json.dumps({"ok": True, "holder": holder, "expires_at": exp_str}, indent=2))
+    return 0
+
+
+def cmd_lease_release(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    holder = args.holder or f"{socket.gethostname()}:{os.getpid()}"
+    current_lease = data["lease"]
+    if current_lease.get("holder") == holder or args.force:
+        current_lease["holder"] = None
+        current_lease["acquired_at"] = None
+        current_lease["expires_at"] = None
+        current_lease["heartbeat_at"] = None
+        data["supervisor_pid"] = None
+        data["supervisor_host"] = None
+        rev = data["revision"]
+        write_campaign(data, expected_revision=rev)
+        append_event(args.id, "LEASE_RELEASED", f"Lease released by {holder}", {"holder": holder})
+        print(json.dumps({"ok": True, "released": True}, indent=2))
+        return 0
+    sys.stderr.write(f"error: cannot release lease held by {current_lease.get('holder')!r}\n")
+    return 1
+
+
+def cmd_wu_transition(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    wuid = args.wu_id
+    target_phase = args.phase
+    target_status = args.status
+
+    wu = next((w for w in data["work_units"] if w["id"] == wuid), None)
+    if not wu:
+        sys.stderr.write(f"error: work unit {wuid} not found\n")
+        return 1
+
+    cur_phase = wu["phase"]
+    if not args.force and target_phase and target_phase not in ALLOWED_PHASE_TRANSITIONS.get(cur_phase, set()):
+        sys.stderr.write(f"error: invalid phase transition {cur_phase} -> {target_phase}\n")
+        return 1
+
+    if target_phase:
+        wu["phase"] = target_phase
+    if target_status:
+        wu["status"] = target_status
+    elif target_phase:
+        # derive status from phase
+        if target_phase in {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "committing", "delivering"}:
+            wu["status"] = "active" if target_phase != "ready" else "ready"
+        elif target_phase in {"completed", "blocked", "failed", "cancelled", "superseded"}:
+            wu["status"] = target_phase
+
+    now_str = utcnow()
+    if wu["phase"] == "implementing" and not wu.get("started_at"):
+        wu["started_at"] = now_str
+    if wu["status"] == "completed":
+        wu["completed_at"] = now_str
+        if data.get("active_work_unit") == wuid:
+            data["active_work_unit"] = None
+        data["budgets"]["consecutive_failures"] = 0
+        data["budgets"]["last_progress_at"] = now_str
+    elif wu["status"] in {"failed", "blocked"}:
+        data["budgets"]["consecutive_failures"] = data["budgets"].get("consecutive_failures", 0) + 1
+
+    if args.run_id:
+        wu["run_id"] = args.run_id
+    if args.branch:
+        wu["branch"] = args.branch
+    if args.worktree:
+        wu["worktree"] = args.worktree
+    if args.commit_sha:
+        wu["commit_sha"] = args.commit_sha
+    if args.pr_number:
+        wu["pr_number"] = args.pr_number
+
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "WORK_UNIT_TRANSITION", f"{wuid} transitioned to phase={wu['phase']}, status={wu['status']}", {
+        "wu_id": wuid, "phase": wu["phase"], "status": wu["status"]
+    })
+    print(json.dumps({"ok": True, "wu_id": wuid, "phase": wu["phase"], "status": wu["status"]}, indent=2))
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now_str = now_dt.isoformat()
+
+    reconcile_actions = []
+
+    # 1. Check lease freshness
+    lease = data.get("lease", {})
+    if lease.get("holder") and lease.get("expires_at"):
+        try:
+            exp_dt = dt.datetime.fromisoformat(lease["expires_at"])
+            if exp_dt < now_dt:
+                reconcile_actions.append(f"expired lease held by {lease['holder']} reclaimed")
+                lease["holder"] = None
+                lease["acquired_at"] = None
+                lease["expires_at"] = None
+                data["supervisor_pid"] = None
+        except Exception:
+            pass
+
+    # 2. Check campaign completion
+    all_wu = data.get("work_units", [])
+    if all_wu and all(w["status"] == "completed" for w in all_wu):
+        if data["status"] != "completed":
+            data["status"] = "completed"
+            data["completed_at"] = now_str
+            data["next_action"] = "all work units completed successfully"
+            reconcile_actions.append("marked campaign completed")
+
+    # 3. Check budget limits
+    b = data.get("budgets", {})
+    if b.get("consecutive_failures", 0) >= b.get("max_consecutive_failures", 5):
+        if data["status"] != "paused":
+            data["status"] = "paused"
+            data["pause_reason"] = "budget: max consecutive failures exceeded"
+            data["paused_at"] = now_str
+            reconcile_actions.append("paused campaign due to consecutive failure budget")
+
+    # 4. Check active WU consistency
+    active_wuid = data.get("active_work_unit")
+    if active_wuid:
+        wu = next((w for w in all_wu if w["id"] == active_wuid), None)
+        if not wu or wu["status"] in {"completed", "cancelled", "superseded"}:
+            data["active_work_unit"] = None
+            reconcile_actions.append(f"cleared stale active_work_unit {active_wuid}")
+    else:
+        # Find next eligible WU
+        ready_wus = get_ready_work_units(data)
+        if ready_wus:
+            data["next_action"] = f"ready to execute {ready_wus[0]['id']}"
+        elif data["status"] == "active" and all_wu and all(w["status"] in {"completed", "blocked", "failed"} for w in all_wu):
+            if any(w["status"] in {"blocked", "failed"} for w in all_wu):
+                data["next_action"] = "blocked on unfinished work units"
+
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    if reconcile_actions:
+        append_event(args.id, "RECONCILED", "; ".join(reconcile_actions), {"actions": reconcile_actions})
+
+    res = {
+        "ok": True,
+        "campaign_id": data["id"],
+        "status": data["status"],
+        "active_work_unit": data.get("active_work_unit"),
+        "next_action": data.get("next_action"),
+        "reconciled_actions": reconcile_actions,
+    }
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+def cmd_evidence_record(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    wuid = args.wu_id
+    wu = next((w for w in data["work_units"] if w["id"] == wuid), None)
+    if not wu:
+        sys.stderr.write(f"error: work unit {wuid} not found\n")
+        return 1
+
+    ev_path = Path(args.evidence_file)
+    if not ev_path.is_file():
+        sys.stderr.write(f"error: evidence file {ev_path} not found\n")
+        return 1
+
+    evidence_data = json.loads(ev_path.read_text(encoding="utf-8"))
+    wu["evidence"] = evidence_data
+    if "candidate_sha" in evidence_data:
+        wu["candidate_sha"] = evidence_data["candidate_sha"]
+    if "base_sha" in evidence_data:
+        wu["base_sha"] = evidence_data["base_sha"]
+    if "diff_digest" in evidence_data:
+        wu["diff_digest"] = evidence_data["diff_digest"]
+    if "commit_sha" in evidence_data:
+        wu["commit_sha"] = evidence_data["commit_sha"]
+
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "EVIDENCE_RECORDED", f"Evidence bundle recorded for {wuid}", {"wu_id": wuid})
+    print(json.dumps({"ok": True, "wu_id": wuid, "evidence_recorded": True}, indent=2))
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    data["status"] = "paused"
+    data["pause_reason"] = args.reason or "manual pause"
+    data["paused_at"] = utcnow()
+    data["next_action"] = "campaign paused by operator"
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "CAMPAIGN_PAUSED", f"Campaign paused: {data['pause_reason']}", {"reason": data["pause_reason"]})
+    print(json.dumps({"ok": True, "status": "paused", "reason": data["pause_reason"]}, indent=2))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    data["status"] = "active"
+    data["pause_reason"] = None
+    data["paused_at"] = None
+    data["next_action"] = "campaign resumed, ready for supervisor"
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "CAMPAIGN_RESUMED", "Campaign resumed", {})
+    print(json.dumps({"ok": True, "status": "active"}, indent=2))
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    data["status"] = "cancelled"
+    data["cancelled_at"] = utcnow()
+    data["next_action"] = "campaign cancelled"
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "CAMPAIGN_CANCELLED", "Campaign cancelled by operator", {})
+    print(json.dumps({"ok": True, "status": "cancelled"}, indent=2))
+    return 0
+
+
+def cmd_blocker_add(args: argparse.Namespace) -> int:
+    data = read_campaign(args.id)
+    if args.type not in BLOCKER_TYPES:
+        sys.stderr.write(f"error: invalid blocker type {args.type!r}\n")
+        return 1
+
+    blocker = {
+        "type": args.type,
+        "message": args.message,
+        "created_at": utcnow(),
+        "work_unit_id": args.wu_id,
+        "context": json.loads(args.context) if args.context else {},
+    }
+    data["blockers"].append(blocker)
+
+    if args.wu_id:
+        wu = next((w for w in data["work_units"] if w["id"] == args.wu_id), None)
+        if wu:
+            wu["blocker"] = blocker
+            wu["status"] = "blocked"
+            wu["phase"] = "blocked"
+
+    data["next_action"] = f"blocked: {args.message}"
+    rev = data["revision"]
+    write_campaign(data, expected_revision=rev)
+    append_event(args.id, "BLOCKER_ADDED", f"Blocker [{args.type}]: {args.message}", blocker)
+    print(json.dumps({"ok": True, "blocker": blocker}, indent=2))
+    return 0
+
+
+def cmd_timeline(args: argparse.Namespace) -> int:
+    cdir = campaign_dir(args.id)
+    efile = cdir / "events.jsonl"
+    if not efile.is_file():
+        print(json.dumps([]))
+        return 0
+    events = []
+    with efile.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                events.append(json.loads(line))
+    if args.json:
+        print(json.dumps(events, indent=2))
+    else:
+        for ev in events:
+            print(f"[{ev['timestamp']}] {ev['event_type']:<24} {ev['message']}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = campaign_state_home()
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        test = root / ".write-test"
+        test.write_text("ok\n", encoding="utf-8")
+        test.unlink()
+    except Exception as exc:
+        errors.append(f"campaign state directory is not writable: {exc}")
+
+    count = 0
+    if root.is_dir():
+        for cdir in sorted(root.glob("camp-*")):
+            cfile = cdir / "campaign.json"
+            if cfile.is_file():
+                count += 1
+                try:
+                    data = json.loads(cfile.read_text(encoding="utf-8"))
+                    validate_campaign(data)
+                except Exception as exc:
+                    warnings.append(f"{cdir.name}: {exc}")
+
+    result = {
+        "ok": not errors,
+        "schema": SCHEMA_V1,
+        "state_home": str(root),
+        "campaigns": count,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    print(json.dumps(result, indent=2))
+    return 0 if not errors else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # doctor
+    p_doc = sub.add_parser("doctor", help="Check campaign store and health")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    # init
+    p_init = sub.add_parser("init", help="Initialize a new campaign")
+    p_init.add_argument("--id", help="Explicit campaign ID (camp-...)")
+    p_init.add_argument("--title", required=True, help="Human-readable title")
+    p_init.add_argument("--objective", help="High-level objective")
+    p_init.add_argument("--repo-root", help="Repository root path")
+    p_init.add_argument("--backlog-file", help="JSON file containing backlog work units")
+    p_init.add_argument("--corrections-per-wu", type=int, default=3)
+    p_init.add_argument("--corrections-global", type=int, default=30)
+    p_init.add_argument("--frontier-calls", type=int, default=50)
+    p_init.add_argument("--cost-limit-usd", type=float)
+    p_init.add_argument("--max-consecutive-failures", type=int, default=5)
+    p_init.add_argument("--max-stalled-seconds", type=int, default=3600)
+    p_init.add_argument("--force", action="store_true")
+    p_init.set_defaults(func=cmd_init)
+
+    # show
+    p_show = sub.add_parser("show", help="Show campaign state")
+    p_show.add_argument("id", help="Campaign ID")
+    p_show.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_show.set_defaults(func=cmd_show)
+
+    # list
+    p_list = sub.add_parser("list", help="List all campaigns")
+    p_list.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_list.set_defaults(func=cmd_list)
+
+    # dag
+    p_dag = sub.add_parser("dag", help="Validate and inspect campaign DAG")
+    p_dag.add_argument("id", help="Campaign ID")
+    p_dag.set_defaults(func=cmd_dag)
+
+    # wu-add
+    p_wu_add = sub.add_parser("wu-add", help="Add a work unit to a campaign")
+    p_wu_add.add_argument("id", help="Campaign ID")
+    p_wu_add.add_argument("--wu-id", help="Explicit WU ID (WU-...)")
+    p_wu_add.add_argument("--objective", required=True, help="WU objective")
+    p_wu_add.add_argument("--dependencies", help="Comma-separated prerequisite WU IDs")
+    p_wu_add.add_argument("--scope", help="Comma-separated allowed file paths")
+    p_wu_add.add_argument("--criteria", help="Acceptance criteria")
+    p_wu_add.add_argument("--verify-cmd", help="Verification shell command")
+    p_wu_add.add_argument("--risk-class", choices=["bounded", "unbounded"], default="bounded")
+    p_wu_add.add_argument("--required-route", choices=["auto", "direct-only", "delegated", "frontier", "frontier-gated"], default="delegated")
+    p_wu_add.add_argument("--issue", type=int, help="Linked GitHub issue number")
+    p_wu_add.add_argument("--corrections-budget", type=int)
+    p_wu_add.set_defaults(func=cmd_wu_add)
+
+    # wu-transition
+    p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")
+    p_wut.add_argument("id", help="Campaign ID")
+    p_wut.add_argument("wu_id", help="Work Unit ID")
+    p_wut.add_argument("--phase", choices=list(WU_PHASES))
+    p_wut.add_argument("--status", choices=list(WU_STATUSES))
+    p_wut.add_argument("--run-id", help="Associated run ID")
+    p_wut.add_argument("--branch", help="Git branch")
+    p_wut.add_argument("--worktree", help="Worktree path")
+    p_wut.add_argument("--commit-sha", help="Produced commit SHA")
+    p_wut.add_argument("--pr-number", type=int, help="Pull request number")
+    p_wut.add_argument("--force", action="store_true")
+    p_wut.set_defaults(func=cmd_wu_transition)
+
+    # lease
+    p_la = sub.add_parser("lease-acquire", help="Acquire exclusive campaign lease")
+    p_la.add_argument("id", help="Campaign ID")
+    p_la.add_argument("--holder", help="Holder identity string")
+    p_la.add_argument("--duration", type=int, default=120)
+    p_la.set_defaults(func=cmd_lease_acquire)
+
+    p_lh = sub.add_parser("lease-heartbeat", help="Renew campaign lease")
+    p_lh.add_argument("id", help="Campaign ID")
+    p_lh.add_argument("--holder", help="Holder identity string")
+    p_lh.add_argument("--duration", type=int, default=120)
+    p_lh.set_defaults(func=cmd_lease_heartbeat)
+
+    p_lr = sub.add_parser("lease-release", help="Release campaign lease")
+    p_lr.add_argument("id", help="Campaign ID")
+    p_lr.add_argument("--holder", help="Holder identity string")
+    p_lr.add_argument("--force", action="store_true")
+    p_lr.set_defaults(func=cmd_lease_release)
+
+    # reconcile
+    p_rec = sub.add_parser("reconcile", help="Reconcile campaign state safely")
+    p_rec.add_argument("id", help="Campaign ID")
+    p_rec.set_defaults(func=cmd_reconcile)
+
+    # evidence
+    p_ev = sub.add_parser("evidence-record", help="Record evidence bundle for completed WU")
+    p_ev.add_argument("id", help="Campaign ID")
+    p_ev.add_argument("wu_id", help="Work Unit ID")
+    p_ev.add_argument("--evidence-file", required=True, help="Path to evidence JSON file")
+    p_ev.set_defaults(func=cmd_evidence_record)
+
+    # pause / resume / cancel
+    p_p = sub.add_parser("pause", help="Pause a campaign")
+    p_p.add_argument("id", help="Campaign ID")
+    p_p.add_argument("--reason", help="Reason for pause")
+    p_p.set_defaults(func=cmd_pause)
+
+    p_r = sub.add_parser("resume", help="Resume a paused campaign")
+    p_r.add_argument("id", help="Campaign ID")
+    p_r.set_defaults(func=cmd_resume)
+
+    p_c = sub.add_parser("cancel", help="Cancel a campaign")
+    p_c.add_argument("id", help="Campaign ID")
+    p_c.set_defaults(func=cmd_cancel)
+
+    # blocker
+    p_b = sub.add_parser("blocker-add", help="Add a typed blocker to campaign")
+    p_b.add_argument("id", help="Campaign ID")
+    p_b.add_argument("--type", required=True, choices=list(BLOCKER_TYPES))
+    p_b.add_argument("--message", required=True)
+    p_b.add_argument("--wu-id", help="Target work unit ID")
+    p_b.add_argument("--context", help="JSON string with blocker context")
+    p_b.set_defaults(func=cmd_blocker_add)
+
+    # timeline
+    p_tl = sub.add_parser("timeline", help="Inspect campaign events timeline")
+    p_tl.add_argument("id", help="Campaign ID")
+    p_tl.add_argument("--json", action="store_true")
+    p_tl.set_defaults(func=cmd_timeline)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except Exception as exc:
+        sys.stderr.write(f"myrmex-campaign error: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

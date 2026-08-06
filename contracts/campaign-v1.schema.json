@@ -1,0 +1,385 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "myrmex.campaign/v1",
+  "title": "Myrmex Campaign v1",
+  "description": "Durable campaign state for Myrmex autonomous work. Complements myrmex-state (individual runs). Not a replacement.",
+  "type": "object",
+  "required": [
+    "schema", "schema_version", "revision", "id",
+    "created_at", "updated_at", "status",
+    "title", "objective", "repository_root",
+    "work_units", "dag", "budgets", "lease"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "myrmex.campaign/v1"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic counter for compare-and-swap writes."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$",
+      "description": "Stable, globally unique campaign identifier."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "paused", "completed", "failed", "cancelled"]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repository_root": {
+      "type": "string",
+      "description": "Absolute path to the target git repository."
+    },
+    "source": {
+      "description": "Origin of the work unit backlog.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"type": "string", "const": "local"},
+            "path": {"type": ["string", "null"]}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "repo"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"type": "string", "const": "github-milestone"},
+            "repo": {"type": "string"},
+            "milestone": {"type": ["integer", "null"]}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "repo"],
+          "additionalProperties": false,
+          "properties": {
+            "type": {"type": "string", "const": "github-issues"},
+            "repo": {"type": "string"},
+            "issues": {"type": "array", "items": {"type": "integer"}}
+          }
+        }
+      ]
+    },
+    "work_units": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/work_unit"}
+    },
+    "dag": {
+      "type": "object",
+      "required": ["edges"],
+      "additionalProperties": false,
+      "properties": {
+        "edges": {
+          "type": "array",
+          "description": "Directed edges [from_wu_id, to_wu_id] meaning to depends on from.",
+          "items": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    "active_work_unit": {
+      "type": ["string", "null"],
+      "description": "ID of the currently active work unit, or null."
+    },
+    "budgets": {
+      "$ref": "#/definitions/budgets"
+    },
+    "lease": {
+      "$ref": "#/definitions/lease"
+    },
+    "pause_reason": {"type": ["string", "null"]},
+    "paused_at": {"type": ["string", "null"], "format": "date-time"},
+    "blockers": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/blocker"}
+    },
+    "next_action": {"type": ["string", "null"]},
+    "supervisor_pid": {"type": ["integer", "null"]},
+    "supervisor_host": {"type": ["string", "null"]},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "cancelled_at": {"type": ["string", "null"], "format": "date-time"},
+    "failed_at": {"type": ["string", "null"], "format": "date-time"},
+    "failure_reason": {"type": ["string", "null"]}
+  },
+  "definitions": {
+    "work_unit": {
+      "type": "object",
+      "required": [
+        "id", "status", "phase", "objective",
+        "dependencies", "scope",
+        "risk_class", "required_route",
+        "corrections_used", "corrections_budget",
+        "attempts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$",
+          "description": "Stable work unit identifier within the campaign."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending", "ready", "active", "verifying",
+            "remediating", "ci", "delivering",
+            "completed", "blocked", "failed", "cancelled", "superseded"
+          ]
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "ready", "collecting-context", "implementing",
+            "verifying", "remediating", "running-ci",
+            "committing", "delivering", "completed",
+            "blocked", "failed", "cancelled", "superseded"
+          ],
+          "description": "Detailed execution phase within the WU lifecycle."
+        },
+        "objective": {"type": "string", "minLength": 1},
+        "dependencies": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "IDs of work units that must be completed before this one can start."
+        },
+        "scope": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Repository paths this WU is allowed to modify."
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "verification_commands": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Shell commands to run for automated verification."
+        },
+        "risk_class": {
+          "type": "string",
+          "enum": ["bounded", "unbounded"]
+        },
+        "required_route": {
+          "type": "string",
+          "enum": ["auto", "direct-only", "delegated", "frontier", "frontier-gated"]
+        },
+        "issue": {"type": ["integer", "null"]},
+        "branch": {"type": ["string", "null"]},
+        "worktree": {"type": ["string", "null"]},
+        "run_id": {"type": ["string", "null"]},
+        "base_sha": {"type": ["string", "null"]},
+        "candidate_sha": {"type": ["string", "null"]},
+        "diff_digest": {"type": ["string", "null"]},
+        "commit_sha": {"type": ["string", "null"]},
+        "pr_number": {"type": ["integer", "null"]},
+        "pr_url": {"type": ["string", "null"]},
+        "started_at": {"type": ["string", "null"], "format": "date-time"},
+        "completed_at": {"type": ["string", "null"], "format": "date-time"},
+        "corrections_used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "corrections_budget": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "attempts": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/wu_attempt"}
+        },
+        "evidence": {
+          "description": "Evidence bundle produced when WU is completed.",
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/definitions/wu_evidence"}
+          ]
+        },
+        "blocker": {
+          "description": "Typed blocker if WU is blocked.",
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/definitions/blocker"}
+          ]
+        },
+        "next_action": {"type": ["string", "null"]},
+        "ci_result": {
+          "type": ["string", "null"],
+          "enum": ["pass", "fail", "timeout", "skipped", null]
+        },
+        "ci_summary": {"type": ["string", "null"]},
+        "defects_found": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "corrections_applied": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "implementing_agent": {"type": ["string", "null"]},
+        "verifying_agent": {"type": ["string", "null"]}
+      }
+    },
+    "wu_attempt": {
+      "type": "object",
+      "required": ["run_id", "started_at"],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {"type": "string"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "outcome": {
+          "type": ["string", "null"],
+          "enum": ["completed", "failed", "cancelled", "interrupted", null]
+        },
+        "ended_at": {"type": ["string", "null"], "format": "date-time"},
+        "failure_reason": {"type": ["string", "null"]}
+      }
+    },
+    "wu_evidence": {
+      "type": "object",
+      "required": ["objective", "base_sha", "candidate_sha", "diff_digest"],
+      "additionalProperties": true,
+      "properties": {
+        "objective": {"type": "string"},
+        "scope": {"type": "array", "items": {"type": "string"}},
+        "issue": {"type": ["integer", "null"]},
+        "base_sha": {"type": "string"},
+        "candidate_sha": {"type": "string"},
+        "diff_digest": {"type": "string"},
+        "implementing_agent": {"type": ["string", "null"]},
+        "verifying_agent": {"type": ["string", "null"]},
+        "defects_found": {"type": "array", "items": {"type": "string"}},
+        "corrections": {"type": "array", "items": {"type": "string"}},
+        "verification_commands_run": {"type": "array", "items": {"type": "string"}},
+        "verification_results": {"type": "array", "items": {"type": "string"}},
+        "ci_result": {"type": ["string", "null"]},
+        "ci_summary": {"type": ["string", "null"]},
+        "commit_sha": {"type": ["string", "null"]},
+        "pr_number": {"type": ["integer", "null"]},
+        "pr_url": {"type": ["string", "null"]},
+        "external_receipts": {"type": "array", "items": {"type": "object"}},
+        "completed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "required": [
+        "max_concurrent_wu",
+        "corrections_per_wu",
+        "corrections_global",
+        "corrections_global_used",
+        "frontier_calls",
+        "frontier_calls_used",
+        "consecutive_failures",
+        "max_consecutive_failures",
+        "last_progress_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrent_wu": {"type": "integer", "minimum": 1, "default": 1},
+        "corrections_per_wu": {"type": "integer", "minimum": 1, "default": 3},
+        "corrections_global": {"type": "integer", "minimum": 1, "default": 30},
+        "corrections_global_used": {"type": "integer", "minimum": 0},
+        "frontier_calls": {"type": "integer", "minimum": 0, "default": 50},
+        "frontier_calls_used": {"type": "integer", "minimum": 0},
+        "estimated_cost_usd": {"type": ["number", "null"]},
+        "cost_limit_usd": {"type": ["number", "null"]},
+        "max_consecutive_failures": {"type": "integer", "minimum": 1, "default": 5},
+        "consecutive_failures": {"type": "integer", "minimum": 0},
+        "max_time_without_progress_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "default": 3600
+        },
+        "last_progress_at": {"type": "string", "format": "date-time"},
+        "external_operations": {"type": "integer", "minimum": 0},
+        "total_diff_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "holder", "acquired_at", "expires_at",
+        "heartbeat_at", "heartbeat_interval_seconds",
+        "lease_duration_seconds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "holder": {"type": ["string", "null"]},
+        "acquired_at": {"type": ["string", "null"], "format": "date-time"},
+        "expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "heartbeat_at": {"type": ["string", "null"], "format": "date-time"},
+        "heartbeat_interval_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "default": 60
+        },
+        "lease_duration_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "default": 300
+        }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "required": ["type", "message", "created_at"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "human_decision_required",
+            "credential_required",
+            "destructive_action_required",
+            "product_change_required",
+            "budget_exhausted",
+            "ci_failed_unrecoverable",
+            "conflict_unresolvable",
+            "stalled_no_progress",
+            "frontier_unavailable",
+            "unknown"
+          ]
+        },
+        "message": {"type": "string"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "work_unit_id": {"type": ["string", "null"]},
+        "context": {"type": "object"}
+      }
+    }
+  }
+}

@@ -41,6 +41,7 @@ REQUIRED_COMMANDS = {
     "myrmex-status.md",
 }
 REQUIRED_CONTRACTS = {
+    "campaign-v1.schema.json",
     "repository-context-v1.schema.json",
     "work-order-v1.schema.json",
     "work-result-v1.schema.json",
@@ -353,6 +354,41 @@ def main() -> int:
                     errors.append(f"myrmex-memory test failed: {memory_test.stderr.strip() or memory_test.stdout.strip()}")
         except SyntaxError as exc:
             errors.append(f"myrmex-memory syntax error: {exc}")
+
+    campaign_bin = ROOT / "bin/myrmex-campaign"
+    if not campaign_bin.is_file():
+        errors.append("missing bin/myrmex-campaign")
+    elif not os.access(campaign_bin, os.X_OK):
+        errors.append("bin/myrmex-campaign is not executable")
+    else:
+        try:
+            compile(campaign_bin.read_text(encoding="utf-8"), str(campaign_bin), "exec")
+            if not args.quick:
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+                camp_test = run([sys.executable, str(ROOT / "tests/test-campaign-schema-and-store.py")], env=env)
+                if camp_test.returncode != 0:
+                    errors.append(f"myrmex-campaign store test failed: {camp_test.stderr.strip() or camp_test.stdout.strip()}")
+                dag_test = run([sys.executable, str(ROOT / "tests/test-campaign-dag.py")], env=env)
+                if dag_test.returncode != 0:
+                    errors.append(f"myrmex-campaign dag test failed: {dag_test.stderr.strip() or dag_test.stdout.strip()}")
+        except SyntaxError as exc:
+            errors.append(f"myrmex-campaign syntax error: {exc}")
+
+    head_bin = ROOT / "bin/myrmex-head"
+    if not head_bin.is_file():
+        errors.append("missing bin/myrmex-head")
+    elif not os.access(head_bin, os.X_OK):
+        errors.append("bin/myrmex-head is not executable")
+    else:
+        try:
+            compile(head_bin.read_text(encoding="utf-8"), str(head_bin), "exec")
+            if not args.quick:
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+                head_test = run([sys.executable, str(ROOT / "tests/test-campaign-supervisor-head.py")], env=env)
+                if head_test.returncode != 0:
+                    errors.append(f"myrmex-head test failed: {head_test.stderr.strip() or head_test.stdout.strip()}")
+        except SyntaxError as exc:
+            errors.append(f"myrmex-head syntax error: {exc}")
 
     for script in [*list((ROOT / "scripts").glob("*.py")), *list((ROOT / "tests").glob("*.py"))]:
         try:
