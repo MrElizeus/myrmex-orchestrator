@@ -6844,6 +6844,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show")
     show.add_argument("run_id", nargs="?")
+    show.add_argument("--json", action="store_true", help="Output JSON format")
     show.set_defaults(func=cmd_show)
 
     listing = sub.add_parser("list")

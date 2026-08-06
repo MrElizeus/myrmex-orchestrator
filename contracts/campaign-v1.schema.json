@@ -242,6 +242,32 @@
           "enum": ["pass", "fail", "timeout", "skipped", null]
         },
         "ci_summary": {"type": ["string", "null"]},
+        "task_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "workspace": {"type": ["string", "null"]},
+        "writer_receipt": {"type": ["object", "null"]},
+        "verifier_receipt": {"type": ["object", "null"]},
+        "correction_runs": {
+          "type": "array",
+          "items": {"type": "object"}
+        },
+        "ci_operation": {"type": ["object", "null"]},
+        "commit_receipt": {"type": ["object", "null"]},
+        "implementation_command": {
+          "type": ["string", "array", "null"],
+          "items": {"type": "string"}
+        },
+        "remediation_command": {
+          "type": ["string", "array", "null"],
+          "items": {"type": "string"}
+        },
+        "ci_command": {
+          "type": ["string", "array", "null"],
+          "items": {"type": "string"}
+        },
+        "no_op_allowed": {"type": ["boolean", "null"]},
         "defects_found": {
           "type": "array",
           "items": {"type": "string"}
@@ -368,6 +394,8 @@
             "destructive_action_required",
             "product_change_required",
             "budget_exhausted",
+            "verifier_workspace_mutation",
+            "ci_failed",
             "ci_failed_unrecoverable",
             "conflict_unresolvable",
             "stalled_no_progress",

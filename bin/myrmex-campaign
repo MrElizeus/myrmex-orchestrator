@@ -42,6 +42,8 @@ BLOCKER_TYPES = {
     "destructive_action_required",
     "product_change_required",
     "budget_exhausted",
+    "verifier_workspace_mutation",
+    "ci_failed",
     "ci_failed_unrecoverable",
     "conflict_unresolvable",
     "stalled_no_progress",
@@ -51,13 +53,13 @@ BLOCKER_TYPES = {
 
 ALLOWED_PHASE_TRANSITIONS = {
     "ready": {"collecting-context", "blocked", "cancelled"},
-    "collecting-context": {"implementing", "blocked", "failed", "cancelled"},
-    "implementing": {"verifying", "blocked", "failed", "cancelled"},
-    "verifying": {"remediating", "running-ci", "blocked", "failed", "cancelled"},
-    "remediating": {"verifying", "blocked", "failed", "cancelled"},
-    "running-ci": {"committing", "remediating", "blocked", "failed", "cancelled"},
-    "committing": {"delivering", "completed", "blocked", "failed", "cancelled"},
-    "delivering": {"completed", "blocked", "failed", "cancelled"},
+    "collecting-context": {"collecting-context", "implementing", "verifying", "remediating", "running-ci", "committing", "delivering", "completed", "blocked", "failed", "cancelled"},
+    "implementing": {"collecting-context", "verifying", "blocked", "failed", "cancelled"},
+    "verifying": {"collecting-context", "remediating", "running-ci", "blocked", "failed", "cancelled"},
+    "remediating": {"collecting-context", "verifying", "blocked", "failed", "cancelled"},
+    "running-ci": {"collecting-context", "committing", "remediating", "blocked", "failed", "cancelled"},
+    "committing": {"collecting-context", "delivering", "completed", "blocked", "failed", "cancelled"},
+    "delivering": {"collecting-context", "completed", "blocked", "failed", "cancelled"},
     "blocked": {"ready", "collecting-context", "implementing", "verifying", "remediating", "running-ci", "cancelled", "superseded"},
     "failed": {"ready", "cancelled", "superseded"},
     "cancelled": set(),
@@ -370,6 +372,17 @@ def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
         "next_action": "awaiting dependencies or supervisor dispatch",
         "ci_result": None,
         "ci_summary": None,
+        "task_ids": [],
+        "workspace": wu_spec.get("workspace"),
+        "writer_receipt": None,
+        "verifier_receipt": None,
+        "correction_runs": [],
+        "ci_operation": None,
+        "commit_receipt": None,
+        "implementation_command": wu_spec.get("implementation_command"),
+        "remediation_command": wu_spec.get("remediation_command"),
+        "ci_command": wu_spec.get("ci_command"),
+        "no_op_allowed": wu_spec.get("no_op_allowed", False),
         "defects_found": [],
         "corrections_applied": [],
         "implementing_agent": None,
@@ -402,6 +415,10 @@ def cmd_wu_add(args: argparse.Namespace) -> int:
         "required_route": args.required_route or "delegated",
         "issue": args.issue,
         "corrections_budget": args.corrections_budget or data["budgets"]["corrections_per_wu"],
+        "implementation_command": args.impl_cmd,
+        "remediation_command": args.remed_cmd,
+        "ci_command": args.ci_cmd,
+        "no_op_allowed": getattr(args, "no_op_allowed", False),
     }
     add_wu_to_data(data, wu_spec)
 
@@ -522,8 +539,18 @@ def cmd_lease_acquire(args: argparse.Namespace) -> int:
         try:
             exp_dt = dt.datetime.fromisoformat(current_lease["expires_at"])
             if exp_dt > now_dt and current_lease["holder"] != holder:
-                sys.stderr.write(f"error: lease held by {current_lease['holder']} until {current_lease['expires_at']}\n")
-                return 1
+                is_dead = False
+                if ":" in current_lease["holder"]:
+                    h_host, h_pid_str = current_lease["holder"].split(":", 1)
+                    if h_host == socket.gethostname():
+                        try:
+                            h_pid = int(h_pid_str)
+                            os.kill(h_pid, 0)
+                        except OSError:
+                            is_dead = True
+                if not is_dead:
+                    sys.stderr.write(f"error: lease held by {current_lease['holder']} until {current_lease['expires_at']}\n")
+                    return 1
         except Exception:
             pass
 
@@ -613,13 +640,17 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
     now_str = utcnow()
     if wu["phase"] == "implementing" and not wu.get("started_at"):
         wu["started_at"] = now_str
-    if wu["status"] == "completed":
+    if wu["status"] == "active":
+        data["active_work_unit"] = wuid
+    elif wu["status"] == "completed":
         wu["completed_at"] = now_str
         if data.get("active_work_unit") == wuid:
             data["active_work_unit"] = None
         data["budgets"]["consecutive_failures"] = 0
         data["budgets"]["last_progress_at"] = now_str
     elif wu["status"] in {"failed", "blocked"}:
+        if data.get("active_work_unit") == wuid:
+            data["active_work_unit"] = None
         data["budgets"]["consecutive_failures"] = data["budgets"].get("consecutive_failures", 0) + 1
 
     if args.run_id:
@@ -630,8 +661,44 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
         wu["worktree"] = args.worktree
     if args.commit_sha:
         wu["commit_sha"] = args.commit_sha
+    if args.base_sha:
+        wu["base_sha"] = args.base_sha
+    if args.candidate_sha:
+        wu["candidate_sha"] = args.candidate_sha
+    if args.diff_digest:
+        wu["diff_digest"] = args.diff_digest
     if args.pr_number:
         wu["pr_number"] = args.pr_number
+
+    def _parse_receipt(val: str | None) -> Any:
+        if not val:
+            return None
+        trimmed = val.strip()
+        if trimmed.startswith(("{", "[")):
+            try:
+                return json.loads(trimmed)
+            except Exception:
+                pass
+        try:
+            if len(val) < 255:
+                p = Path(val)
+                if p.is_file():
+                    return json.loads(p.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+        return json.loads(val)
+
+    if args.writer_receipt:
+        wu["writer_receipt"] = _parse_receipt(args.writer_receipt)
+
+    if args.verifier_receipt:
+        wu["verifier_receipt"] = _parse_receipt(args.verifier_receipt)
+
+    if args.ci_op:
+        wu["ci_operation"] = _parse_receipt(args.ci_op)
+
+    if args.commit_receipt:
+        wu["commit_receipt"] = _parse_receipt(args.commit_receipt)
 
     rev = data["revision"]
     write_campaign(data, expected_revision=rev)
@@ -651,17 +718,30 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
     # 1. Check lease freshness
     lease = data.get("lease", {})
-    if lease.get("holder") and lease.get("expires_at"):
-        try:
-            exp_dt = dt.datetime.fromisoformat(lease["expires_at"])
-            if exp_dt < now_dt:
-                reconcile_actions.append(f"expired lease held by {lease['holder']} reclaimed")
-                lease["holder"] = None
-                lease["acquired_at"] = None
-                lease["expires_at"] = None
-                data["supervisor_pid"] = None
-        except Exception:
-            pass
+    if lease.get("holder"):
+        is_reclaimable = False
+        if lease.get("expires_at"):
+            try:
+                exp_dt = dt.datetime.fromisoformat(lease["expires_at"])
+                if exp_dt < now_dt:
+                    is_reclaimable = True
+            except Exception:
+                pass
+        if not is_reclaimable and ":" in lease["holder"]:
+            h_host, h_pid_str = lease["holder"].split(":", 1)
+            if h_host == socket.gethostname():
+                try:
+                    h_pid = int(h_pid_str)
+                    os.kill(h_pid, 0)
+                except OSError:
+                    is_reclaimable = True
+
+        if is_reclaimable:
+            reconcile_actions.append(f"lease held by {lease['holder']} reclaimed")
+            lease["holder"] = None
+            lease["acquired_at"] = None
+            lease["expires_at"] = None
+            data["supervisor_pid"] = None
 
     # 2. Check campaign completion
     all_wu = data.get("work_units", [])
@@ -685,17 +765,24 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     active_wuid = data.get("active_work_unit")
     if active_wuid:
         wu = next((w for w in all_wu if w["id"] == active_wuid), None)
-        if not wu or wu["status"] in {"completed", "cancelled", "superseded"}:
+        if not wu or wu["status"] in {"completed", "cancelled", "superseded", "blocked", "failed"}:
             data["active_work_unit"] = None
             reconcile_actions.append(f"cleared stale active_work_unit {active_wuid}")
-    else:
-        # Find next eligible WU
-        ready_wus = get_ready_work_units(data)
-        if ready_wus:
-            data["next_action"] = f"ready to execute {ready_wus[0]['id']}"
-        elif data["status"] == "active" and all_wu and all(w["status"] in {"completed", "blocked", "failed"} for w in all_wu):
-            if any(w["status"] in {"blocked", "failed"} for w in all_wu):
-                data["next_action"] = "blocked on unfinished work units"
+
+    if not data.get("active_work_unit"):
+        # Check if there is an in-progress active WU that was interrupted across crash boundary
+        in_progress_wu = next((w for w in all_wu if w["status"] == "active"), None)
+        if in_progress_wu:
+            data["active_work_unit"] = in_progress_wu["id"]
+            data["next_action"] = f"resume active work unit {in_progress_wu['id']}"
+            reconcile_actions.append(f"restored active_work_unit to {in_progress_wu['id']}")
+        else:
+            ready_wus = get_ready_work_units(data)
+            if ready_wus:
+                data["next_action"] = f"ready to execute {ready_wus[0]['id']}"
+            elif data["status"] == "active" and all_wu and all(w["status"] in {"completed", "blocked", "failed"} for w in all_wu):
+                if any(w["status"] in {"blocked", "failed"} for w in all_wu):
+                    data["next_action"] = "blocked on unfinished work units"
 
     rev = data["revision"]
     write_campaign(data, expected_revision=rev)
@@ -728,6 +815,18 @@ def cmd_evidence_record(args: argparse.Namespace) -> int:
         return 1
 
     evidence_data = json.loads(ev_path.read_text(encoding="utf-8"))
+
+    # Strict invariant validation (Rule 9)
+    if not evidence_data.get("diff_digest"):
+        sys.stderr.write("error: evidence bundle missing diff_digest\n")
+        return 1
+    if not evidence_data.get("candidate_sha"):
+        sys.stderr.write("error: evidence bundle missing candidate_sha\n")
+        return 1
+    if evidence_data.get("ci_result") not in {"pass", "skipped"}:
+        sys.stderr.write(f"error: invalid or failed ci_result in evidence: {evidence_data.get('ci_result')}\n")
+        return 1
+
     wu["evidence"] = evidence_data
     if "candidate_sha" in evidence_data:
         wu["candidate_sha"] = evidence_data["candidate_sha"]
@@ -737,6 +836,14 @@ def cmd_evidence_record(args: argparse.Namespace) -> int:
         wu["diff_digest"] = evidence_data["diff_digest"]
     if "commit_sha" in evidence_data:
         wu["commit_sha"] = evidence_data["commit_sha"]
+    if "writer_receipt" in evidence_data and evidence_data["writer_receipt"]:
+        wu["writer_receipt"] = evidence_data["writer_receipt"]
+    if "verifier_receipt" in evidence_data and evidence_data["verifier_receipt"]:
+        wu["verifier_receipt"] = evidence_data["verifier_receipt"]
+    if "ci_operation" in evidence_data and evidence_data["ci_operation"]:
+        wu["ci_operation"] = evidence_data["ci_operation"]
+    if "commit_receipt" in evidence_data and evidence_data["commit_receipt"]:
+        wu["commit_receipt"] = evidence_data["commit_receipt"]
 
     rev = data["revision"]
     write_campaign(data, expected_revision=rev)
@@ -916,7 +1023,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_wu_add.add_argument("--dependencies", help="Comma-separated prerequisite WU IDs")
     p_wu_add.add_argument("--scope", help="Comma-separated allowed file paths")
     p_wu_add.add_argument("--criteria", help="Acceptance criteria")
-    p_wu_add.add_argument("--verify-cmd", help="Verification shell command")
+    p_wu_add.add_argument("--verify-cmd", "--verification-cmd", dest="verify_cmd", help="Verification shell command")
+    p_wu_add.add_argument("--impl-cmd", "--implementation-cmd", dest="impl_cmd", help="Implementation command/script for writer")
+    p_wu_add.add_argument("--remed-cmd", "--remediation-cmd", dest="remed_cmd", help="Remediation command/script")
+    p_wu_add.add_argument("--ci-cmd", "--ci-command", dest="ci_cmd", help="CI validation command")
+    p_wu_add.add_argument("--no-op-allowed", action="store_true", help="Allow completing without workspace diff")
     p_wu_add.add_argument("--risk-class", choices=["bounded", "unbounded"], default="bounded")
     p_wu_add.add_argument("--required-route", choices=["auto", "direct-only", "delegated", "frontier", "frontier-gated"], default="delegated")
     p_wu_add.add_argument("--issue", type=int, help="Linked GitHub issue number")
@@ -932,7 +1043,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_wut.add_argument("--run-id", help="Associated run ID")
     p_wut.add_argument("--branch", help="Git branch")
     p_wut.add_argument("--worktree", help="Worktree path")
+    p_wut.add_argument("--base-sha", help="Base git commit SHA")
+    p_wut.add_argument("--candidate-sha", help="Candidate git commit SHA")
     p_wut.add_argument("--commit-sha", help="Produced commit SHA")
+    p_wut.add_argument("--diff-digest", help="Diff SHA-256 digest")
+    p_wut.add_argument("--writer-receipt", help="JSON string or file path for writer receipt")
+    p_wut.add_argument("--verifier-receipt", help="JSON string or file path for verifier receipt")
+    p_wut.add_argument("--ci-op", help="JSON string or file path for CI operation")
+    p_wut.add_argument("--commit-receipt", help="JSON string or file path for commit receipt")
     p_wut.add_argument("--pr-number", type=int, help="Pull request number")
     p_wut.add_argument("--force", action="store_true")
     p_wut.set_defaults(func=cmd_wu_transition)
