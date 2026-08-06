@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Isolated Worktree Management for Myrmex Work Units.
-Enforces scope boundary, dirty state checks, and clean worktree lifecycles.
+Enforces scope boundary, dirty state checks, read-only verifier worktrees, and clean worktree lifecycles.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -31,13 +32,12 @@ def create_wu_worktree(
     allowed_scope: list[str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """
-    Creates an isolated Git worktree for a specific Work Unit.
+    Creates an isolated Git worktree for a specific Work Unit (Writer environment).
     Returns (worktree_path, receipt_dict).
     """
     source_repo = source_repo.resolve()
     target_dir = _get_worktrees_dir() / campaign_id / wu_id
     if target_dir.exists():
-        # Check if it's already a valid worktree
         if (target_dir / ".git").exists():
             proc_check = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -94,6 +94,93 @@ def create_wu_worktree(
     )
 
     return target_dir, receipt
+
+
+def create_verifier_worktree(
+    source_repo: Path,
+    campaign_id: str,
+    wu_id: str,
+    candidate_sha: str,
+    writer_worktree: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    Creates an isolated, read-only worktree for the Verifier agent.
+    The Verifier agent CANNOT alter index, permissions, symlinks, or files.
+    """
+    source_repo = source_repo.resolve()
+    target_dir = _get_worktrees_dir() / campaign_id / f"{wu_id}-verifier"
+    shutil.rmtree(target_dir, ignore_errors=True)
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prune stale worktrees
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        cwd=source_repo,
+        capture_output=True,
+        text=True,
+    )
+
+    # Detached head at candidate_sha
+    cmd = ["git", "worktree", "add", "--detach", str(target_dir), candidate_sha]
+    proc = subprocess.run(cmd, cwd=source_repo, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Failed to create verifier worktree at {target_dir}: {proc.stderr}")
+
+    # If writer_worktree has uncommitted candidate changes, copy modified files into verifier worktree
+    if writer_worktree and writer_worktree.exists():
+        proc_status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=writer_worktree,
+            capture_output=True,
+            text=True,
+        )
+        lines = [l for l in proc_status.stdout.splitlines() if l.strip()]
+        for line in lines:
+            parts = line[3:].strip()
+            if parts != ".myrmex-worktree-receipt.json":
+                src_file = writer_worktree / parts
+                dst_file = target_dir / parts
+                if src_file.is_file():
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+
+    receipt = {
+        "source_repository": str(source_repo),
+        "verifier_worktree_path": str(target_dir),
+        "candidate_sha": candidate_sha,
+        "read_only": True,
+        "owner_wu": wu_id,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return target_dir, receipt
+
+
+def compute_workspace_hash(worktree_dir: Path) -> str:
+    """Computes a total hash of all tracked/untracked/ignored state in the workspace."""
+    worktree_dir = worktree_dir.resolve()
+    hasher = hashlib.sha256()
+
+    proc_status = subprocess.run(
+        ["git", "status", "--porcelain=v2", "--ignored"],
+        cwd=worktree_dir,
+        capture_output=True,
+        text=True,
+    )
+    hasher.update(proc_status.stdout.encode("utf-8"))
+
+    # Walk files to hash contents and metadata permissions
+    for root, dirs, files in os.walk(worktree_dir):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        for f in sorted(files):
+            p = Path(root) / f
+            try:
+                st = p.stat()
+                hasher.update(f"{p.relative_to(worktree_dir)}:{st.st_mode}:{st.st_size}".encode("utf-8"))
+            except Exception:
+                pass
+
+    return hasher.hexdigest()
 
 
 def verify_workspace_scope(
@@ -166,7 +253,6 @@ def verify_workspace_scope(
 
     # 4. Check escaping symlinks
     for root, dirs, files in os.walk(worktree_dir):
-        # Skip .git
         if ".git" in dirs:
             dirs.remove(".git")
         for f in files:
@@ -195,7 +281,6 @@ def cleanup_wu_worktree(
         return True
 
     if not force:
-        # Check for un-integrated changes
         proc = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=worktree_dir,

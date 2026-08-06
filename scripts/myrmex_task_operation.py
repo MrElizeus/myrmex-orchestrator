@@ -2,6 +2,7 @@
 """
 Task Operation Ledger for Myrmex Task Contracts (myrmex.task-operation/v1).
 Manages durable intent, dispatch, observation, and receipt lifecycle for OpenCode tasks.
+Enforces atomic creation (0600 permissions), prompt digests, and receipt validation.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts.opencode_transport import sanitize_text
+from scripts.opencode_transport import sanitize_text, _write_secure_json
 
 
 def _task_ops_dir() -> Path:
@@ -56,6 +57,14 @@ class TaskOperationV1:
         return cls(**d)
 
 
+def save_task_operation(op: TaskOperationV1) -> Path:
+    """Atomically saves task operation record with 0600 permissions."""
+    d = _task_ops_dir()
+    path = d / f"{op.operation_id}.json"
+    _write_secure_json(path, op.to_dict())
+    return path
+
+
 def create_task_intent(
     campaign_id: str,
     work_unit_id: str,
@@ -66,7 +75,7 @@ def create_task_intent(
     base_sha: str,
     prompt: str,
     provider: str = "opencode",
-    model: str = "opencode/deepseek-v4-flash-free",
+    model: str = "default",
     attempt: int = 1,
 ) -> TaskOperationV1:
     """
@@ -102,13 +111,6 @@ def create_task_intent(
     )
     save_task_operation(op)
     return op
-
-
-def save_task_operation(op: TaskOperationV1) -> Path:
-    d = _task_ops_dir()
-    path = d / f"{op.operation_id}.json"
-    path.write_text(json.dumps(op.to_dict(), indent=2), encoding="utf-8")
-    return path
 
 
 def find_task_operation(operation_id: str) -> TaskOperationV1 | None:
@@ -159,12 +161,13 @@ def record_task_terminal(
     op.diff_digest = diff_digest
     op.error_type = error_type
 
-    res_bytes = result_text.encode("utf-8")
+    sanitized = sanitize_text(result_text)
+    res_bytes = sanitized.encode("utf-8")
     op.result_digest = hashlib.sha256(res_bytes).hexdigest()
     op.receipt["phase"] = "TASK_TERMINAL"
     op.receipt["result_digest"] = op.result_digest
     op.receipt["result_payload"] = result_payload
-    op.receipt["sanitized_summary"] = sanitize_text(result_text[:500])
+    op.receipt["sanitized_summary"] = sanitized[:500]
     save_task_operation(op)
     return op
 
