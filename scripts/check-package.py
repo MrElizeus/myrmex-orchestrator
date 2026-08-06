@@ -53,6 +53,9 @@ REQUIRED_CONTRACTS = {
     "frontier-state-v2.schema.json",
     "memory-v1.schema.json",
     "work-unit-metric-v1.schema.json",
+    "plan-revision-v1.schema.json",
+    "planning-request-v1.schema.json",
+    "planning-result-v1.schema.json",
     "procedural-experiment-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }
