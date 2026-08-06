@@ -413,6 +413,61 @@ myrmex-memory procedural list --repository-root <repo>
 myrmex-memory procedural show <experiment-id> --repository-root <repo>
 ```
 
+## Campaign intelligence sidecar
+
+Each campaign may carry an immutable Campaign Intelligence sidecar beneath its
+campaign directory. It stores JSON-object records of four kinds (`backlog`,
+`plan`, `review`, `decision`) and one generated index:
+
+```text
+<campaign-dir>/intelligence/
+  lock
+  artifacts/<sha256-of-artifact-id>.json
+  projection.json
+```
+
+Directories are mode 0700 and files mode 0600. Artifact filenames are the
+SHA-256 of the validated artifact ID; the store rejects symbolic links and any
+path that escapes the campaign directory.
+
+Artifacts are immutable. The first `intelligence-put` for an artifact ID
+returns `created`; repeating the identical kind and JSON payload returns
+`reused` and leaves the file byte-for-byte unchanged; a different kind or
+payload for the same ID returns `conflict` and never alters the original.
+Artifact IDs are unique campaign-wide. Writes are serialized by an exclusive
+`flock` on `intelligence/lock`; each artifact file is fsynced before the
+per-campaign `projection.json` index is atomically replaced.
+
+The projection is a non-authoritative, rebuildable inventory of descriptors
+only, never artifact payloads. Deleting `projection.json` does not delete any
+artifact; run:
+
+```bash
+myrmex-campaign intelligence-rebuild <campaign-id>
+```
+
+to reconstruct it. Rebuild validates every artifact and rejects corrupt ones
+explicitly rather than skipping them. `myrmex-campaign intelligence-doctor
+<campaign-id>` is read-only and reports `healthy`, `projection_missing`,
+`projection_stale`, `artifact_corrupt`, or `backend_unavailable`. If a process
+stops after an artifact is durable but before the projection is replaced, the
+artifact remains authoritative and an explicit rebuild restores the
+projection.
+
+Input is JSON-object-only and must come from `-` (standard input) or a regular
+non-symlink file outside the campaign repository root. Repository source files
+and raw-content keys (`source_code`, `file_content`, `raw_diff`, `patch`, and
+similar) are rejected, as are secret-bearing keys and values (passwords,
+tokens, bearer values, private keys, secret assignments). Rejections identify
+the rejected field without echoing the value and occur before any artifact or
+projection file is created.
+
+`campaign.json`, the `myrmex.campaign/v1` schema, and campaign revision/CAS
+remain authoritative; sidecar writes never touch them. Intelligence artifacts
+have no repository-effect authority: this store does not activate plans and
+does not create work units. No artifact-update or artifact-delete command
+exists.
+
 ## Draft PR recovery
 
 Keep GitHub create and label operations separate. A confirmed approved

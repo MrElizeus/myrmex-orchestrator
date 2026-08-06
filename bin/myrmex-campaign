@@ -21,6 +21,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import myrmex_campaign_intelligence as intel  # noqa: E402
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -1085,6 +1090,135 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if not errors else 1
 
 
+# Campaign intelligence sidecar commands (WU-P1-002).
+# Stable exit codes: 0 success; 1 invalid input/campaign; 2 conflict;
+# 3 backend unavailable/store error; 4 artifact not found.
+def _intel_emit_error(status: str, message: str) -> None:
+    print(json.dumps({"ok": False, "status": status, "error": message}, indent=2))
+
+
+def cmd_intelligence_put(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+    except ValueError as exc:
+        _intel_emit_error("invalid_campaign_id", str(exc))
+        return 1
+    try:
+        data = read_campaign(cid)
+    except Exception as exc:
+        _intel_emit_error("campaign_unavailable", str(exc))
+        return 1
+    try:
+        payload = intel.read_input_json(args.input_json, data["repository_root"], campaign_dir(cid))
+    except intel.IntelligencePayloadRejected as exc:
+        _intel_emit_error("input_rejected", str(exc))
+        return 1
+    try:
+        result = intel.put_artifact(
+            campaign_dir=campaign_dir(cid),
+            campaign_id=cid,
+            campaign_revision=data["revision"],
+            kind=args.kind,
+            artifact_id=args.artifact_id,
+            payload=payload,
+        )
+    except intel.IntelligenceArtifactConflict as exc:
+        _intel_emit_error("conflict", str(exc))
+        return 2
+    except intel.IntelligenceBackendUnavailable as exc:
+        _intel_emit_error("backend_unavailable", str(exc))
+        return 3
+    except intel.IntelligenceStoreError as exc:
+        _intel_emit_error("store_error", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_intelligence_show(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+    except Exception as exc:
+        _intel_emit_error("campaign_unavailable", str(exc))
+        return 1
+    try:
+        result = intel.get_artifact(campaign_dir(cid), cid, args.artifact_id)
+    except intel.IntelligenceArtifactInvalid as exc:
+        if str(exc).startswith("artifact not found"):
+            _intel_emit_error("not_found", str(exc))
+            return 4
+        _intel_emit_error("artifact_invalid", str(exc))
+        return 1
+    except intel.IntelligenceStoreError as exc:
+        _intel_emit_error("store_error", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_intelligence_list(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+    except Exception as exc:
+        _intel_emit_error("campaign_unavailable", str(exc))
+        return 1
+    if args.kind is not None and args.kind not in intel.ALLOWED_ARTIFACT_KINDS:
+        _intel_emit_error("invalid_kind", f"invalid artifact kind {args.kind!r}")
+        return 1
+    try:
+        result = intel.list_artifacts(campaign_dir(cid), cid, kind=args.kind)
+    except intel.IntelligenceStoreError as exc:
+        _intel_emit_error("store_error", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_intelligence_rebuild(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+    except Exception as exc:
+        _intel_emit_error("campaign_unavailable", str(exc))
+        return 1
+    try:
+        result = intel.rebuild_projection(campaign_dir(cid), cid)
+    except (intel.IntelligenceArtifactInvalid, intel.IntelligenceProjectionInvalid) as exc:
+        _intel_emit_error("rebuild_failed", str(exc))
+        return 1
+    except intel.IntelligenceBackendUnavailable as exc:
+        _intel_emit_error("backend_unavailable", str(exc))
+        return 3
+    except intel.IntelligenceStoreError as exc:
+        _intel_emit_error("store_error", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_intelligence_doctor(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+    except Exception as exc:
+        _intel_emit_error("campaign_unavailable", str(exc))
+        return 1
+    try:
+        result = intel.doctor(campaign_dir(cid), cid)
+    except intel.IntelligenceStoreError as exc:
+        _intel_emit_error("store_error", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "healthy" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1239,6 +1373,47 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl.add_argument("id", help="Campaign ID")
     p_tl.add_argument("--json", action="store_true")
     p_tl.set_defaults(func=cmd_timeline)
+
+    # campaign intelligence sidecar (WU-P1-002)
+    p_ic_put = sub.add_parser(
+        "intelligence-put",
+        help="Store an immutable campaign intelligence artifact (backlog|plan|review|decision)",
+    )
+    p_ic_put.add_argument("id", help="Campaign ID")
+    p_ic_put.add_argument("--kind", required=True, choices=list(intel.ALLOWED_ARTIFACT_KINDS))
+    p_ic_put.add_argument("--artifact-id", required=True, help="Campaign-wide artifact ID")
+    p_ic_put.add_argument("--input-json", required=True, help="JSON object file path or - for stdin")
+    p_ic_put.set_defaults(func=cmd_intelligence_put)
+
+    p_ic_show = sub.add_parser(
+        "intelligence-show",
+        help="Show one immutable campaign intelligence artifact",
+    )
+    p_ic_show.add_argument("id", help="Campaign ID")
+    p_ic_show.add_argument("--artifact-id", required=True, help="Campaign-wide artifact ID")
+    p_ic_show.set_defaults(func=cmd_intelligence_show)
+
+    p_ic_list = sub.add_parser(
+        "intelligence-list",
+        help="List campaign intelligence projection descriptors (no payloads)",
+    )
+    p_ic_list.add_argument("id", help="Campaign ID")
+    p_ic_list.add_argument("--kind", choices=list(intel.ALLOWED_ARTIFACT_KINDS))
+    p_ic_list.set_defaults(func=cmd_intelligence_list)
+
+    p_ic_rebuild = sub.add_parser(
+        "intelligence-rebuild",
+        help="Rebuild the campaign intelligence projection from stored artifacts",
+    )
+    p_ic_rebuild.add_argument("id", help="Campaign ID")
+    p_ic_rebuild.set_defaults(func=cmd_intelligence_rebuild)
+
+    p_ic_doctor = sub.add_parser(
+        "intelligence-doctor",
+        help="Health-check the campaign intelligence sidecar (read-only)",
+    )
+    p_ic_doctor.add_argument("id", help="Campaign ID")
+    p_ic_doctor.set_defaults(func=cmd_intelligence_doctor)
 
     return p
 
