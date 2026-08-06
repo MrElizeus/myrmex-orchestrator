@@ -67,6 +67,7 @@ ALLOWED_ARTIFACT_KINDS = ("backlog", "plan", "review", "decision")
 
 CAMPAIGN_ID_RE = re.compile(r"^camp-[a-z0-9][a-z0-9-]{4,60}$")
 ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 INTELLIGENCE_DIR_NAME = "intelligence"
 ARTIFACTS_DIR_NAME = "artifacts"
@@ -98,6 +99,19 @@ _ARTIFACT_ENVELOPE_FIELDS = frozenset({
     "schema", "campaign_id", "artifact_id", "kind",
     "artifact_digest", "payload_digest", "observed_campaign_revision",
     "created_at", "payload",
+})
+
+# The exact, closed set of projection top-level fields and per-descriptor
+# fields. Projections (or descriptors) carrying any additional field or
+# missing any of these are structurally invalid; validation errors name
+# offending fields but never echo field values.
+_PROJECTION_TOP_FIELDS = frozenset({
+    "schema", "campaign_id", "source_digest", "artifact_count",
+    "artifacts", "rebuilt_at",
+})
+_PROJECTION_DESCRIPTOR_FIELDS = frozenset({
+    "artifact_id", "artifact_digest", "payload_digest", "created_at",
+    "storage_key",
 })
 
 
@@ -250,15 +264,30 @@ def _require_regular_non_symlink(path: Path, label: str) -> None:
 
 
 def _fsync_dir(path: Path) -> None:
-    """Best-effort directory fsync; strict file fsync is handled at write time."""
+    """Synchronize a directory, failing closed on any backend failure.
+
+    Strict supported-Linux semantics: open the directory (with O_DIRECTORY
+    where available), fsync it, then close it. A directory open or fsync
+    failure means the rename that published a file may not be durable, so the
+    caller must not report success; no rollback is fabricated here because the
+    renamed file may already have reached durable storage and a later
+    retry/rebuild reconciles it idempotently.
+    """
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
     try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise IntelligenceBackendUnavailable(
+            f"cannot open directory {path.name} for synchronization: {exc}"
+        ) from exc
     try:
-        os.fsync(fd)
-    except OSError:
-        pass
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise IntelligenceBackendUnavailable(
+                f"cannot synchronize directory {path.name}: {exc}"
+            ) from exc
     finally:
         os.close(fd)
 
@@ -452,8 +481,152 @@ def _compute_projection_source_digest(
     return sha256_hex(canonical_json_bytes(core))
 
 
+def _validate_projection_descriptor(descriptor: Any) -> None:
+    """Validate one projection descriptor against the closed descriptor shape.
+
+    A descriptor must be an object whose key set is exactly
+    {artifact_id, artifact_digest, payload_digest, created_at, storage_key},
+    with a valid artifact ID, lowercase 64-hex SHA-256 digests, a non-empty
+    created_at string, and a lowercase 64-hex storage_key equal to
+    sha256(artifact_id). Error messages name offending fields but never echo
+    field values.
+    """
+    if not isinstance(descriptor, dict):
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor is not a JSON object"
+        )
+    actual_fields = set(descriptor.keys())
+    if actual_fields != _PROJECTION_DESCRIPTOR_FIELDS:
+        extra = sorted(actual_fields - _PROJECTION_DESCRIPTOR_FIELDS)
+        missing = sorted(_PROJECTION_DESCRIPTOR_FIELDS - actual_fields)
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor must contain exactly the fields artifact_id, "
+            "artifact_digest, payload_digest, created_at, storage_key"
+            + (f"; unexpected field(s): {extra!r}" if extra else "")
+            + (f"; missing field(s): {missing!r}" if missing else "")
+        )
+    aid = descriptor["artifact_id"]
+    if not isinstance(aid, str) or not ARTIFACT_ID_RE.match(aid):
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor has an invalid artifact_id"
+        )
+    if (
+        not isinstance(descriptor["artifact_digest"], str)
+        or not SHA256_HEX_RE.match(descriptor["artifact_digest"])
+    ):
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor has an invalid artifact_digest"
+        )
+    if (
+        not isinstance(descriptor["payload_digest"], str)
+        or not SHA256_HEX_RE.match(descriptor["payload_digest"])
+    ):
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor has an invalid payload_digest"
+        )
+    created_at = descriptor["created_at"]
+    if not isinstance(created_at, str) or not created_at:
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor is missing created_at"
+        )
+    storage_key = descriptor["storage_key"]
+    if not isinstance(storage_key, str) or not SHA256_HEX_RE.match(storage_key):
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor has an invalid storage_key"
+        )
+    if artifact_storage_key(aid) != storage_key:
+        raise IntelligenceProjectionInvalid(
+            "projection descriptor storage_key does not match sha256(artifact_id)"
+        )
+
+
+def _validate_projection_structure(projection: dict[str, Any]) -> None:
+    """Validate the closed projection envelope and descriptor structure.
+
+    Fail-closed structural validation: the top-level key set must be exactly
+    {schema, campaign_id, source_digest, artifact_count, artifacts,
+    rebuilt_at}; artifacts must be an object whose key set is exactly the four
+    artifact kinds with array values; every descriptor must match the closed
+    descriptor shape; artifact_count must be a non-negative integer equal to
+    the total descriptor count; artifact ids must be unique across all kinds;
+    and descriptors must be in deterministic (artifact_id, artifact_digest)
+    order. Raises IntelligenceProjectionInvalid on any failure.
+    """
+    actual_fields = set(projection.keys())
+    if actual_fields != _PROJECTION_TOP_FIELDS:
+        extra = sorted(actual_fields - _PROJECTION_TOP_FIELDS)
+        missing = sorted(_PROJECTION_TOP_FIELDS - actual_fields)
+        raise IntelligenceProjectionInvalid(
+            "projection must contain exactly the fields schema, campaign_id, "
+            "source_digest, artifact_count, artifacts, rebuilt_at"
+            + (f"; unexpected field(s): {extra!r}" if extra else "")
+            + (f"; missing field(s): {missing!r}" if missing else "")
+        )
+
+    artifacts = projection["artifacts"]
+    if not isinstance(artifacts, dict):
+        raise IntelligenceProjectionInvalid(
+            "projection artifacts must be a JSON object"
+        )
+
+    actual_kinds = set(artifacts.keys())
+    if actual_kinds != set(ALLOWED_ARTIFACT_KINDS):
+        extra = sorted(actual_kinds - set(ALLOWED_ARTIFACT_KINDS))
+        missing = sorted(set(ALLOWED_ARTIFACT_KINDS) - actual_kinds)
+        raise IntelligenceProjectionInvalid(
+            "projection artifacts must contain exactly the kinds backlog, plan, "
+            "review, decision"
+            + (f"; unexpected kind(s): {extra!r}" if extra else "")
+            + (f"; missing kind(s): {missing!r}" if missing else "")
+        )
+
+    artifact_count = projection["artifact_count"]
+    if type(artifact_count) is not int or artifact_count < 0:
+        raise IntelligenceProjectionInvalid(
+            "projection artifact_count must be a non-negative integer"
+        )
+
+    seen_ids: set[str] = set()
+    total = 0
+    for kind in ALLOWED_ARTIFACT_KINDS:
+        descriptors = artifacts[kind]
+        if not isinstance(descriptors, list):
+            raise IntelligenceProjectionInvalid(
+                f"projection kind {kind!r} must be an array"
+            )
+        for descriptor in descriptors:
+            _validate_projection_descriptor(descriptor)
+            aid = descriptor["artifact_id"]
+            if aid in seen_ids:
+                raise IntelligenceProjectionInvalid(
+                    "projection contains duplicate artifact id across artifact kinds"
+                )
+            seen_ids.add(aid)
+        total += len(descriptors)
+
+    if artifact_count != total:
+        raise IntelligenceProjectionInvalid(
+            "projection artifact_count does not match the descriptor count"
+        )
+
+    for kind in ALLOWED_ARTIFACT_KINDS:
+        descriptors = artifacts[kind]
+        ordered = sorted(
+            descriptors, key=lambda d: (d["artifact_id"], d["artifact_digest"])
+        )
+        if descriptors != ordered:
+            raise IntelligenceProjectionInvalid(
+                "projection descriptors are not in deterministic "
+                "(artifact_id, artifact_digest) order"
+            )
+
+
 def _read_projection_file(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
-    """Read and fully validate the stored projection (schema, owner, digest)."""
+    """Read and fully validate the stored projection (schema, owner, closed
+    structure, then digest). Structural failures raise
+    IntelligenceProjectionInvalid so callers report projection_stale without
+    rewriting the invalid file; the source_digest is recomputed and compared
+    only after structural validation succeeds."""
     proj_path = _iroot(campaign_dir) / PROJECTION_FILE_NAME
     _require_regular_non_symlink(proj_path, "projection file")
     try:
@@ -477,10 +650,11 @@ def _read_projection_file(campaign_dir: Path, campaign_id: str) -> dict[str, Any
             f"projection belongs to campaign {projection.get('campaign_id')!r}, "
             f"expected {campaign_id!r}"
         )
+    _validate_projection_structure(projection)
     expected = _compute_projection_source_digest(
         campaign_id,
-        projection.get("artifact_count", -1),
-        projection.get("artifacts", None),
+        projection["artifact_count"],
+        projection["artifacts"],
     )
     if projection.get("source_digest") != expected:
         raise IntelligenceProjectionInvalid(
