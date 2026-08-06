@@ -7,7 +7,8 @@ descriptor lists, doctor health, projection delete/rebuild recovery, campaign
 byte/revision stability, conflict rejection, invalid input rejection,
 secret/raw-source rejection with no persistence, concurrency (identical and
 conflicting writers), crash-after-artifact recovery, corruption detection,
-and campaign-v1 compatibility.
+strict fail-closed directory fsync, strict projection structural tamper
+rejection, and campaign-v1 compatibility.
 """
 from __future__ import annotations
 
@@ -870,6 +871,256 @@ def test_private_mode_violations_fail_doctor_and_restore_heals() -> None:
 
 
 # --------------------------------------------------------------------------
+# Frontier corrective-plan regression tests (WU-P1-002-D)
+# --------------------------------------------------------------------------
+
+def _run_patched_child(code: str, state_home: str) -> subprocess.CompletedProcess[str]:
+    """Run a Python snippet in a subprocess that imports the store module and
+    may monkeypatch it (same convention as the crash-recovery test)."""
+    env = dict(os.environ, XDG_STATE_HOME=state_home, PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+
+
+def test_fsync_failure_artifact_dir_fails_closed() -> None:
+    """Finding 1 (artifact-directory path): a directory fsync failure after the
+    artifact rename must fail closed with a typed backend failure, no success
+    receipt, and no fabricated rollback; retry/rebuild reconciles idempotently."""
+    with tempfile.TemporaryDirectory(prefix="intel-fsync-art-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        cdir = campaign_dir(td)
+        payload = {"title": "Fsync Survivor", "n": 11}
+
+        child = (
+            "import sys\n"
+            "sys.path.insert(0, {scripts!r})\n"
+            "import myrmex_campaign_intelligence as intel\n"
+            "def _fail_dir_fsync(path):\n"
+            "    raise intel.IntelligenceBackendUnavailable(\n"
+            "        'injected directory fsync failure: ' + str(path))\n"
+            "intel._fsync_dir = _fail_dir_fsync\n"
+            "try:\n"
+            "    intel.put_artifact(\n"
+            "        campaign_dir={cdir!r}, campaign_id='camp-intel', campaign_revision=1,\n"
+            "        kind='plan', artifact_id='fsync-art', payload={payload!r},\n"
+            "    )\n"
+            "    print('UNEXPECTED_SUCCESS')\n"
+            "except intel.IntelligenceStoreError as exc:\n"
+            "    print('RAISED:' + type(exc).__name__)\n"
+            "    raise SystemExit(3)\n"
+        ).format(scripts=str(SCRIPTS_DIR), cdir=str(cdir), payload=payload)
+        proc = _run_patched_child(child, td)
+        assert proc.returncode == 3, f"failed fsync must fail closed (nonzero): {proc.stdout} {proc.stderr}"
+        assert "RAISED:IntelligenceBackendUnavailable" in proc.stdout, proc.stdout
+        assert "UNEXPECTED_SUCCESS" not in proc.stdout, "no successful durability receipt may be emitted"
+        ok("artifact-directory fsync failure returns a typed backend failure with no success receipt")
+
+        files = list(artifacts_dir(td).glob("*.json"))
+        assert len(files) == 1, f"the already-renamed artifact must remain, found {files}"
+        envelope = json.loads(files[0].read_text(encoding="utf-8"))
+        assert envelope["artifact_id"] == "fsync-art"
+        assert envelope["payload_digest"] == intel.compute_payload_digest(payload)
+        assert envelope["artifact_digest"] == intel.compute_artifact_digest(
+            "camp-intel", "plan", "fsync-art", payload
+        )
+        ok("the artifact that exists remains internally valid (no fabricated rollback)")
+
+        doc = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc["ok"] is False
+        assert doc["status"] in ("projection_missing", "projection_stale"), doc
+        ok(f"doctor reports an unrecovered condition ({doc['status']}) after fsync failure")
+
+        retry = put(td, "camp-intel", "plan", "fsync-art", write_payload(Path(td) / "inputs" / "fsync.json", payload))
+        assert retry.returncode == EXIT_OK, retry.stderr
+        assert json.loads(retry.stdout)["status"] == "reused", retry.stdout
+        assert len(list(artifacts_dir(td).glob("*.json"))) == 1, "retry must not duplicate the artifact"
+        listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], td).stdout)
+        assert listing["status"] == "healthy" and listing["artifact_count"] == 1, listing
+        ok("retrying the same artifact is idempotent (reused) with no duplicate and a healthy projection")
+
+        proj = campaign_dir(td) / "intelligence" / "projection.json"
+        proj.unlink(missing_ok=True)
+        rebuilt = run_campaign(["intelligence-rebuild", "camp-intel"], td)
+        assert rebuilt.returncode == EXIT_OK, rebuilt.stderr
+        doc2 = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc2["status"] == "healthy", doc2
+        ok("explicit rebuild restores a healthy projection after artifact-dir fsync failure")
+
+
+def test_fsync_failure_projection_dir_fails_closed() -> None:
+    """Finding 1 (intelligence-root/projection path): a directory fsync failure
+    on the intelligence root after the projection rename must fail closed, and
+    retry/rebuild reconciles the already-persisted artifact idempotently."""
+    with tempfile.TemporaryDirectory(prefix="intel-fsync-proj-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        cdir = campaign_dir(td)
+        iroot = cdir / "intelligence"
+        payload = {"title": "Projection Fsync Survivor", "n": 22}
+
+        child = (
+            "import sys\n"
+            "sys.path.insert(0, {scripts!r})\n"
+            "import myrmex_campaign_intelligence as intel\n"
+            "orig = intel._fsync_dir\n"
+            "def _fail_root_fsync(path):\n"
+            "    if str(path) == {iroot!r}:\n"
+            "        raise intel.IntelligenceBackendUnavailable(\n"
+            "            'injected intelligence-root fsync failure')\n"
+            "    return orig(path)\n"
+            "intel._fsync_dir = _fail_root_fsync\n"
+            "try:\n"
+            "    intel.put_artifact(\n"
+            "        campaign_dir={cdir!r}, campaign_id='camp-intel', campaign_revision=1,\n"
+            "        kind='review', artifact_id='fsync-proj', payload={payload!r},\n"
+            "    )\n"
+            "    print('UNEXPECTED_SUCCESS')\n"
+            "except intel.IntelligenceStoreError as exc:\n"
+            "    print('RAISED:' + type(exc).__name__)\n"
+            "    raise SystemExit(3)\n"
+        ).format(scripts=str(SCRIPTS_DIR), cdir=str(cdir), iroot=str(iroot), payload=payload)
+        proc = _run_patched_child(child, td)
+        assert proc.returncode == 3, f"failed projection fsync must fail closed: {proc.stdout} {proc.stderr}"
+        assert "RAISED:IntelligenceBackendUnavailable" in proc.stdout, proc.stdout
+        assert "UNEXPECTED_SUCCESS" not in proc.stdout, "no successful durability receipt may be emitted"
+        ok("intelligence-root fsync failure returns a typed backend failure with no success receipt")
+
+        files = list(artifacts_dir(td).glob("*.json"))
+        assert len(files) == 1, f"the already-renamed artifact must remain, found {files}"
+        envelope = json.loads(files[0].read_text(encoding="utf-8"))
+        assert envelope["artifact_id"] == "fsync-proj"
+        assert envelope["payload_digest"] == intel.compute_payload_digest(payload)
+        ok("the artifact that exists remains internally valid (no fabricated rollback)")
+
+        # Model the restart where the non-durable projection rename was lost.
+        proj = iroot / "projection.json"
+        proj.unlink(missing_ok=True)
+        doc = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc["status"] == "projection_missing" and doc["ok"] is False, doc
+        ok("doctor reports projection_missing for the lost projection entry")
+
+        retry = put(td, "camp-intel", "review", "fsync-proj", write_payload(Path(td) / "inputs" / "fsync2.json", payload))
+        assert retry.returncode == EXIT_OK, retry.stderr
+        assert json.loads(retry.stdout)["status"] == "reused", retry.stdout
+        assert len(list(artifacts_dir(td).glob("*.json"))) == 1, "retry must not duplicate the artifact"
+        listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], td).stdout)
+        assert listing["status"] == "healthy" and listing["artifact_count"] == 1, listing
+        ok("retrying the same artifact is idempotent (reused) with no duplicate and a healthy projection")
+
+        proj.unlink(missing_ok=True)
+        rebuilt = run_campaign(["intelligence-rebuild", "camp-intel"], td)
+        assert rebuilt.returncode == EXIT_OK, rebuilt.stderr
+        doc2 = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc2["status"] == "healthy", doc2
+        ok("explicit rebuild restores a healthy projection after projection fsync failure")
+
+
+_PROJECTION_TAMPER_MARKER = "topsecretprojectionvalue"
+
+
+def _fresh_projection_store(state_home: str) -> tuple[Path, dict]:
+    """Create a healthy two-artifact store and return (projection_path, dict)."""
+    repo = Path(state_home) / "repo"
+    repo.mkdir()
+    init_campaign(state_home, "camp-intel", repo)
+    for aid, n in (("plan-a", 1), ("plan-b", 2)):
+        p = write_payload(Path(state_home) / "inputs" / f"{aid}.json", {"n": n})
+        proc = put(state_home, "camp-intel", "plan", aid, p)
+        assert proc.returncode == EXIT_OK, proc.stderr
+    proj = campaign_dir(state_home) / "intelligence" / "projection.json"
+    return proj, json.loads(proj.read_text(encoding="utf-8"))
+
+
+def _tamper_projection(pristine: dict, mutate) -> dict:
+    """Deep-copy a pristine projection, apply a structural tamper, then recompute
+    source_digest so the tamper is detectable only by structural validation."""
+    import copy
+    data = copy.deepcopy(pristine)
+    mutate(data)
+    data["source_digest"] = intel._compute_projection_source_digest(
+        data["campaign_id"], data["artifact_count"], data["artifacts"]
+    )
+    return data
+
+
+def _assert_tamper_rejected_stale(state_home: str, proj: Path, data: dict) -> None:
+    """Write a tampered projection and verify list/doctor report projection_stale
+    without rewriting the file and without emitting the marker value."""
+    proj.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tampered_bytes = proj.read_bytes()
+
+    listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], state_home).stdout)
+    assert listing["status"] == "projection_stale", listing
+    assert _PROJECTION_TAMPER_MARKER not in json.dumps(listing), listing
+    assert proj.read_bytes() == tampered_bytes, "list must not rewrite the tampered projection"
+
+    doc_proc = run_campaign(["intelligence-doctor", "camp-intel"], state_home)
+    doc = json.loads(doc_proc.stdout)
+    assert doc["status"] == "projection_stale" and doc["ok"] is False, doc
+    assert _PROJECTION_TAMPER_MARKER not in json.dumps(doc), doc
+    assert doc_proc.returncode == 1, doc_proc.stdout
+    assert proj.read_bytes() == tampered_bytes, "doctor must not rewrite the tampered projection"
+
+
+def test_projection_structural_tamper_cases_rejected_stale() -> None:
+    """Finding 2: any invalid projection structure is reported as
+    projection_stale by list and doctor, never repaired, never rewritten, and
+    never emitting injected payload/secret values. Each case starts from a valid
+    projection, tampers one structural dimension, and recomputes source_digest so
+    only the closed-structure validation can catch it."""
+    with tempfile.TemporaryDirectory(prefix="intel-proj-struct-") as td:
+        proj, pristine = _fresh_projection_store(td)
+        m = _PROJECTION_TAMPER_MARKER
+
+        cases = [
+            ("unknown top-level projection field",
+             lambda d: d.update({"unexpected_top": {"nested": m}})),
+            ("missing required top-level field",
+             lambda d: d.pop("rebuilt_at")),
+            ("unknown artifact-kind key",
+             lambda d: d["artifacts"].update({"extra_kind": []})),
+            ("missing required artifact-kind key",
+             lambda d: d["artifacts"].pop("decision")),
+            ("artifacts not an object",
+             lambda d: d.update({"artifacts": ["not", "an", "object"]})),
+            ("kind value not an array",
+             lambda d: d["artifacts"].update({"plan": {"not": "array"}})),
+            ("descriptor with extra payload field",
+             lambda d: d["artifacts"]["plan"][0].update({"payload": {m: "leak"}})),
+            ("descriptor with extra raw/secret field",
+             lambda d: d["artifacts"]["plan"][0].update({"raw_secret_field": m})),
+            ("descriptor missing a required field",
+             lambda d: d["artifacts"]["plan"][0].pop("created_at")),
+            ("malformed artifact_digest",
+             lambda d: d["artifacts"]["plan"][0].update({"artifact_digest": "A" + "0" * 63})),
+            ("malformed payload_digest",
+             lambda d: d["artifacts"]["plan"][0].update({"payload_digest": "0" * 63})),
+            ("malformed storage_key",
+             lambda d: d["artifacts"]["plan"][0].update({"storage_key": "not-a-storage-key"})),
+            ("storage_key != sha256(artifact_id)",
+             lambda d: d["artifacts"]["plan"][0].update({"storage_key": "0" * 64})),
+            ("incorrect artifact_count",
+             lambda d: d.update({"artifact_count": 999})),
+            ("duplicate artifact_id across kinds",
+             lambda d: d["artifacts"]["decision"].append(dict(d["artifacts"]["plan"][0]))),
+            ("non-deterministic descriptor ordering",
+             lambda d: d["artifacts"]["plan"].reverse()),
+        ]
+
+        for label, mutate in cases:
+            data = _tamper_projection(pristine, mutate)
+            _assert_tamper_rejected_stale(td, proj, data)
+            ok(f"projection_stale for {label} (list and doctor, no rewrite, no value emitted)")
+
+        proj.write_text(json.dumps(pristine, indent=2), encoding="utf-8")
+        listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], td).stdout)
+        assert listing["status"] == "healthy", listing
+        ok("restoring the pristine projection returns healthy")
+
+
+# --------------------------------------------------------------------------
 # Compatibility
 # --------------------------------------------------------------------------
 
@@ -934,6 +1185,9 @@ def main() -> int:
         test_prohibited_payload_content_detected_on_read,
         test_projection_campaign_mismatch_is_stale_not_repaired,
         test_private_mode_violations_fail_doctor_and_restore_heals,
+        test_fsync_failure_artifact_dir_fails_closed,
+        test_fsync_failure_projection_dir_fails_closed,
+        test_projection_structural_tamper_cases_rejected_stale,
         test_campaign_v1_schema_and_existing_commands_unchanged,
         test_no_update_or_delete_command_exists,
     ]
