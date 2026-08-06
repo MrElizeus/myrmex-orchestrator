@@ -66,6 +66,7 @@ myrmex-state init \
   --repository-root <repo> \
   --mode interactive|autonomous \
   --scope narrow|continuous \
+  --execution-policy unresolved|auto|direct-only|frontier-gated \
   --branch <branch> \
   --base-sha <sha> \
   --commit-policy deny|ask|authorized \
@@ -74,12 +75,27 @@ myrmex-state init \
 
 Add each protected dirty path with `--protected-dirty-path`. Persist the returned run ID and acquire `myrmex-state lock <run-id> --owner <stable-session-owner>` before side effects.
 
+A new run must have an explicit execution policy. The orchestrator derives it
+from a clear prompt; when the prompt is ambiguous it initializes `unresolved`,
+uses OpenCode `question` once, and persists the answer with `route set`. Until
+then `reconcile` returns `REQUEST_EXECUTION_POLICY` and all effect boundaries
+fail closed. A persisted policy survives resume and is never inherited from
+another run.
+
 Use typed `myrmex-state` domain commands for every phase/status/receipt
 transition and `myrmex-state event` for compact audit events. Generic `patch`
 is only for non-critical metadata; it cannot modify state-machine fields or
 receipts. Persist every external effect in `pending_operations` as `intent →
 observed effect → receipt → terminal confirmation` with a stable idempotency
-key, then use `myrmex-state reconcile <run-id>` before recovery. `myrmex-state`
+key, and record its effect stage (`none`, `transport_started`, `request_sent`,
+or `response_observed`). A transport failure proven to have happened before any effect may use
+`frontier retry` with the same semantic purpose. A confirmed retry supersedes
+its predecessor atomically. For a legacy `blocked/blocked` run, use the typed
+`recovery resolve-frontier` command; it restores the persisted active phase only
+after every targeted failed Frontier attempt is resolved. Use `operation
+abandon` only when no successor is needed. Use `myrmex-state reconcile <run-id>`
+before recovery.
+`myrmex-state`
 accepts only explicit
 pairs: all work phases are `/active`; `blocked/blocked`, `dormant/dormant`,
 `failed/failed`, `cancelled/cancelled`, and `superseded/superseded` are

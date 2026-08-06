@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     env = dict(os.environ, MYRMEX_STATE_HOME=str(Path(td) / "state"), PYTHONDONTWRITEBYTECODE="1")
     init = run(
         "init", "--objective", "State test", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", "--commit-policy", "ask", "--push-policy", "deny",
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", "--commit-policy", "ask", "--push-policy", "deny",
         env=env,
     )
     run_id = init.stdout.strip()
@@ -99,8 +99,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert state["revision"] == 0
     assert state["push_status"] == "not_requested"
     assert state["execution"] == {
-        "requested_policy": "auto", "effective_route": "auto", "authority": "system",
-        "request_id": None, "set_at": state["created_at"], "locked": False,
+        "requested_policy": "auto", "effective_route": "auto", "authority": "prompt",
+        "request_id": None, "source_digest": None, "set_at": state["created_at"],
+        "resolved_at": state["created_at"], "locked": False,
     }
     assert state["attempts"] == {"scouts": 0, "writers": 0, "verifiers": 0, "corrections": 0}
     assert state["delegation_ledger"] == []
@@ -109,9 +110,12 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     # A persisted direct-only policy survives ordinary reads/migration and
     # rejects both stateful delegation entry points and Frontier checks.
+    # The run must start with an unresolved policy so `route set` can establish
+    # direct-only as the first (and only) resolution.
     direct = run(
         "init", "--run-id", "myrmex-direct-policy", "--objective", "Direct policy test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        env=env,
     ).stdout.strip()
     direct_only = json.loads(run(
         "route", "set", direct, "--policy", "direct-only", "--authority", "user",
@@ -149,10 +153,14 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert persisted_direct["state"]["execution"]["requested_policy"] == "direct-only"
 
     # The switch into direct-only is rejected while a persisted child task is
-    # still active; it must first be consolidated or recovered.
+    # still active. With the immutability invariant, a run with active delegations
+    # already has a resolved policy (delegations require a resolved policy), so
+    # any subsequent route set is blocked by BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED.
+    # We verify this by using a run with auto (already resolved) + active delegation.
     pending = run(
         "init", "--run-id", "myrmex-route-pending", "--objective", "Route pending test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation", pending, "--agent", "myrmex-worker", "--role", "writer", "--reason", "pending child",
@@ -164,11 +172,15 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "--request-id", "req-user-direct-pending", "--expect-revision", "1", env=env, ok=False,
     )
 
-    # A start must have a durable task identity, and old anonymous started
-    # records still block a switch to direct-only rather than being forgotten.
+    # A start must have a durable task identity. Old anonymous started records
+    # also block a switch to direct-only. With the immutability invariant, a run
+    # that already has delegation activity has a resolved policy, so any subsequent
+    # route set fails with BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED. The run
+    # starts with auto (already resolved) and has an anonymous ledger record injected.
     anonymous = run(
         "init", "--run-id", "myrmex-route-anonymous", "--objective", "Anonymous route test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation", anonymous, "--agent", "myrmex-worker", "--role", "writer", "--reason", "missing identity",
@@ -182,7 +194,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
         "route", "set", anonymous, "--policy", "direct-only", "--authority", "user",
         "--request-id", "req-user-direct-anonymous", "--expect-revision", "0", env=env, ok=False,
     )
-    assert "anonymous active delegation records" in anonymous_route.stderr
+    # The immutability guard fires before the delegation check for runs with an
+    # already-resolved policy; the failure code is BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED.
+    assert "BLOCKED_EXECUTION_POLICY_ALREADY_RESOLVED" in anonymous_route.stderr
 
     run("lock", run_id, "--owner", "test-owner", env=env)
     run("lock", run_id, "--owner", "other-owner", env=env, ok=False)
@@ -396,7 +410,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     run("unlock", run_id, "--owner", "test-owner", env=env)
     second = run(
         "init", "--run-id", "myrmex-no-progress", "--objective", "No progress test",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto",
         env=env,
     ).stdout.strip()
     run(
@@ -428,7 +442,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # a WU authorization cannot clear it.
     capped = run(
         "init", "--run-id", "myrmex-global-correction-cap", "--objective", "Global correction cap",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--max-total-corrections", "1",
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", "--max-total-corrections", "1",
         env=env,
     ).stdout.strip()
     run(
@@ -453,7 +467,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # only a real provider error is an execution failure and evidence is redacted.
     provider = run(
         "init", "--run-id", "myrmex-provider-outcomes", "--objective", "Provider outcomes",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", provider, "--agent", "myrmex-scout", "--role", "scout", "--reason", "configured routing",
@@ -486,7 +500,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert explicitly_blocked["status"] == "blocked" and explicitly_blocked["blocker"] == "HUMAN_DECISION_REQUIRED"
     unresolved = run(
         "init", "--run-id", "myrmex-unresolved-agent", "--objective", "Unresolved agent", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     blocked_agent = json.loads(run(
         "delegation-preflight", unresolved, "--agent", "myrmex-worker", "--role", "writer", "--reason", "resolver blocked",
@@ -501,7 +515,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     blocked_result = run(
         "init", "--run-id", "myrmex-blocked-terminal-result", "--objective", "Blocked terminal result",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", blocked_result, "--agent", "myrmex-worker", "--role", "writer",
@@ -534,7 +548,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     terminal_result = run(
         "init", "--run-id", "myrmex-cancelled-terminal-result", "--objective", "Cancelled terminal result",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", terminal_result, "--agent", "myrmex-worker", "--role", "writer",
@@ -565,7 +579,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # order, consolidates once, and cannot advance the next gate twice.
     joined = run(
         "init", "--run-id", "myrmex-delegation-join", "--objective", "Join test", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run("delegation-batch", joined, "start", "--batch-id", "scouts", "--task-ids-json", '["task-1","task-2","task-3"]', "--expect-revision", "0", env=env)
     collected = json.loads(run(
@@ -582,7 +596,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     missing = run(
         "init", "--run-id", "myrmex-join-missing", "--objective", "Missing join result", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run("delegation-batch", missing, "start", "--batch-id", "scouts", "--task-ids-json", '["task-1","task-2"]', "--expect-revision", "0", env=env)
     recovery = json.loads(run(
@@ -603,7 +617,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     contradiction = run(
         "init", "--run-id", "myrmex-join-conflict", "--objective", "Contradictory join result", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run("delegation-batch", contradiction, "start", "--batch-id", "scouts", "--task-ids-json", '["task-1","task-2"]', "--expect-revision", "0", env=env)
     conflict = json.loads(run(
@@ -614,7 +628,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     unrelated_blocker = run(
         "init", "--run-id", "myrmex-batch-unrelated-blocker", "--objective", "Batch blocker scope",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation-batch", unrelated_blocker, "start", "--batch-id", "scouts", "--task-ids-json", '["task-1"]',
@@ -634,7 +648,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # from durable operation state before any external transport is repeated.
     recovery_run = run(
         "init", "--run-id", "myrmex-recovery-ledger", "--objective", "Recovery ledger",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto",
+        env=env,
     ).stdout.strip()
     recovery_path = Path(td) / "state" / "runs" / recovery_run / "state.json"
     recovery_before = recovery_path.read_bytes()
@@ -673,16 +689,8 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     ).stdout)
     assert frontier_confirmed["revision"] == 4
     # A terminal Frontier operation no longer leaves the legacy task ID as a
-    # permanent direct-route blocker, but direct-only still rejects new starts.
-    terminal_frontier_route = json.loads(run(
-        "route", "set", recovery_run, "--policy", "direct-only", "--authority", "user",
-        "--request-id", "req-user-direct-after-frontier", "--expect-revision", "4", env=env,
-    ).stdout)
-    assert terminal_frontier_route["revision"] == 5
-    run(
-        "frontier", recovery_run, "start", "--request-id", "req-frontier-forbidden", "--task-id", "forbidden-task",
-        "--expect-revision", "5", env=env, ok=False,
-    )
+    # permanent direct-route blocker. Once a policy is resolved it is immutable;
+    # the direct-only blocking is tested via the `direct` run above.
     run(
         "frontier", direct, "start", "--request-id", "req-frontier-direct", "--task-id", "direct-task",
         "--expect-revision", "1", env=env, ok=False,
@@ -693,7 +701,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # recovery and complete cannot redispatch the same child.
     no_preflight = run(
         "init", "--run-id", "myrmex-no-preflight", "--objective", "No preflight", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation", no_preflight, "--agent", "myrmex-worker", "--role", "writer", "--reason", "must reject",
@@ -704,7 +712,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert no_preflight_state["revision"] == 0 and no_preflight_state["delegation_ledger"] == []
     missing_correction_workspace = run(
         "init", "--run-id", "myrmex-correction-workspace", "--objective", "Correction workspace", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "correction", "start", missing_correction_workspace, "--reason", "missing workspace", "--task-id", "missing-workspace",
@@ -714,7 +722,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     assert json.loads(run("show", missing_correction_workspace, env=env).stdout)["revision"] == 0
     preflight_run = run(
         "init", "--run-id", "myrmex-delegation-preflight", "--objective", "Delegation preflight",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", preflight_run, "--agent", "myrmex-worker", "--role", "writer",
@@ -767,7 +775,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # allowing a confirmed side effect to masquerade as successful completion.
     incomplete_delivery = run(
         "init", "--run-id", "myrmex-incomplete-delivery", "--objective", "Incomplete delivery",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     ci_intent = json.loads(run(
         "operation", incomplete_delivery, "intent", "--kind", "ci", "--idempotency-key", "ci:run-1",
@@ -797,7 +805,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # body generator derives its link from that persisted receipt.
     delivery_run = run(
         "init", "--run-id", "myrmex-delivery-flow", "--objective", "Delivery flow",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     issue_body = Path(td) / "tracking-body.md"
     issue_body.write_text("Authorized tracking scope\n")
@@ -1094,7 +1102,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     parent_gate = run(
         "init", "--run-id", "myrmex-parent-gate", "--objective", "Parent gate", "--parent-objective", "continuous objective",
-        "--repository-root", td, "--mode", "autonomous", "--scope", "continuous", env=env,
+        "--repository-root", td, "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     parent_incomplete = run(
         "complete", parent_gate, "--message", "cannot skip parent gate", "--expect-revision", "0", env=env, ok=False,
@@ -1106,7 +1114,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     # records only accepted Frontier WU evidence and is idempotent.
     deny_commit = run(
         "init", "--run-id", "myrmex-commit-policy-deny", "--objective", "deny commit policy",
-        "--repository-root", td, "--branch", "main", "--mode", "autonomous", "--scope", "narrow",
+        "--repository-root", td, "--branch", "main", "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto",
         "--commit-policy", "deny", "--push-policy", "deny", env=env,
     ).stdout.strip()
     denied_authorization = run(
@@ -1120,7 +1128,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     governed_parent = run(
         "init", "--run-id", "myrmex-governed-parent", "--objective", "governed parent",
         "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
-        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "authorized", "--push-policy", "deny", env=env,
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", "--commit-policy", "authorized", "--push-policy", "deny", env=env,
     ).stdout.strip()
     legacy_authorization = json.loads(run(
         "authorization", governed_parent, "create", "--authority", "user", "--request-id", "legacy-before-governed",
@@ -1221,7 +1229,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     complete_governed = run(
         "init", "--run-id", "myrmex-governed-complete", "--objective", "governed complete",
         "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
-        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", "--commit-policy", "deny", "--push-policy", "deny", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", complete_governed, "--agent", "myrmex-worker", "--role", "writer",
@@ -1293,7 +1301,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     plan_parent = run(
         "init", "--run-id", "myrmex-governed-plan-rejected", "--objective", "governed plan rejection",
         "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
-        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", "--commit-policy", "deny", "--push-policy", "deny", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", plan_parent, "--agent", "myrmex-worker", "--role", "writer",
@@ -1387,7 +1395,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
     grant_plan_parent = run(
         "init", "--run-id", "myrmex-governed-grant-plan", "--objective", "governed grant plan rejection",
         "--parent-objective", "standing governed parent", "--repository-root", td, "--branch", "main",
-        "--mode", "autonomous", "--scope", "continuous", "--commit-policy", "deny", "--push-policy", "deny", env=env,
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", "--commit-policy", "deny", "--push-policy", "deny", env=env,
     ).stdout.strip()
     run(
         "delegation-preflight", grant_plan_parent, "--agent", "myrmex-worker", "--role", "writer",
@@ -1473,7 +1481,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     terminal = run(
         "init", "--run-id", "myrmex-terminal-state", "--objective", "Terminal state", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     run("lock", terminal, "--owner", "terminal-owner", env=env)
     completed = json.loads(run(
@@ -1503,7 +1511,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-state-test-") as td:
 
     legacy = run(
         "init", "--run-id", "myrmex-legacy-dormant", "--objective", "Legacy state", "--repository-root", td,
-        "--mode", "autonomous", "--scope", "narrow", env=env,
+        "--mode", "autonomous", "--scope", "narrow", "--execution-policy", "auto", env=env,
     ).stdout.strip()
     legacy_path = Path(td) / "state" / "runs" / legacy / "state.json"
     legacy_data = json.loads(legacy_path.read_text())

@@ -29,6 +29,23 @@ Close other instances using the same `--user-data-dir`, or configure a separate 
 
 Run `myrmex-state doctor`. Confirm `~/.local/bin` is on PATH and the XDG state directory is writable. Frontier mode must not start without healthy local state.
 
+## Frontier resume repeats the same failed exchange
+
+Inspect `myrmex-state reconcile <run-id>`. `FINALIZE_FRONTIER_SUPERSESSION`
+means a confirmed successor already exists: run the typed `recovery
+resolve-frontier` command and do not open the browser.
+`RESOLVE_PRE_EFFECT_FRONTIER_FAILURE` requires complete effect **and** receipt
+evidence showing `browser_tab_opened=false`,
+`outbound_request_observed=false`, and `request_sent=false`; a timeout, missing
+field, contradiction, or absent `message_id` alone is insufficient.
+
+A legacy `blocked/blocked` run must be restored only by the typed recovery
+command, which preserves the failed operation, links its confirmed successor,
+and returns to the persisted active phase after all targeted Frontier attempts
+are resolved. Never edit `state.json` or fabricate a `message_id`. If any effect
+may have happened, keep the run blocked and use `frontier recover` against the
+saved identity.
+
 ## Memory unavailable
 
 Normal and frontier work may continue when local state is healthy, but semantic cross-session memory is degraded. Restart OpenCode after MCP changes. Never claim a memory save that did not succeed.
@@ -61,3 +78,10 @@ write a local artifact and apply the label through the narrow issue-label REST
 fallback when the Projects scope is absent. Persist discovery/receipt through
 the typed `pull_request` operation lifecycle; the helper no longer patches
 state directly.
+
+## A new run does nothing and reconcile requests execution policy
+
+`REQUEST_EXECUTION_POLICY` is a recoverable initialization state, not a failure.
+Use OpenCode `question` once to choose Auto, Direct-only, or Frontier-gated,
+then persist it with `myrmex-state route set`. Do not patch the execution object
+or assume `auto`.

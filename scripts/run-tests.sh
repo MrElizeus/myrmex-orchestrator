@@ -33,7 +33,7 @@ import json, sys
 from pathlib import Path
 root=Path(sys.argv[1])
 def package_files(pattern):
-    ignored = {'.git', 'external-sources'}
+    ignored = {'.git', 'external-sources', '.playwright-mcp', '.atl', '.myrmex-work'}
     return [path for path in root.rglob(pattern) if not any(part in ignored for part in path.relative_to(root).parts)]
 try:
     import jsonschema
@@ -47,6 +47,14 @@ else:
     print(f'schema meta-validation: PASS ({checked} schemas)')
 PYSCHEMA
 python3 "$ROOT/tests/test-state-cli.py"
+python3 "$ROOT/tests/test-execution-policy-resolution.py"
+python3 "$ROOT/tests/test-frontier-operation-recovery.py"
+python3 "$ROOT/tests/test-frontier-pre-effect-absence.py"
+python3 "$ROOT/tests/test-frontier-pre-effect-recovery.py"
+python3 "$ROOT/tests/test-frontier-blocked-recovery.py"
+python3 "$ROOT/tests/test-frontier-successor-causality.py"
+python3 "$ROOT/tests/test-operation-attempt-lifecycle.py"
+python3 "$ROOT/tests/test-eigengrid-blocked-run-recovery.py"
 python3 "$ROOT/tests/test-correction-grant-replay.py"
 python3 "$ROOT/tests/test-parent-objective-continuity.py"
 python3 "$ROOT/tests/test-local-commit.py"
@@ -74,7 +82,7 @@ python3 - "$ROOT" <<'PYSCAN'
 import re, sys
 from pathlib import Path
 root=Path(sys.argv[1])
-ignored = {'.git', 'external-sources'}
+ignored = {'.git', 'external-sources', '.playwright-mcp', '.atl', '.myrmex-work'}
 patterns=[
     re.compile(rb'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----'),
     re.compile(rb'AKIA[0-9A-Z]{16}'),

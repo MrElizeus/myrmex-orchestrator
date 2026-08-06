@@ -44,7 +44,7 @@ Use autonomous frontier delegation for this narrow objective. Continue through i
 myrmex-state doctor
 myrmex-state list
 myrmex-state show <run-id>
-myrmex-state init --objective-file <file> --repository-root <repo> --artifact-root /absolute/external/run-root --mode autonomous --scope narrow
+myrmex-state init --objective-file <file> --repository-root <repo> --artifact-root /absolute/external/run-root --mode autonomous --scope narrow --execution-policy auto
 myrmex-state transition <run-id> --to-phase collecting-context --reason "context gathered" --expect-revision <n>
 myrmex-state route set <run-id> --policy direct-only --authority user --request-id <request-id> --expect-revision <n>
 myrmex-state reconcile <run-id>
@@ -55,11 +55,20 @@ myrmex-state frontier <run-id> result --operation-id <op-...> --request-id <requ
   --transport-status success --frontier-decision ACCEPT --response-type plan --plan-json '{"work_unit_id":"WU-next"}' --expect-revision <n>
 myrmex-state frontier <run-id> recover --operation-id <op-...> --request-id <request-id> --message-id <message-id> \
   --transport-status success --frontier-decision REMEDIATE --effect-json '{...}' --receipt-json '{...}' --expect-revision <n>
+myrmex-state frontier <run-id> retry --operation-id <failed-op-...> --request-id <same-request-id> \
+  --pre-effect-absence-proven --expect-revision <n>
 myrmex-state delegation-preflight <run-id> --agent myrmex-worker --role writer --reason "bounded work" --task-id <task-id> --work-unit-id WU-03 --workspace <repo> --expect-revision <n>
 myrmex-state operation <run-id> intent --kind pull_request --idempotency-key <stable-key> --intent-json '{"required":true}' --expect-revision <n>
 myrmex-state operation <run-id> observe --operation-id op-... --effect-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> receipt --operation-id op-... --receipt-json '{...}' --expect-revision <n>
 myrmex-state operation <run-id> confirm --operation-id op-... --status confirmed --reason "receipt verified" --expect-revision <n>
+myrmex-state operation <run-id> supersede --operation-id <failed-op-...> \
+  --successor-operation-id <confirmed-op-...> --reason PRE_EFFECT_FAILURE --expect-revision <n>
+myrmex-state operation <run-id> abandon --operation-id <failed-op-...> \
+  --pre-effect-absence-proven --reason PRE_EFFECT_FAILURE --expect-revision <n>
+myrmex-state recovery <run-id> resolve-frontier --operation-id <failed-op-...> \
+  --successor-operation-id <confirmed-op-...> --disposition supersede \
+  --reason PRE_EFFECT_FAILURE --expect-revision <n>
 myrmex-state work-unit <run-id> complete --work-unit-id WU-03 --evidence-json '{...}' --expect-revision <n>
 myrmex-state pause <run-id> --reason "pause requested" --expect-revision <n>
 myrmex-state resume <run-id> --expect-revision <n>
@@ -67,6 +76,23 @@ myrmex-state cancel <run-id> --reason "parent cancelled" --cancellation-type PAR
 myrmex-state correction start <run-id> --work-unit-id WU-03 --task-id <task-id> --workspace <repo> --reason "fix verifier findings" --source-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --expect-revision <n>
 myrmex-state correction authorize <run-id> --work-unit-id WU-03 --authority frontier --request-id <request-id> --verification-request-id <verification-request-id> --defect-revision <n> --scope-digest <sha256> --source-candidate-sha <sha> --max-additional-attempts 1 --expect-revision <n>
 ```
+
+
+### Execution policy at run start
+
+A new run never silently defaults to `auto`. When the prompt clearly selects a
+mode, initialize with one of `auto`, `direct-only`, `delegated`, or
+`frontier-gated`. When it is ambiguous, omit the option (the persisted value is
+`unresolved`), call OpenCode `question` once, and then resolve it:
+
+```bash
+myrmex-state reconcile <run-id>  # REQUEST_EXECUTION_POLICY
+myrmex-state route set <run-id> --policy auto --authority user \
+  --request-id <answer-id> --source-digest <sha256> --expect-revision <n>
+```
+
+No Task, Frontier exchange, or other effect is allowed while policy is
+`unresolved`. Resume uses the persisted answer and never asks again.
 
 ### Bounded local commit
 
@@ -230,16 +256,22 @@ only; neither the policy resolver nor the tests call live GitHub.
    operation ID, body, receipt, stable marker, and exact remote identity. This
    makes resume idempotent without duplicate issue or PR creation.
 
-Frontier responses keep transport status separate from the substantive decision.
-`success` transport with `ACCEPT`, `REMEDIATE`, or `BLOCKED` is technically
-confirmed once the request ID, response message ID, effect, and receipt match.
+Frontier responses keep transport status separate from the substantive decision
+and record an `effect_stage`: `none`, `transport_started`, `request_sent`, or
+`response_observed`. A failed exchange can be retried with the same request ID
+only when the caller explicitly proves `none` (no browser tab, outbound
+request, or message identity). The retry creates a linked successor; after the
+successor is confirmed, `operation supersede` closes the old record without
+deleting its evidence. `operation abandon` is the equivalent terminal
+resolution when no successor is needed.
+
 Transport errors, timeouts, malformed responses, request mismatches, and
-response-identity mismatches are recorded as failed and remain completion
-blockers. `frontier recover` is the typed path for a legacy failed Frontier
-operation: it appends immutable recovery evidence and an effective confirmed
-outcome without rewriting the original terminal record. An exact replay is a
-byte-stable no-op; conflicting identity/payload or an unexpected revision is
-rejected without mutation.
+response-identity mismatches with a possible external effect remain recovery
+blockers. `frontier recover` no longer requires an original `message_id`; it
+can attach a later confirmed response identity to a failed operation. An exact
+replay is a byte-stable no-op; conflicting identity/payload or an unexpected
+revision is rejected without mutation. Failed, abandoned, and superseded
+historical records do not block completion once they have a typed resolution.
 The generic `operation observe/receipt/confirm` lifecycle cannot confirm a
 Frontier exchange unless those same typed fields and identities are present.
 

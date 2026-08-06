@@ -293,14 +293,17 @@
       "properties": {
         "requested_policy": {
           "enum": [
+            "unresolved",
             "auto",
             "direct-only",
             "delegated",
-            "frontier"
+            "frontier",
+            "frontier-gated"
           ]
         },
         "effective_route": {
           "enum": [
+            "unresolved",
             "auto",
             "direct",
             "delegated",
@@ -317,8 +320,22 @@
             "null"
           ]
         },
+        "source_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
         "set_at": {
           "type": "string",
+          "format": "date-time"
+        },
+        "resolved_at": {
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "date-time"
         },
         "locked": {
@@ -326,6 +343,35 @@
         }
       },
       "additionalProperties": false
+    },
+    "recovery": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "code": {"type": "string", "minLength": 1},
+        "status": {"enum": ["blocked", "resolved"]},
+        "operation_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+          "uniqueItems": true
+        },
+        "resume_phase": {"type": ["string", "null"]},
+        "blocked_at_revision": {"type": ["integer", "null"], "minimum": 0},
+        "evidence_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "recorded_at": {"type": "string", "format": "date-time"},
+        "resolved_at": {"type": ["string", "null"], "format": "date-time"},
+        "resolved_operation_id": {"type": ["string", "null"], "pattern": "^op-[0-9a-f]{24}$"},
+        "successor_operation_id": {"type": ["string", "null"], "pattern": "^op-[0-9a-f]{24}$"},
+        "remaining_operation_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+          "uniqueItems": true
+        },
+        "reason": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
     },
     "blocker": {
       "type": [
@@ -525,6 +571,13 @@
               "null"
             ],
             "pattern": "^op-[0-9a-f]{24}$"
+          },
+          "attempt_group_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^attempt-[0-9a-f]{24}$"
           }
         }
       }
@@ -1216,6 +1269,60 @@
             "type": "string",
             "minLength": 1
           },
+          "effect_stage": {
+            "enum": [
+              "none",
+              "transport_started",
+              "request_sent",
+              "response_observed"
+            ]
+          },
+          "effective_effect_stage": {
+            "enum": [
+              "none",
+              "transport_started",
+              "request_sent",
+              "response_observed"
+            ]
+          },
+          "pre_effect_absence_proven": {
+            "type": "boolean"
+          },
+          "predecessor_operation_id": {
+            "type": "string",
+            "pattern": "^op-[0-9a-f]{24}$"
+          },
+          "predecessor_operation_ids": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^op-[0-9a-f]{24}$"},
+            "uniqueItems": true
+          },
+          "successor_operation_id": {
+            "type": "string",
+            "pattern": "^op-[0-9a-f]{24}$"
+          },
+          "purpose_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "attempt_group_id": {
+            "type": "string",
+            "pattern": "^attempt-[0-9a-f]{24}$"
+          },
+          "terminal_disposition": {
+            "enum": [
+              "completed_effect",
+              "failed_attempt",
+              "superseded",
+              "abandoned",
+              "ambiguous_effect"
+            ]
+          },
+          "resolution_evidence": {"type": "object"},
+          "resolution_evidence_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
           "status": {
             "enum": [
               "intent",
@@ -1223,7 +1330,8 @@
               "receipt-recorded",
               "confirmed",
               "failed",
-              "abandoned"
+              "abandoned",
+              "superseded"
             ]
           },
           "request_id": {"type": "string", "minLength": 1},
@@ -1377,6 +1485,14 @@
                 "type": "string",
                 "minLength": 1
               },
+              "effect_stage": {
+                "enum": [
+                  "none",
+                  "transport_started",
+                  "request_sent",
+                  "response_observed"
+                ]
+              },
               "effect": {
                 "type": "object"
               },
@@ -1438,6 +1554,9 @@
                 },
                 "effective_status": {
                   "const": "confirmed"
+                },
+                "effect_stage": {
+                  "const": "response_observed"
                 },
                 "effect": {
                   "type": "object"
@@ -1562,7 +1681,8 @@
                 "status": {
                   "enum": [
                     "failed",
-                    "abandoned"
+                    "abandoned",
+                    "superseded"
                   ]
                 }
               },

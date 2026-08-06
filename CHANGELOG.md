@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Added explicit execution-policy resolution for new runs: clear prompts persist
+  their route, while ambiguous prompts reconcile to `REQUEST_EXECUTION_POLICY`
+  before any effect.
+- Added typed recovery for recoverable `blocked/blocked` Frontier failures,
+  atomic confirmed-successor supersession, and historical delegation-attempt
+  semantics.
+- Added a sanitized EigenGrid incident regression covering multiple failed
+  Frontier attempts, a later confirmed plan, an unconsumed authorization, and
+  idempotent recovery without transport replay.
+- Fixed Frontier pre-effect transport failures getting stuck behind an
+  impossible `message_id` recovery precondition. Operations now record effect
+  stages, support proven no-effect retries, and can be typed as abandoned or
+  superseded by a confirmed successor without losing history.
 - Removed hard step ceilings from the continuous orchestrator and frontier transport while retaining bounded scout, worker, and verifier limits.
 - Removed legacy bridge files from the public baseline so Myrmex starts as an independent OpenCode project.
 - Added `myrmex.memory/v1` and the offline `myrmex-memory` project backend:
