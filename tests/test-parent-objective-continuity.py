@@ -29,7 +29,7 @@ def init(env: dict[str, str], repository: str, run_id: str) -> str:
     return run(
         "init", "--run-id", run_id, "--objective", "first bounded task",
         "--parent-objective", "continuous parent objective", "--repository-root", repository,
-        "--mode", "autonomous", "--scope", "continuous", env=env,
+        "--mode", "autonomous", "--scope", "continuous", "--execution-policy", "auto", env=env,
     ).stdout.strip()
 
 

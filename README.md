@@ -19,7 +19,7 @@ smoke test has been run.
 
 ## What it installs
 
-- Primary agent: myrmex-orchestrator, DIRECT by default.
+- Primary agent: myrmex-orchestrator, with an explicit per-run execution policy.
 - Subagents: myrmex-scout, myrmex-worker, myrmex-verifier, and myrmex-frontier.
 - Skills: local delegation, frontier delegation, governed project-memory policy,
   and separate Git delivery gates.
@@ -33,7 +33,7 @@ smoke test has been run.
 
 ## Routes
 
-DIRECT is the default for clear, bounded, reversible work.
+Clear prompts persist their requested route. Ambiguous prompts ask once before any effect; Myrmex never silently assumes `auto`.
 
 DELEGATED uses one bounded writer and an independent verifier when fresh context
 or multi-layer evidence materially helps. A work unit permits at most one scout,

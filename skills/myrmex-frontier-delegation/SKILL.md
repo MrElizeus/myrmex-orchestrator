@@ -23,9 +23,13 @@ Use only for explicit frontier/browser intent or a Myrmex frontier command. Use 
 
 Before sending:
 
-1. Run `myrmex-state doctor` and initialize/resume a run.
-2. Inspect the persisted execution policy. If it is `direct-only`, do not start
-   or recover a Frontier exchange; report the execution-policy blocker.
+1. Run `myrmex-state doctor` and initialize/resume a run. For a new run,
+   persist `frontier-gated` when the prompt or command explicitly requests this
+   skill. If policy is ambiguous, use OpenCode `question` once and persist the
+   answer before effects; never silently assume `auto`.
+2. Inspect the persisted execution policy. If it is `unresolved`, follow
+   `REQUEST_EXECUTION_POLICY`. If it is `direct-only`, do not start or recover a
+   Frontier exchange; report the execution-policy blocker.
 3. Confirm `myrmex-frontier` and Playwright MCP are available with an already authenticated profile/conversation.
 4. Confirm repository evidence can be sanitized without secrets, customer/production data, or unrelated source.
 5. Before browser transport, use `myrmex-state frontier <run-id> start` to
