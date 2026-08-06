@@ -1,0 +1,178 @@
+{
+  "smoke_status": "SUCCESS",
+  "sessions": {
+    "writer_session_id": "ses_028002a29ffeHjLYQ8nXi8HDyi",
+    "verifier_fail_session_id": "ses_028000d74ffenZp9RoAyQFnvLj",
+    "remediator_session_id": "ses_027ffd6d8ffeKRffwediCG58kk",
+    "verifier_pass_session_id": "ses_027ff9303ffe1NOvrG5ro5APXd"
+  },
+  "receipts": {
+    "writer": {
+      "operation_id": "op-smoke-1786035294-WU-SMOKE-01-writer-att1",
+      "campaign_id": "smoke-campaign-p012",
+      "work_unit_id": "WU-SMOKE-01",
+      "run_id": "smoke-1786035294",
+      "role": "writer",
+      "agent": "myrmex-worker",
+      "provider": "opencode",
+      "model": "default",
+      "workspace": "/tmp/myrmex-smoke-ns_sgl45/state/myrmex/worktrees/smoke-campaign-p012/WU-SMOKE-01",
+      "base_sha": "390e350cafde7ad13639a812ad63ee783991edc0",
+      "candidate_sha": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+      "diff_digest": "sha256_writer_diff_digest",
+      "status": "completed",
+      "created_at": "2026-08-06T16:54:54Z",
+      "started_at": "2026-08-06T16:54:59Z",
+      "completed_at": "2026-08-06T16:55:02Z",
+      "task_id": "ses_028002a29ffeHjLYQ8nXi8HDyi",
+      "request_digest": "b4f31ebba390167036432d594fef02e970708de76374fbef23428423f71eecfa",
+      "result_digest": "15cae6e02fee10e120917e135e7148357d70a29a82ce6d21daa89d4850eeeecf",
+      "error_type": null,
+      "receipt": {
+        "schema": "myrmex.task-operation/v1",
+        "phase": "RESULT_RECEIPT_CONFIRMED",
+        "observed_task_id": "ses_028002a29ffeHjLYQ8nXi8HDyi",
+        "result_digest": "15cae6e02fee10e120917e135e7148357d70a29a82ce6d21daa89d4850eeeecf",
+        "result_payload": null,
+        "sanitized_summary": "Created `math_ops.py` with `add(a, b)` returning `a - b` (intentional defect for testing).",
+        "confirmed_at": "2026-08-06T16:55:02Z"
+      }
+    },
+    "verifier_fail": {
+      "operation_id": "op-smoke-1786035294-WU-SMOKE-01-verifier-att1",
+      "campaign_id": "smoke-campaign-p012",
+      "work_unit_id": "WU-SMOKE-01",
+      "run_id": "smoke-1786035294",
+      "role": "verifier",
+      "agent": "myrmex-verifier",
+      "provider": "opencode",
+      "model": "default",
+      "workspace": "/tmp/myrmex-smoke-ns_sgl45/state/myrmex/worktrees/smoke-campaign-p012/WU-SMOKE-01-verifier",
+      "base_sha": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+      "candidate_sha": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+      "diff_digest": "sha256_writer_diff_digest",
+      "status": "failed",
+      "created_at": "2026-08-06T16:55:02Z",
+      "started_at": "2026-08-06T16:55:06Z",
+      "completed_at": "2026-08-06T16:55:16Z",
+      "task_id": "ses_028000d74ffenZp9RoAyQFnvLj",
+      "request_digest": "706eb8ea32e3616e47c9209ce7f892df920b7bd4118262b7483a60f91a7fcee2",
+      "result_digest": "46c6154b8f156e63f9753466672f95838e600237b933a808758ec83b0b215b95",
+      "error_type": null,
+      "receipt": {
+        "schema": "myrmex.task-operation/v1",
+        "phase": "RESULT_RECEIPT_CONFIRMED",
+        "observed_task_id": "ses_028000d74ffenZp9RoAyQFnvLj",
+        "result_digest": "46c6154b8f156e63f9753466672f95838e600237b933a808758ec83b0b215b95",
+        "result_payload": {
+          "decision": "FAIL",
+          "candidate_sha": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+          "diff_digest": "sha256_writer_diff_digest",
+          "defects": [
+            {
+              "file": "math_ops.py",
+              "issue": "add(a,b) subtracts instead of adding"
+            }
+          ],
+          "checks": [
+            "math_ops.py syntax check"
+          ],
+          "residual_risks": []
+        },
+        "sanitized_summary": "{\"decision\": \"FAIL\", \"candidate_sha\": \"b6d2174a5a0383868ab1da3c2a39be7f506f509e\", \"diff_digest\": \"sha256_writer_diff_digest\", \"defects\": [{\"file\": \"math_ops.py\", \"issue\": \"add(a,b) subtracts instead of adding\"}], \"checks\": [\"math_ops.py syntax check\"], \"residual_risks\": []}",
+        "confirmed_at": "2026-08-06T16:55:16Z"
+      }
+    },
+    "remediator": {
+      "operation_id": "op-smoke-1786035294-WU-SMOKE-01-remediator-att1",
+      "campaign_id": "smoke-campaign-p012",
+      "work_unit_id": "WU-SMOKE-01",
+      "run_id": "smoke-1786035294",
+      "role": "remediator",
+      "agent": "myrmex-worker",
+      "provider": "opencode",
+      "model": "default",
+      "workspace": "/tmp/myrmex-smoke-ns_sgl45/state/myrmex/worktrees/smoke-campaign-p012/WU-SMOKE-01",
+      "base_sha": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+      "candidate_sha": "d533db0a91828fc5b3c0155793086133588985cd",
+      "diff_digest": "sha256_remediator_diff_digest",
+      "status": "completed",
+      "created_at": "2026-08-06T16:55:16Z",
+      "started_at": "2026-08-06T16:55:20Z",
+      "completed_at": "2026-08-06T16:55:33Z",
+      "task_id": "ses_027ffd6d8ffeKRffwediCG58kk",
+      "request_digest": "46eff615213a7d525a993175ffdc1612db9e8437a05ab3b3e5ee3b46519efd8f",
+      "result_digest": "a09cb7a9732f095c008af314973f741674992d9371c7b3280820739cfcead984",
+      "error_type": null,
+      "receipt": {
+        "schema": "myrmex.task-operation/v1",
+        "phase": "RESULT_RECEIPT_CONFIRMED",
+        "observed_task_id": "ses_027ffd6d8ffeKRffwediCG58kk",
+        "result_digest": "a09cb7a9732f095c008af314973f741674992d9371c7b3280820739cfcead984",
+        "result_payload": null,
+        "sanitized_summary": "Fixed: `add(a, b)` now returns `a + b`.",
+        "confirmed_at": "2026-08-06T16:55:33Z"
+      }
+    },
+    "verifier_pass": {
+      "operation_id": "op-smoke-1786035294-WU-SMOKE-01-verifier-att2",
+      "campaign_id": "smoke-campaign-p012",
+      "work_unit_id": "WU-SMOKE-01",
+      "run_id": "smoke-1786035294",
+      "role": "verifier",
+      "agent": "myrmex-verifier",
+      "provider": "opencode",
+      "model": "default",
+      "workspace": "/tmp/myrmex-smoke-ns_sgl45/state/myrmex/worktrees/smoke-campaign-p012/WU-SMOKE-01-verifier",
+      "base_sha": "d533db0a91828fc5b3c0155793086133588985cd",
+      "candidate_sha": "d533db0a91828fc5b3c0155793086133588985cd",
+      "diff_digest": "sha256_remediator_diff_digest",
+      "status": "completed",
+      "created_at": "2026-08-06T16:55:33Z",
+      "started_at": "2026-08-06T16:55:37Z",
+      "completed_at": "2026-08-06T16:55:48Z",
+      "task_id": "ses_027ff9303ffe1NOvrG5ro5APXd",
+      "request_digest": "fab173f04fdf2305ce07cd709e3baf0b2e3802883eb35b0d353bc56a243ba05a",
+      "result_digest": "1fe657f03ac02b24f890c16d8e1f65d7e41311a2c005898f1ae0067918eb5ce7",
+      "error_type": null,
+      "receipt": {
+        "schema": "myrmex.task-operation/v1",
+        "phase": "RESULT_RECEIPT_CONFIRMED",
+        "observed_task_id": "ses_027ff9303ffe1NOvrG5ro5APXd",
+        "result_digest": "1fe657f03ac02b24f890c16d8e1f65d7e41311a2c005898f1ae0067918eb5ce7",
+        "result_payload": {
+          "decision": "PASS",
+          "candidate_sha": "d533db0a91828fc5b3c0155793086133588985cd",
+          "diff_digest": "sha256_remediator_diff_digest",
+          "defects": [],
+          "checks": [
+            "math_ops.py syntax check",
+            "unit test PASS"
+          ],
+          "residual_risks": []
+        },
+        "sanitized_summary": "{\"decision\": \"PASS\", \"candidate_sha\": \"d533db0a91828fc5b3c0155793086133588985cd\", \"diff_digest\": \"sha256_remediator_diff_digest\", \"defects\": [], \"checks\": [\"math_ops.py syntax check\", \"unit test PASS\"], \"residual_risks\": []}",
+        "confirmed_at": "2026-08-06T16:55:48Z"
+      }
+    },
+    "ci": {
+      "command": "python3 -m py_compile math_ops.py",
+      "exit_code": 0,
+      "status": "pass",
+      "stdout_digest": "sha256_ci_pass",
+      "timestamp": "2026-08-06T16:55:48Z"
+    },
+    "commit": {
+      "commit_sha": "d533db0a91828fc5b3c0155793086133588985cd",
+      "author": "Myrmex Worker <worker@myrmex.local>",
+      "message": "fix: correct math_ops.py add function",
+      "timestamp": "2026-08-06T16:55:48Z"
+    }
+  },
+  "digests": {
+    "candidate_sha_1": "b6d2174a5a0383868ab1da3c2a39be7f506f509e",
+    "diff_digest_1": "sha256_writer_diff_digest",
+    "candidate_sha_2": "d533db0a91828fc5b3c0155793086133588985cd",
+    "diff_digest_2": "sha256_remediator_diff_digest"
+  }
+}
