@@ -20,3 +20,8 @@ build/
 
 # Local OSS study checkout; never part of the distribution
 external-sources/
+
+# Local orchestrator workspace artifacts
+.atl/
+.myrmex-work/
+.playwright-mcp/

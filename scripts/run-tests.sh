@@ -19,7 +19,7 @@ python3 - "$ROOT" <<'PY'
 from pathlib import Path
 import sys
 root=Path(sys.argv[1])
-for path in [*root.glob('scripts/*.py'), *root.glob('tests/*.py'), root/'bin/myrmex-state', root/'bin/myrmex-memory']:
+for path in [*root.glob('scripts/*.py'), *root.glob('tests/*.py'), root/'bin/myrmex-state', root/'bin/myrmex-memory', root/'bin/myrmex-campaign', root/'bin/myrmex-head']:
     compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 print('syntax compile: PASS')
 PY
@@ -60,6 +60,11 @@ python3 "$ROOT/tests/test-parent-objective-continuity.py"
 python3 "$ROOT/tests/test-local-commit.py"
 python3 "$ROOT/tests/test-memory-cli.py"
 python3 "$ROOT/tests/test-procedural-learning.py"
+python3 "$ROOT/tests/test-campaign-schema-and-store.py"
+python3 "$ROOT/tests/test-campaign-dag.py"
+python3 "$ROOT/tests/test-campaign-budget-and-policy.py"
+python3 "$ROOT/tests/test-campaign-supervisor-head.py"
+python3 "$ROOT/tests/test-campaign-closed-loop-soak.py"
 if command -v node >/dev/null 2>&1; then
   node "$ROOT/tests/test-frontier-dom.js"
 else

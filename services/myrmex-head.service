@@ -1,0 +1,20 @@
+[Unit]
+Description=Myrmex Autonomous Campaign Supervisor
+Documentation=https://github.com/MrElizeus/myrmex-orchestrator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/myrmex-head
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+KillMode=mixed
+SendSIGKILL=yes
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=default.target

@@ -235,6 +235,36 @@ def main() -> int:
         except Exception as exc:
             errors.append(f"myrmex-memory doctor error: {exc}")
 
+    campaign_bin = bin_dir / "myrmex-campaign"
+    if not campaign_bin.is_file():
+        errors.append(f"missing {campaign_bin}")
+    elif not os.access(campaign_bin, os.X_OK):
+        errors.append(f"campaign CLI is not executable: {campaign_bin}")
+    else:
+        try:
+            with tempfile.TemporaryDirectory(prefix="myrmex-camp-doctor-") as td:
+                env = os.environ.copy()
+                env["XDG_STATE_HOME"] = td
+                proc = subprocess.run([str(campaign_bin), "doctor"], capture_output=True, text=True, timeout=20, env=env)
+            if proc.returncode != 0:
+                errors.append(f"myrmex-campaign doctor failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            else:
+                payload = json.loads(proc.stdout)
+                if not payload.get("ok"):
+                    errors.append("myrmex-campaign doctor returned ok=false")
+                else:
+                    checks.append(f"myrmex-campaign:{campaign_bin}")
+        except Exception as exc:
+            errors.append(f"myrmex-campaign doctor error: {exc}")
+
+    head_bin = bin_dir / "myrmex-head"
+    if not head_bin.is_file():
+        errors.append(f"missing {head_bin}")
+    elif not os.access(head_bin, os.X_OK):
+        errors.append(f"head supervisor CLI is not executable: {head_bin}")
+    else:
+        checks.append(f"myrmex-head:{head_bin}")
+
     resolution_script = Path(__file__).with_name("inspect-agent-resolution.py")
     if resolution_script.is_file():
         try:
