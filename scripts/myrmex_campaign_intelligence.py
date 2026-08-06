@@ -91,6 +91,15 @@ _RAW_CONTENT_KEYS = frozenset({
     "raw_diff", "patch", "raw_log", "raw_prompt",
 })
 
+# The exact, closed set of artifact-envelope fields. Envelopes carrying any
+# additional field (or missing any of these) are invalid; unknown field values
+# are never echoed in validation errors.
+_ARTIFACT_ENVELOPE_FIELDS = frozenset({
+    "schema", "campaign_id", "artifact_id", "kind",
+    "artifact_digest", "payload_digest", "observed_campaign_revision",
+    "created_at", "payload",
+})
+
 
 def _compact_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
@@ -345,6 +354,17 @@ def _validate_artifact_envelope(
 ) -> dict[str, Any]:
     if not isinstance(envelope, dict):
         raise IntelligenceArtifactInvalid("artifact envelope is not a JSON object")
+    actual_fields = set(envelope.keys())
+    if actual_fields != _ARTIFACT_ENVELOPE_FIELDS:
+        extra = sorted(actual_fields - _ARTIFACT_ENVELOPE_FIELDS)
+        missing = sorted(_ARTIFACT_ENVELOPE_FIELDS - actual_fields)
+        raise IntelligenceArtifactInvalid(
+            "artifact envelope must contain exactly the fields "
+            "schema, campaign_id, artifact_id, kind, artifact_digest, "
+            "payload_digest, observed_campaign_revision, created_at, payload"
+            + (f"; unexpected field(s): {extra!r}" if extra else "")
+            + (f"; missing field(s): {missing!r}" if missing else "")
+        )
     if envelope.get("schema") != ARTIFACT_SCHEMA:
         raise IntelligenceArtifactInvalid(
             f"unsupported artifact schema {envelope.get('schema')!r}"
@@ -365,6 +385,16 @@ def _validate_artifact_envelope(
     payload = envelope.get("payload")
     if not isinstance(payload, dict):
         raise IntelligenceArtifactInvalid("artifact envelope payload is not a JSON object")
+    # Re-apply the content-safety invariant on persisted artifacts. A tampered
+    # artifact whose payload carries secret/raw content is treated as an
+    # artifact-invalid failure (read/doctor/rebuild semantics); the converted
+    # message never carries secret material.
+    try:
+        reject_secret_or_raw(payload)
+    except IntelligencePayloadRejected as exc:
+        raise IntelligenceArtifactInvalid(
+            "artifact payload violates the content-safety policy"
+        ) from exc
     if compute_payload_digest(payload) != envelope.get("payload_digest"):
         raise IntelligenceArtifactInvalid(
             "artifact payload_digest does not match the payload"
@@ -761,7 +791,7 @@ def list_artifacts(
         raise IntelligenceProjectionInvalid("projection path is a symbolic link")
     try:
         projection = _read_projection_file(campaign_dir, campaign_id)
-    except IntelligenceProjectionInvalid as exc:
+    except (IntelligenceProjectionInvalid, IntelligenceCampaignMismatch) as exc:
         return {
             "ok": True,
             "status": "projection_stale",
@@ -813,6 +843,7 @@ def doctor(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
         }
 
     details: list[str] = []
+    mode_issues: list[str] = []
     iroot = _iroot(campaign_dir)
     if not iroot.exists():
         return {
@@ -873,13 +904,49 @@ def doctor(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
                 "details": [f"{label} is not a regular file"],
             }
         if (st.st_mode & 0o777) != expected_mode:
-            details.append(f"{label} mode is {oct(st.st_mode & 0o777)}")
+            mode_issues.append(f"{label} mode is {oct(st.st_mode & 0o777)}")
 
-    # Validate every stored artifact; corrupt artifacts are reported, never omitted.
+    # Private-mode violations make doctor non-healthy: the required modes are
+    # intelligence/ 0700, intelligence/artifacts/ 0700, intelligence/lock 0600,
+    # projection.json 0600, and every artifact file 0600. Details only carry
+    # non-sensitive mode information.
+    if mode_issues:
+        return {
+            "ok": False,
+            "status": "artifact_corrupt",
+            "campaign_id": campaign_id,
+            "details": mode_issues,
+        }
+
+    # Validate every stored artifact; corrupt artifacts are reported, never
+    # omitted. A stored artifact with a non-0600 mode is itself a health failure.
     artifacts_dir_exists = arts_dir.exists()
     stored = []
     if artifacts_dir_exists:
         for path in sorted(arts_dir.glob("*.json")):
+            try:
+                st = path.lstat()
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "status": "artifact_corrupt",
+                    "campaign_id": campaign_id,
+                    "details": [f"cannot stat artifact {path.name}: {exc}"],
+                }
+            if not stat.S_ISREG(st.st_mode):
+                return {
+                    "ok": False,
+                    "status": "artifact_corrupt",
+                    "campaign_id": campaign_id,
+                    "details": [f"artifact {path.name} is not a regular file"],
+                }
+            if (st.st_mode & 0o777) != _FILE_MODE:
+                return {
+                    "ok": False,
+                    "status": "artifact_corrupt",
+                    "campaign_id": campaign_id,
+                    "details": [f"artifact {path.name} mode is {oct(st.st_mode & 0o777)}"],
+                }
             try:
                 envelope = _read_artifact_file(path, campaign_id)
             except IntelligenceStoreError as exc:
@@ -902,7 +969,7 @@ def doctor(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
 
     try:
         projection = _read_projection_file(campaign_dir, campaign_id)
-    except IntelligenceProjectionInvalid as exc:
+    except (IntelligenceProjectionInvalid, IntelligenceCampaignMismatch) as exc:
         return {
             "ok": False,
             "status": "projection_stale",

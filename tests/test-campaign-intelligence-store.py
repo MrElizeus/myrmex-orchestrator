@@ -725,6 +725,151 @@ def test_projection_digest_tamper_reported_stale() -> None:
 
 
 # --------------------------------------------------------------------------
+# Frontier corrective-plan regression tests (WU-P1-002-C)
+# --------------------------------------------------------------------------
+
+def test_unknown_envelope_field_rejected_everywhere() -> None:
+    with tempfile.TemporaryDirectory(prefix="intel-corr-env-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        p = write_payload(Path(td) / "inputs" / "p.json", {"title": "Clean"})
+        put(td, "camp-intel", "plan", "env-id", p)
+        artifact_file = next(artifacts_dir(td).glob("*.json"))
+        envelope = json.loads(artifact_file.read_text(encoding="utf-8"))
+        envelope["unexpected_extra"] = {"nested": "forbidden-value"}
+        artifact_file.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+
+        show = run_campaign(["intelligence-show", "camp-intel", "--artifact-id", "env-id"], td)
+        assert show.returncode == EXIT_INVALID, show.stdout
+        show_out = show.stdout + show.stderr
+        assert "forbidden-value" not in show_out, "unknown field values must never be echoed"
+        assert json.loads(show.stdout)["status"] == "artifact_invalid", show.stdout
+        ok("show rejects an artifact with one unknown envelope field without echoing its value")
+
+        doc = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc["status"] == "artifact_corrupt", doc
+        assert doc["ok"] is False
+        assert "forbidden-value" not in json.dumps(doc)
+        assert run_campaign(["intelligence-doctor", "camp-intel"], td).returncode == 1
+        ok("doctor reports artifact_corrupt for an unknown envelope field")
+
+        rebuild = run_campaign(["intelligence-rebuild", "camp-intel"], td)
+        assert rebuild.returncode == EXIT_INVALID, rebuild.stdout
+        assert json.loads(rebuild.stdout)["status"] == "rebuild_failed", rebuild.stdout
+        assert "forbidden-value" not in (rebuild.stdout + rebuild.stderr)
+        ok("rebuild fails explicitly on an unknown envelope field")
+
+
+def test_prohibited_payload_content_detected_on_read() -> None:
+    with tempfile.TemporaryDirectory(prefix="intel-corr-sec-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        p = write_payload(Path(td) / "inputs" / "p.json", {"title": "Clean"})
+        put(td, "camp-intel", "plan", "sec-id", p)
+        artifact_file = next(artifacts_dir(td).glob("*.json"))
+
+        # Tamper the payload with a prohibited secret key/value, then recompute
+        # both digests so the artifact is digest-consistent but policy-invalid.
+        tampered = {"title": "Clean", "password": "hunter2"}
+        envelope = json.loads(artifact_file.read_text(encoding="utf-8"))
+        envelope["payload"] = tampered
+        envelope["payload_digest"] = intel.compute_payload_digest(tampered)
+        envelope["artifact_digest"] = intel.compute_artifact_digest(
+            envelope["campaign_id"], envelope["kind"], envelope["artifact_id"], tampered
+        )
+        artifact_file.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+
+        show = run_campaign(["intelligence-show", "camp-intel", "--artifact-id", "sec-id"], td)
+        assert show.returncode == EXIT_INVALID, show.stdout
+        assert "hunter2" not in (show.stdout + show.stderr), "prohibited value must not be echoed"
+        assert json.loads(show.stdout)["status"] == "artifact_invalid", show.stdout
+        ok("show rejects a digest-consistent artifact with prohibited payload content")
+
+        doc = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc["status"] == "artifact_corrupt", doc
+        assert doc["ok"] is False
+        assert "hunter2" not in json.dumps(doc), "prohibited value must not be echoed by doctor"
+        assert run_campaign(["intelligence-doctor", "camp-intel"], td).returncode == 1
+        ok("doctor reports artifact_corrupt for prohibited payload content without echoing it")
+
+        rebuild = run_campaign(["intelligence-rebuild", "camp-intel"], td)
+        assert rebuild.returncode == EXIT_INVALID, rebuild.stdout
+        assert json.loads(rebuild.stdout)["status"] == "rebuild_failed", rebuild.stdout
+        assert "hunter2" not in (rebuild.stdout + rebuild.stderr)
+        ok("rebuild fails explicitly on prohibited payload content without echoing it")
+
+        listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], td).stdout)
+        assert "hunter2" not in json.dumps(listing), "corrupt artifact must never be silently indexed"
+        ok("the corrupt artifact is never silently indexed")
+
+
+def test_projection_campaign_mismatch_is_stale_not_repaired() -> None:
+    with tempfile.TemporaryDirectory(prefix="intel-corr-proj-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        p = write_payload(Path(td) / "inputs" / "p.json", {"title": "X"})
+        put(td, "camp-intel", "plan", "plan-1", p)
+        proj = campaign_dir(td) / "intelligence" / "projection.json"
+        data = json.loads(proj.read_text(encoding="utf-8"))
+        data["campaign_id"] = "camp-other"
+        proj.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tampered_bytes = proj.read_bytes()
+
+        listing = json.loads(run_campaign(["intelligence-list", "camp-intel"], td).stdout)
+        assert listing["status"] == "projection_stale", listing
+        assert proj.read_bytes() == tampered_bytes, "list must not rewrite the foreign projection"
+        ok("intelligence-list returns projection_stale for a different campaign_id without rewriting it")
+
+        doc = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert doc["status"] == "projection_stale", doc
+        assert doc["ok"] is False
+        assert proj.read_bytes() == tampered_bytes, "doctor must not repair the foreign projection"
+        ok("intelligence-doctor returns projection_stale for a different campaign_id without repairing it")
+
+
+def test_private_mode_violations_fail_doctor_and_restore_heals() -> None:
+    with tempfile.TemporaryDirectory(prefix="intel-corr-mode-") as td:
+        repo = Path(td) / "repo"
+        repo.mkdir()
+        init_campaign(td, "camp-intel", repo)
+        p = write_payload(Path(td) / "inputs" / "p.json", {"x": 1})
+        put(td, "camp-intel", "plan", "mode-plan", p)
+
+        iroot = campaign_dir(td) / "intelligence"
+        arts = iroot / "artifacts"
+        lock = iroot / "lock"
+        proj = iroot / "projection.json"
+        artifact_file = next(arts.glob("*.json"))
+
+        targets = [
+            ("intelligence dir", iroot, 0o700, 0o755),
+            ("artifacts dir", arts, 0o700, 0o755),
+            ("lock file", lock, 0o600, 0o644),
+            ("projection file", proj, 0o600, 0o644),
+            ("artifact file", artifact_file, 0o600, 0o644),
+        ]
+        for label, path, _required, bad_mode in targets:
+            os.chmod(path, bad_mode)
+            proc = run_campaign(["intelligence-doctor", "camp-intel"], td)
+            doc = json.loads(proc.stdout)
+            assert proc.returncode == 1, f"{label}: doctor must be non-healthy ({proc.stdout})"
+            assert doc["status"] == "artifact_corrupt", f"{label}: {doc}"
+            assert doc["ok"] is False
+            assert "0o755" in json.dumps(doc) or "0o644" in json.dumps(doc), (
+                f"{label}: details must carry the non-sensitive mode"
+            )
+            ok(f"doctor non-healthy after chmod of {label}")
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+
+        final = json.loads(run_campaign(["intelligence-doctor", "camp-intel"], td).stdout)
+        assert final["status"] == "healthy" and final["ok"] is True, final
+        ok("restoring required modes makes doctor healthy again")
+
+
+# --------------------------------------------------------------------------
 # Compatibility
 # --------------------------------------------------------------------------
 
@@ -785,6 +930,10 @@ def main() -> int:
         test_crash_after_artifact_before_projection_recovery,
         test_corrupt_artifact_reported_and_rebuild_fails_explicitly,
         test_projection_digest_tamper_reported_stale,
+        test_unknown_envelope_field_rejected_everywhere,
+        test_prohibited_payload_content_detected_on_read,
+        test_projection_campaign_mismatch_is_stale_not_repaired,
+        test_private_mode_violations_fail_doctor_and_restore_heals,
         test_campaign_v1_schema_and_existing_commands_unchanged,
         test_no_update_or_delete_command_exists,
     ]
