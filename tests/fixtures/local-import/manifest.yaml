@@ -1,0 +1,24 @@
+title: Myrmex Manifest
+constraints:
+  - Preserve P0
+  - English-first
+objectives:
+  - id: obj-intelligence
+    title: Intelligence
+    constraints:
+      - Deterministic
+    items:
+      - id: item-planner
+        title: Planner
+        priority: 1
+        depends_on:
+          - item-store
+        constraints:
+          - Bounded
+items:
+  - id: item-store
+    title: Store
+    objective: obj-intelligence
+    priority: P0
+    constraints:
+      - Immutable
