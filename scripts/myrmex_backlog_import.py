@@ -37,6 +37,8 @@ excluding record_id/record_digest.
 """
 from __future__ import annotations
 
+import copy
+import datetime as dt
 import hashlib
 import json
 import re
@@ -63,6 +65,28 @@ SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 LIFECYCLE_STATUSES = ("intent", "effect-observed", "receipt-recorded", "confirmed")
 OUTCOMES = ("changed", "unchanged", "unavailable", "invalid", "ambiguous")
+
+# Exact runtime field sets mirroring the committed 2020-12 schemas. Recovery
+# and construction validation reject any unknown or missing field so that a
+# locally tampered record cannot be accepted on its own internally consistent
+# digests.
+SOURCE_OBSERVATION_FIELDS = frozenset({
+    "schema", "observation_id", "observation_digest", "campaign_id",
+    "operation_id", "source_identity", "adapter", "request_digest",
+    "previous_content_digest", "observed_version", "content_digest",
+    "outcome", "reason_code", "observed_at", "authority",
+})
+IMPORT_RECORD_FIELDS = frozenset({
+    "schema", "record_id", "record_digest", "operation_id", "idempotency_key",
+    "campaign_id", "source_identity", "adapter", "request", "request_digest",
+    "previous_content_digest", "status", "effect_stage", "observation",
+    "receipt", "previous_record_id", "authority", "created_at",
+})
+OBSERVATION_REF_FIELDS = frozenset({"observation_id", "observation_digest", "outcome"})
+RECEIPT_FIELDS = frozenset({
+    "receipt_id", "receipt_digest", "operation_id", "observation_id",
+    "observation_digest", "request_digest", "outcome",
+})
 
 # Bounded authority blocks. Only external_read is true; every effect flag
 # (repository_write, create_work_units, activate_plan, commit, push, merge,
@@ -196,21 +220,57 @@ def _validate_campaign_id(campaign_id: Any) -> None:
         )
 
 
-def _validate_source_identity(source_identity: Any) -> None:
+def _source_identity_errors(source_identity: Any) -> list[str]:
+    """Return exact-shape violations for a source identity block."""
     if not isinstance(source_identity, dict) or set(source_identity) != {"kind", "canonical_id"}:
-        raise ImportOperationInvalid(
-            "source_identity must contain exactly the fields kind and canonical_id"
-        )
+        return ["source_identity must contain exactly the fields kind and canonical_id"]
+    errors: list[str] = []
     kind = source_identity.get("kind")
     if not isinstance(kind, str) or not SOURCE_KIND_RE.match(kind):
-        raise ImportOperationInvalid(
-            "source_identity.kind must match ^[a-z][a-z0-9._-]{0,63}$"
-        )
+        errors.append("source_identity.kind must match ^[a-z][a-z0-9._-]{0,63}$")
     canonical_id = source_identity.get("canonical_id")
     if not isinstance(canonical_id, str) or not (1 <= len(canonical_id) <= 512):
-        raise ImportOperationInvalid(
-            "source_identity.canonical_id must be a string of 1..512 characters"
-        )
+        errors.append("source_identity.canonical_id must be a string of 1..512 characters")
+    return errors
+
+
+def _validate_source_identity(source_identity: Any) -> None:
+    errors = _source_identity_errors(source_identity)
+    if errors:
+        raise ImportOperationInvalid("; ".join(errors))
+
+
+def _authority_errors(authority: Any, expected: dict[str, Any]) -> list[str]:
+    """Return a violation when an authority block is not the exact bounded block.
+
+    Dict equality is exact: unknown fields, missing fields, repository
+    authority, or any raised effect flag (create_work_units, activate_plan,
+    ...) all diverge and become invalid.
+    """
+    if not isinstance(authority, dict) or authority != expected:
+        return [
+            f"authority must equal the bounded {expected['scope']} block exactly "
+            "(external_read only; every effect flag false)"
+        ]
+    return []
+
+
+def _previous_content_digest_errors(value: Any) -> list[str]:
+    if value is not None and (
+        not isinstance(value, str) or not SHA256_HEX_RE.match(value)
+    ):
+        return ["previous_content_digest must be null or a 64-hex SHA-256 digest"]
+    return []
+
+
+def _rfc3339_datetime_errors(value: Any) -> list[str]:
+    if not isinstance(value, str) or not value:
+        return ["must be a non-empty RFC3339 date-time string"]
+    try:
+        dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return ["must be an RFC3339 date-time string"]
+    return []
 
 
 def _validate_idempotency_key(idempotency_key: Any) -> None:
@@ -226,12 +286,9 @@ def _validate_adapter(adapter: Any) -> None:
 
 
 def _validate_previous_content_digest(value: Any) -> None:
-    if value is not None and (
-        not isinstance(value, str) or not SHA256_HEX_RE.match(value)
-    ):
-        raise ImportOperationInvalid(
-            "previous_content_digest must be null or a 64-hex SHA-256 digest"
-        )
+    errors = _previous_content_digest_errors(value)
+    if errors:
+        raise ImportOperationInvalid("; ".join(errors))
 
 
 def _validate_request(request: Any) -> None:
@@ -459,12 +516,40 @@ def _observation_ref(observation: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def validate_source_observation_semantics(observation: dict[str, Any]) -> list[str]:
-    """Return invariant violations for a source-observation payload."""
+    """Return invariant violations for a source-observation payload.
+
+    Enforces the exact closed field set of the committed schema plus the
+    identity/authority/digest/outcome invariants the schema cannot express.
+    """
     errors: list[str] = []
     if not isinstance(observation, dict):
         return ["source observation must be an object"]
+    if set(observation) != SOURCE_OBSERVATION_FIELDS:
+        errors.append(
+            "source observation must contain exactly the fields "
+            + ", ".join(sorted(SOURCE_OBSERVATION_FIELDS))
+        )
     if observation.get("schema") != SOURCE_OBSERVATION_SCHEMA:
         errors.append("schema must be myrmex.source-observation/v1")
+    campaign_id = observation.get("campaign_id")
+    if not isinstance(campaign_id, str) or not CAMPAIGN_ID_RE.match(campaign_id):
+        errors.append("invalid campaign_id; must match ^camp-[a-z0-9][a-z0-9-]{4,60}$")
+    operation_id = observation.get("operation_id")
+    if not isinstance(operation_id, str) or not OPERATION_ID_RE.match(operation_id):
+        errors.append("invalid operation_id; must match ^importop-[0-9a-f]{24}$")
+    errors.extend(_source_identity_errors(observation.get("source_identity")))
+    adapter = observation.get("adapter")
+    if not isinstance(adapter, str) or len(adapter) < 1:
+        errors.append("adapter must be a non-empty string")
+    request_digest = observation.get("request_digest")
+    if not isinstance(request_digest, str) or not SHA256_HEX_RE.match(request_digest):
+        errors.append("request_digest must be a 64-hex SHA-256 digest")
+    errors.extend(_previous_content_digest_errors(observation.get("previous_content_digest")))
+    if observation.get("outcome") in OUTCOMES:
+        observed_at = observation.get("observed_at")
+        if _rfc3339_datetime_errors(observed_at):
+            errors.append("observed_at must be an RFC3339 date-time string")
+    errors.extend(_authority_errors(observation.get("authority"), OBSERVATION_AUTHORITY))
     if observation.get("observation_digest") != compute_observation_digest(observation):
         errors.append("observation_digest does not match canonical digest of the observation")
     if observation.get("observation_id") != "srcobs_" + str(observation.get("observation_digest", "")):
@@ -511,10 +596,45 @@ def validate_source_observation_semantics(observation: dict[str, Any]) -> list[s
 
 
 def validate_receipt_semantics(receipt: dict[str, Any]) -> list[str]:
-    """Return invariant violations for a receipt object."""
+    """Return invariant violations for a receipt object.
+
+    Enforces the exact closed field set of the import-operation schema's
+    receipt member plus digest/identity derivations.
+    """
     errors: list[str] = []
     if not isinstance(receipt, dict):
         return ["receipt must be an object"]
+    if set(receipt) != RECEIPT_FIELDS:
+        errors.append(
+            "receipt must contain exactly the fields receipt_id, receipt_digest, "
+            "operation_id, observation_id, observation_digest, request_digest, outcome"
+        )
+    if not isinstance(receipt.get("receipt_id"), str) or not RECEIPT_ID_RE.match(
+        receipt.get("receipt_id", "")
+    ):
+        errors.append("invalid receipt_id; must match ^imprcpt_[0-9a-f]{64}$")
+    if not isinstance(receipt.get("receipt_digest"), str) or not SHA256_HEX_RE.match(
+        receipt.get("receipt_digest", "")
+    ):
+        errors.append("invalid receipt_digest; must be a 64-hex SHA-256 digest")
+    if not isinstance(receipt.get("operation_id"), str) or not OPERATION_ID_RE.match(
+        receipt.get("operation_id", "")
+    ):
+        errors.append("invalid receipt operation_id; must match ^importop-[0-9a-f]{24}$")
+    if not isinstance(receipt.get("observation_id"), str) or not OBSERVATION_ID_RE.match(
+        receipt.get("observation_id", "")
+    ):
+        errors.append("invalid receipt observation_id; must match ^srcobs_[0-9a-f]{64}$")
+    if not isinstance(receipt.get("observation_digest"), str) or not SHA256_HEX_RE.match(
+        receipt.get("observation_digest", "")
+    ):
+        errors.append("invalid receipt observation_digest; must be a 64-hex SHA-256 digest")
+    if not isinstance(receipt.get("request_digest"), str) or not SHA256_HEX_RE.match(
+        receipt.get("request_digest", "")
+    ):
+        errors.append("invalid receipt request_digest; must be a 64-hex SHA-256 digest")
+    if receipt.get("outcome") not in OUTCOMES:
+        errors.append("invalid receipt outcome")
     if receipt.get("receipt_digest") != compute_receipt_digest(receipt):
         errors.append("receipt_digest does not match canonical digest of the receipt")
     if receipt.get("receipt_id") != "imprcpt_" + str(receipt.get("receipt_digest", "")):
@@ -523,12 +643,41 @@ def validate_receipt_semantics(receipt: dict[str, Any]) -> list[str]:
 
 
 def validate_import_record_semantics(record: dict[str, Any]) -> list[str]:
-    """Return invariant violations for an import-operation record payload."""
+    """Return invariant violations for an import-operation record payload.
+
+    Enforces the exact closed field set of the committed schema plus the
+    identity/authority/digest/status/reference/receipt invariants the schema
+    cannot express.
+    """
     errors: list[str] = []
     if not isinstance(record, dict):
         return ["import operation record must be an object"]
+    if set(record) != IMPORT_RECORD_FIELDS:
+        errors.append(
+            "import operation record must contain exactly the fields "
+            + ", ".join(sorted(IMPORT_RECORD_FIELDS))
+        )
     if record.get("schema") != IMPORT_OPERATION_SCHEMA:
         errors.append("schema must be myrmex.import-operation/v1")
+    campaign_id = record.get("campaign_id")
+    if not isinstance(campaign_id, str) or not CAMPAIGN_ID_RE.match(campaign_id):
+        errors.append("invalid campaign_id; must match ^camp-[a-z0-9][a-z0-9-]{4,60}$")
+    operation_id = record.get("operation_id")
+    if not isinstance(operation_id, str) or not OPERATION_ID_RE.match(operation_id):
+        errors.append("invalid operation_id; must match ^importop-[0-9a-f]{24}$")
+    idempotency_key = record.get("idempotency_key")
+    if not isinstance(idempotency_key, str) or not (1 <= len(idempotency_key) <= 256):
+        errors.append("idempotency_key must be a string of 1..256 characters")
+    errors.extend(_source_identity_errors(record.get("source_identity")))
+    adapter = record.get("adapter")
+    if not isinstance(adapter, str) or len(adapter) < 1:
+        errors.append("adapter must be a non-empty string")
+    errors.extend(_previous_content_digest_errors(record.get("previous_content_digest")))
+    if record.get("status") in LIFECYCLE_STATUSES:
+        created_at = record.get("created_at")
+        if _rfc3339_datetime_errors(created_at):
+            errors.append("created_at must be an RFC3339 date-time string")
+    errors.extend(_authority_errors(record.get("authority"), IMPORT_AUTHORITY))
     if record.get("record_digest") != compute_record_digest(record):
         errors.append("record_digest does not match canonical digest of the record")
     if record.get("record_id") != "importrec_" + str(record.get("record_digest", "")):
@@ -539,8 +688,53 @@ def validate_import_record_semantics(record: dict[str, Any]) -> list[str]:
     if record.get("operation_id") != expected_operation_id:
         errors.append("operation_id is not derived from {campaign_id, idempotency_key}")
     request = record.get("request")
-    if not isinstance(request, dict) or record.get("request_digest") != compute_request_digest(request):
-        errors.append("request_digest does not match canonical digest of the request")
+    if not isinstance(request, dict):
+        errors.append("request must be a JSON object")
+    else:
+        expected_request_digest = compute_request_digest(request)
+        if record.get("request_digest") != expected_request_digest:
+            errors.append("request_digest does not match canonical digest of the request")
+    # Observation reference: exact shape when present.
+    obs_ref = record.get("observation")
+    if obs_ref is not None:
+        if not isinstance(obs_ref, dict) or set(obs_ref) != OBSERVATION_REF_FIELDS:
+            errors.append(
+                "observation reference must contain exactly observation_id, "
+                "observation_digest, outcome"
+            )
+        else:
+            if not isinstance(obs_ref.get("observation_id"), str) or not OBSERVATION_ID_RE.match(
+                obs_ref.get("observation_id", "")
+            ):
+                errors.append("observation reference observation_id must match ^srcobs_[0-9a-f]{64}$")
+            if not isinstance(obs_ref.get("observation_digest"), str) or not SHA256_HEX_RE.match(
+                obs_ref.get("observation_digest", "")
+            ):
+                errors.append(
+                    "observation reference observation_digest must be a 64-hex SHA-256 digest"
+                )
+            if obs_ref.get("outcome") not in OUTCOMES:
+                errors.append(
+                    "observation reference outcome must be one of " + ", ".join(OUTCOMES)
+                )
+            if obs_ref.get("observation_id") != "srcobs_" + str(obs_ref.get("observation_digest", "")):
+                errors.append(
+                    "observation reference observation_id is not derived from observation_digest"
+                )
+    # Receipt: exact shape + deterministic semantics when present.
+    receipt = record.get("receipt")
+    if receipt is not None:
+        errors.extend(validate_receipt_semantics(receipt))
+        if isinstance(obs_ref, dict):
+            expected_receipt = _build_receipt(
+                operation_id=str(record.get("operation_id", "")),
+                observation_id=str(obs_ref.get("observation_id", "")),
+                observation_digest=str(obs_ref.get("observation_digest", "")),
+                request_digest=str(record.get("request_digest", "")),
+                outcome=str(obs_ref.get("outcome", "")),
+            )
+            if receipt != expected_receipt:
+                errors.append("receipt is not deterministic for this operation")
     status = record.get("status")
     if status == "intent":
         if record.get("effect_stage") != "none":
@@ -601,6 +795,58 @@ def validate_lifecycle_chain(records: list[dict[str, Any]]) -> list[str]:
         ):
             if record.get(field) != records[0].get(field):
                 errors.append(f"{record.get('status')} {field} differs from intent")
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Immutable-purpose intent matching (recovery guards)
+# ---------------------------------------------------------------------------
+
+def _intent_mismatch_errors(record: dict[str, Any], intent: dict[str, Any]) -> list[str]:
+    """Return violations when a record's immutable purpose diverges from intent.
+
+    Compares exactly operation_id, idempotency_key, campaign_id,
+    source_identity, adapter, request, request_digest, previous_content_digest
+    and authority. A locally tampered record that recomputed its own digests is
+    still rejected here because the purpose fields diverge from the durable
+    intent.
+    """
+    errors: list[str] = []
+    for field in (
+        "operation_id", "idempotency_key", "campaign_id", "source_identity",
+        "adapter", "request", "request_digest", "previous_content_digest",
+        "authority",
+    ):
+        if record.get(field) != intent.get(field):
+            errors.append(f"{record.get('status')!r} {field} differs from the durable intent")
+    return errors
+
+
+def _validate_record_matches_intent(record: dict[str, Any], intent: dict[str, Any]) -> None:
+    """Raise ImportOperationInvalid when a recovered record diverges from intent."""
+    errors = _intent_mismatch_errors(record, intent)
+    if errors:
+        raise ImportOperationInvalid(
+            "recovered import record does not match the durable intent: "
+            + "; ".join(errors)
+        )
+
+
+def _observation_mismatch_errors(
+    observation: dict[str, Any], stored_intent: dict[str, Any]
+) -> list[str]:
+    """Return violations when an observation diverges from the durable intent."""
+    errors: list[str] = []
+    for field in (
+        "campaign_id", "operation_id", "source_identity", "adapter",
+        "request_digest", "previous_content_digest",
+    ):
+        if observation.get(field) != stored_intent.get(field):
+            errors.append(f"observation {field} does not match the intent")
+    if observation.get("authority") != OBSERVATION_AUTHORITY:
+        errors.append(
+            "observation authority must equal the bounded source-observation block exactly"
+        )
     return errors
 
 
@@ -672,10 +918,10 @@ def _validate_intent_matches(stored: dict[str, Any], expected: dict[str, Any]) -
 def _validate_stored_observation(
     observation: dict[str, Any], stored_intent: dict[str, Any]
 ) -> None:
+    """Replay guard: the stored observation must satisfy the full contract and
+    match the durable intent for every identity-bearing field."""
     errors = validate_source_observation_semantics(observation)
-    for field in ("operation_id", "request_digest", "campaign_id"):
-        if observation.get(field) != stored_intent.get(field):
-            errors.append(f"observation {field} does not match the intent")
+    errors.extend(_observation_mismatch_errors(observation, stored_intent))
     if errors:
         raise ImportOperationInvalid(
             "stored source observation is inconsistent: " + "; ".join(errors)
@@ -688,15 +934,21 @@ def _validate_recovered_chain(
     receipt_recorded: dict[str, Any] | None,
     observation: dict[str, Any],
 ) -> None:
-    """Validate a partially recovered chain before extending it."""
+    """Validate a partially recovered chain before extending it.
+
+    Every recovered record is validated locally AND against the full
+    immutable-purpose equality with the durable intent; exact previous-record
+    causality and exact observation-reference continuity are enforced. A record
+    from another operation/source is rejected even when its own digests are
+    internally consistent.
+    """
     errors: list[str] = []
     errors.extend(validate_import_record_semantics(stored_intent))
     errors.extend(validate_source_observation_semantics(observation))
-    for field in ("operation_id", "request_digest", "campaign_id"):
-        if observation.get(field) != stored_intent.get(field):
-            errors.append(f"observation {field} does not match the intent")
+    errors.extend(_observation_mismatch_errors(observation, stored_intent))
     if effect is not None:
         errors.extend(validate_import_record_semantics(effect))
+        errors.extend(_intent_mismatch_errors(effect, stored_intent))
         if effect.get("status") != "effect-observed":
             errors.append("stored record has a status other than effect-observed")
         if effect.get("previous_record_id") != stored_intent.get("record_id"):
@@ -705,6 +957,7 @@ def _validate_recovered_chain(
             errors.append("effect-observed observation reference does not match the stored observation")
     if receipt_recorded is not None:
         errors.extend(validate_import_record_semantics(receipt_recorded))
+        errors.extend(_intent_mismatch_errors(receipt_recorded, stored_intent))
         if receipt_recorded.get("status") != "receipt-recorded":
             errors.append("stored record has a status other than receipt-recorded")
         if effect is not None and receipt_recorded.get("previous_record_id") != effect.get("record_id"):
@@ -748,7 +1001,11 @@ def _validate_confirmed_chain(
             "confirmed exists without the full lifecycle chain"
         )
     _validate_recovered_chain(stored_intent, effect, receipt_recorded, observation)
+    _validate_record_matches_intent(confirmed, stored_intent)
     errors = validate_import_record_semantics(confirmed)
+    # Complete ordered chain intent -> effect-observed -> receipt-recorded ->
+    # confirmed with exact causal links and immutable-purpose field equality.
+    errors.extend(validate_lifecycle_chain([stored_intent, effect, receipt_recorded, confirmed]))
     if confirmed.get("status") != "confirmed":
         errors.append("stored record has a status other than confirmed")
     if confirmed.get("previous_record_id") != receipt_recorded.get("record_id"):
@@ -778,6 +1035,55 @@ def _result_from_confirmed(confirmed: dict[str, Any]) -> dict[str, Any]:
         "receipt_digest": receipt["receipt_digest"],
         "confirmed_record_id": confirmed["record_id"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Construction validation (internal bugs must fail before persistence)
+# ---------------------------------------------------------------------------
+
+def _validate_constructed_intent(record: dict[str, Any]) -> None:
+    """Requirement: every newly built intent record is validated before persist."""
+    errors = validate_import_record_semantics(record)
+    if record.get("status") != "intent":
+        errors.append("constructed intent record has a status other than intent")
+    if errors:
+        raise ImportOperationInvalid(
+            "constructed intent record is invalid: " + "; ".join(errors)
+        )
+
+
+def _validate_constructed_observation(
+    observation: dict[str, Any], stored_intent: dict[str, Any]
+) -> None:
+    """Requirement: every newly built observation is validated before persist."""
+    errors = validate_source_observation_semantics(observation)
+    errors.extend(_observation_mismatch_errors(observation, stored_intent))
+    if errors:
+        raise ImportOperationInvalid(
+            "constructed source observation is invalid: " + "; ".join(errors)
+        )
+
+
+def _validate_constructed_record(
+    record: dict[str, Any],
+    stored_intent: dict[str, Any],
+    previous_record: dict[str, Any] | None,
+) -> None:
+    """Requirement: every newly built lifecycle record is validated before
+    persist: local semantics, immutable-purpose equality with intent, and exact
+    causality linking the previous record."""
+    errors = validate_import_record_semantics(record)
+    errors.extend(_intent_mismatch_errors(record, stored_intent))
+    expected_previous = None if previous_record is None else previous_record.get("record_id")
+    if record.get("previous_record_id") != expected_previous:
+        previous_label = (
+            "previous" if previous_record is None else previous_record.get("status")
+        )
+        errors.append(f"{record.get('status')} previous_record_id does not link the {previous_label} record")
+    if errors:
+        raise ImportOperationInvalid(
+            "constructed import record is invalid: " + "; ".join(errors)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -820,10 +1126,17 @@ def execute_import_operation(
     if not isinstance(campaign_revision, int) or campaign_revision < 0:
         raise ImportOperationInvalid("campaign_revision must be a non-negative integer")
 
-    # P1-002 policy: reject secret/raw content BEFORE any artifact is persisted.
-    _reject_secret_or_raw(request, "request")
+    # Finding 2: authoritative internal snapshots. All operation IDs, digests,
+    # intent records, observations, and lifecycle records use ONLY these
+    # snapshots; the reader receives separate defensive copies that share no
+    # mutable object with stored intent / internal operation identity.
+    authoritative_source_identity = copy.deepcopy(source_identity)
+    authoritative_request = copy.deepcopy(request)
 
-    request_digest = compute_request_digest(request)
+    # P1-002 policy: reject secret/raw content BEFORE any artifact is persisted.
+    _reject_secret_or_raw(authoritative_request, "request")
+
+    request_digest = compute_request_digest(authoritative_request)
     operation_id = derive_operation_id(campaign_id, idempotency_key)
 
     intent_artifact_id = f"import-operation/{operation_id}/intent"
@@ -839,9 +1152,9 @@ def execute_import_operation(
         operation_id=operation_id,
         idempotency_key=idempotency_key,
         campaign_id=campaign_id,
-        source_identity=source_identity,
+        source_identity=authoritative_source_identity,
         adapter=adapter,
-        request=request,
+        request=authoritative_request,
         request_digest=request_digest,
         previous_content_digest=previous_content_digest,
         status="intent",
@@ -853,6 +1166,7 @@ def execute_import_operation(
         created_at=intel.utcnow(),
     )
     _reject_secret_or_raw(intent_record, "import operation")
+    _validate_constructed_intent(intent_record)
 
     stored_intent = _try_get_payload(campaign_dir, campaign_id, intent_artifact_id)
     if stored_intent is None:
@@ -888,9 +1202,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="confirmed",
@@ -901,6 +1215,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(confirmed_record, stored_intent, receipt_recorded)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", confirmed_artifact_id, confirmed_record,
@@ -924,9 +1239,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="receipt-recorded",
@@ -937,6 +1252,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(receipt_recorded, stored_intent, effect)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", receipt_artifact_id, receipt_recorded,
@@ -945,9 +1261,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="confirmed",
@@ -958,6 +1274,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(confirmed_record, stored_intent, receipt_recorded)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", confirmed_artifact_id, confirmed_record,
@@ -972,9 +1289,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="effect-observed",
@@ -985,6 +1302,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(effect_record, stored_intent, stored_intent)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", effect_artifact_id, effect_record,
@@ -1000,9 +1318,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="receipt-recorded",
@@ -1013,6 +1331,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(receipt_recorded, stored_intent, effect_record)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", receipt_artifact_id, receipt_recorded,
@@ -1021,9 +1340,9 @@ def execute_import_operation(
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             campaign_id=campaign_id,
-            source_identity=source_identity,
+            source_identity=authoritative_source_identity,
             adapter=adapter,
-            request=request,
+            request=authoritative_request,
             request_digest=request_digest,
             previous_content_digest=previous_content_digest,
             status="confirmed",
@@ -1034,6 +1353,7 @@ def execute_import_operation(
             authority=authority,
             created_at=intel.utcnow(),
         )
+        _validate_constructed_record(confirmed_record, stored_intent, receipt_recorded)
         _put_artifact(
             campaign_dir, campaign_id, campaign_revision,
             "decision", confirmed_artifact_id, confirmed_record,
@@ -1042,10 +1362,15 @@ def execute_import_operation(
 
     # Only the intent exists: invoke the reader once. Only TimeoutError is
     # translated; unexpected exceptions escape with the intent intact.
+    #
+    # Finding 2: the reader receives defensive copies of the authoritative
+    # snapshots that share NO mutable object with stored intent / internal
+    # operation identity / later lifecycle builders. A buggy or adversarial
+    # reader cannot mutate the durable operation.
     reader_context = {
-        "source_identity": source_identity,
+        "source_identity": copy.deepcopy(authoritative_source_identity),
         "adapter": adapter,
-        "request": request,
+        "request": copy.deepcopy(authoritative_request),
         "request_digest": request_digest,
     }
     try:
@@ -1055,16 +1380,24 @@ def execute_import_operation(
     parsed = _parse_reader_result(raw_result)
     parsed["outcome"] = _map_outcome(parsed, previous_content_digest)
 
+    # Finding 2 invariant guard: after the reader returns, the internal request
+    # digest must still match the authoritative snapshot.
+    if compute_request_digest(authoritative_request) != request_digest:
+        raise ImportOperationInvalid(
+            "internal request digest invariant violated after reader execution"
+        )
+
     observation = _build_observation(
         campaign_id=campaign_id,
         operation_id=operation_id,
-        source_identity=source_identity,
+        source_identity=authoritative_source_identity,
         adapter=adapter,
         request_digest=request_digest,
         previous_content_digest=previous_content_digest,
         parsed=parsed,
         observed_at=intel.utcnow(),
     )
+    _validate_constructed_observation(observation, stored_intent)
     _put_artifact(
         campaign_dir, campaign_id, campaign_revision,
         "backlog", observation_artifact_id, observation,
@@ -1074,9 +1407,9 @@ def execute_import_operation(
         operation_id=operation_id,
         idempotency_key=idempotency_key,
         campaign_id=campaign_id,
-        source_identity=source_identity,
+        source_identity=authoritative_source_identity,
         adapter=adapter,
-        request=request,
+        request=authoritative_request,
         request_digest=request_digest,
         previous_content_digest=previous_content_digest,
         status="effect-observed",
@@ -1087,6 +1420,7 @@ def execute_import_operation(
         authority=authority,
         created_at=intel.utcnow(),
     )
+    _validate_constructed_record(effect_record, stored_intent, stored_intent)
     _put_artifact(
         campaign_dir, campaign_id, campaign_revision,
         "decision", effect_artifact_id, effect_record,
@@ -1103,9 +1437,9 @@ def execute_import_operation(
         operation_id=operation_id,
         idempotency_key=idempotency_key,
         campaign_id=campaign_id,
-        source_identity=source_identity,
+        source_identity=authoritative_source_identity,
         adapter=adapter,
-        request=request,
+        request=authoritative_request,
         request_digest=request_digest,
         previous_content_digest=previous_content_digest,
         status="receipt-recorded",
@@ -1116,6 +1450,7 @@ def execute_import_operation(
         authority=authority,
         created_at=intel.utcnow(),
     )
+    _validate_constructed_record(receipt_recorded, stored_intent, effect_record)
     _put_artifact(
         campaign_dir, campaign_id, campaign_revision,
         "decision", receipt_artifact_id, receipt_recorded,
@@ -1125,9 +1460,9 @@ def execute_import_operation(
         operation_id=operation_id,
         idempotency_key=idempotency_key,
         campaign_id=campaign_id,
-        source_identity=source_identity,
+        source_identity=authoritative_source_identity,
         adapter=adapter,
-        request=request,
+        request=authoritative_request,
         request_digest=request_digest,
         previous_content_digest=previous_content_digest,
         status="confirmed",
@@ -1138,6 +1473,7 @@ def execute_import_operation(
         authority=authority,
         created_at=intel.utcnow(),
     )
+    _validate_constructed_record(confirmed_record, stored_intent, receipt_recorded)
     _put_artifact(
         campaign_dir, campaign_id, campaign_revision,
         "decision", confirmed_artifact_id, confirmed_record,
