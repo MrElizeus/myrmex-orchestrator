@@ -107,6 +107,26 @@ def artifact_file_count(cdir: Path) -> int:
     return len(list(arts.glob("*.json")))
 
 
+def tamper_artifact(cdir: Path, campaign_id: str, artifact_id: str, mutate_payload) -> None:
+    """Tamper a stored P1-003 payload directly on disk, bypassing the normal
+    immutable put_artifact API, and recompute the outer P1-002 envelope digests
+    so the envelope remains internally valid.
+
+    The mutate_payload callback is responsible for recomputing any inner P1-003
+    digest-derived identities (record_digest/record_id or
+    observation_digest/observation_id) so the P1-003 contract is internally
+    consistent and can only be rejected by the runtime trust-boundary checks.
+    """
+    path = bkg._artifact_path(cdir, artifact_id)
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    mutate_payload(envelope["payload"])
+    envelope["payload_digest"] = intel.compute_payload_digest(envelope["payload"])
+    envelope["artifact_digest"] = intel.compute_artifact_digest(
+        envelope["campaign_id"], envelope["kind"], envelope["artifact_id"], envelope["payload"]
+    )
+    path.write_bytes(intel.canonical_json_bytes(envelope) + b"\n")
+
+
 # ---------------------------------------------------------------------------
 # Contract fixture builders (deterministic)
 # ---------------------------------------------------------------------------
@@ -335,6 +355,29 @@ def run_operation(cdir: Path, data: dict, idempotency_key: str = RUNTIME_IDEMPOT
         previous_content_digest=previous,
         reader=reader,
     )
+
+
+def run_operation_until(cdir: Path, data: dict, fail_at_artifact_id: str,
+                        idempotency_key: str = RUNTIME_IDEMPOTENCY) -> None:
+    """Run one operation with a simulated persistence failure at the given
+    artifact id, leaving the sidecar in the durable state just before that
+    artifact would have been written."""
+    original_put = intel.put_artifact
+
+    def failing_put(campaign_dir, campaign_id, campaign_revision, kind, artifact_id, payload):
+        if artifact_id == fail_at_artifact_id:
+            raise RuntimeError("simulated lifecycle persist failure")
+        return original_put(campaign_dir, campaign_id, campaign_revision, kind, artifact_id, payload)
+
+    intel.put_artifact = failing_put
+    try:
+        try:
+            run_operation(cdir, data, idempotency_key=idempotency_key)
+            raise AssertionError(f"operation must fail when persisting {fail_at_artifact_id}")
+        except RuntimeError as exc:
+            assert "simulated lifecycle persist failure" in str(exc)
+    finally:
+        intel.put_artifact = original_put
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +975,348 @@ def test_mapping_counts_and_projection_descriptors() -> None:
 
 
 # ---------------------------------------------------------------------------
+# WU-P1-003-C corrective regression tests (frontier remote audit turn 42)
+# ---------------------------------------------------------------------------
+
+def test_persisted_record_corruption() -> None:
+    """Regression group 1: runtime corruption bypassing the immutable APIs.
+
+    The stored P1-003 payload is modified directly on disk and the outer P1-002
+    envelope digests recomputed so the envelope stays internally valid; replay
+    must reject the corrupted P1-003 contract before extending/returning the
+    chain.
+    """
+    # 1a: unknown top-level field on the stored intent -> semantic rejection.
+    with tempfile.TemporaryDirectory(prefix="p1c-corr-intent-") as td:
+        cdir, data = init_campaign(td)
+        run_operation(cdir, data)
+        op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+        artifact_id = f"import-operation/{op_id}/intent"
+        files_before = artifact_file_count(cdir)
+
+        def add_unknown_field(payload):
+            payload["sneaky_field"] = 1
+            payload["record_digest"] = bkg.compute_record_digest(payload)
+            payload["record_id"] = bkg.derive_record_id(payload["record_digest"])
+
+        tamper_artifact(cdir, data["id"], artifact_id, add_unknown_field)
+        # The P1-002 envelope itself is still valid.
+        assert intel.get_artifact(cdir, data["id"], artifact_id)["ok"] is True
+        reader, calls = make_reader(
+            lambda: {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D},
+            campaign_dir=cdir, campaign_id=data["id"], idempotency_key=RUNTIME_IDEMPOTENCY, state={},
+        )
+        try:
+            run_operation(cdir, data, reader=reader)
+            raise AssertionError("tampered intent must be rejected on replay")
+        except bkg.ImportOperationInvalid:
+            pass
+        assert len(calls) == 0, "corrupted intent must fail before the reader"
+        assert artifact_file_count(cdir) == files_before
+
+    # 1b: identity-bearing tamper on the stored intent -> conflict rejection.
+    with tempfile.TemporaryDirectory(prefix="p1c-corr-intent2-") as td:
+        cdir, data = init_campaign(td)
+        run_operation(cdir, data)
+        op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+        artifact_id = f"import-operation/{op_id}/intent"
+        files_before = artifact_file_count(cdir)
+
+        def change_identity(payload):
+            payload["source_identity"] = {"kind": "github", "canonical_id": "other/repo"}
+            payload["record_digest"] = bkg.compute_record_digest(payload)
+            payload["record_id"] = bkg.derive_record_id(payload["record_digest"])
+
+        tamper_artifact(cdir, data["id"], artifact_id, change_identity)
+        assert intel.get_artifact(cdir, data["id"], artifact_id)["ok"] is True
+        reader, calls = make_reader(
+            lambda: {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D},
+            campaign_dir=cdir, campaign_id=data["id"], idempotency_key=RUNTIME_IDEMPOTENCY, state={},
+        )
+        try:
+            run_operation(cdir, data, reader=reader)
+            raise AssertionError("identity-tampered intent must conflict on replay")
+        except bkg.ImportOperationConflict:
+            pass
+        assert len(calls) == 0, "identity-tampered intent must conflict before the reader"
+        assert artifact_file_count(cdir) == files_before
+    ok("persisted-record corruption: 2 envelope-internally-valid tamper scenarios rejected before extending/returning")
+
+
+def test_source_observation_continuity_corruption() -> None:
+    """Regression group 2: source-observation continuity corruption.
+
+    Independently tamper source_identity, adapter, previous_content_digest,
+    authority.create_work_units=true, authority.activate_plan=true, and an
+    unknown top-level field on the stored observation; each replay must raise
+    ImportOperationInvalid and the reader must NOT be invoked during recovery.
+    """
+    cases = [
+        ("source_identity", lambda p: p.update({"source_identity": {"kind": "github", "canonical_id": "other/repo"}})),
+        ("adapter", lambda p: p.update({"adapter": "github"})),
+        ("previous_content_digest", lambda p: p.update({"previous_content_digest": HEX64_C})),
+        ("authority-create-work-units", lambda p: p["authority"].update({"create_work_units": True})),
+        ("authority-activate-plan", lambda p: p["authority"].update({"activate_plan": True})),
+        ("unknown-field", lambda p: p.update({"sneaky_field": 1})),
+    ]
+    for label, mutate in cases:
+        with tempfile.TemporaryDirectory(prefix="p1c-corr-obs-") as td:
+            cdir, data = init_campaign(td)
+            op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+            run_operation_until(cdir, data, f"import-operation/{op_id}/effect-observed")
+            assert artifact_file_count(cdir) == 2, "intermediate state must be intent + observation"
+            artifact_id = f"source-observation/{op_id}"
+            files_before = artifact_file_count(cdir)
+
+            def recompute(payload):
+                mutate(payload)
+                payload["observation_digest"] = bkg.compute_observation_digest(payload)
+                payload["observation_id"] = bkg.derive_observation_id(payload["observation_digest"])
+
+            tamper_artifact(cdir, data["id"], artifact_id, recompute)
+            reader, calls = make_reader(
+                lambda: {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D},
+                campaign_dir=cdir, campaign_id=data["id"], idempotency_key=RUNTIME_IDEMPOTENCY, state={},
+            )
+            try:
+                run_operation(cdir, data, reader=reader)
+                raise AssertionError(f"tampered observation ({label}) must be rejected")
+            except bkg.ImportOperationInvalid:
+                pass
+            assert len(calls) == 0, f"reader must not be invoked during recovery ({label})"
+            assert artifact_file_count(cdir) == files_before
+    ok(f"source-observation continuity corruption: {len(cases)} tamper scenarios -> ImportOperationInvalid, reader not invoked")
+
+
+def test_lifecycle_record_continuity_corruption() -> None:
+    """Regression group 3: lifecycle-record continuity corruption.
+
+    Tamper the existing effect-observed record with recomputed inner record and
+    outer sidecar digests for divergent source_identity/adapter/request/
+    previous_content_digest/authority/operation identity and an unknown
+    top-level field; replay must fail before receipt/confirmation extension.
+    """
+    cases = [
+        ("source_identity", lambda p: p.update({"source_identity": {"kind": "github", "canonical_id": "other/repo"}})),
+        ("adapter", lambda p: p.update({"adapter": "github"})),
+        ("request", lambda p: (
+            p.update({"request": {"issue": "INC-999"}}),
+            p.update({"request_digest": bkg.compute_request_digest(p["request"])}),
+        )),
+        ("previous_content_digest", lambda p: p.update({"previous_content_digest": HEX64_C})),
+        ("authority", lambda p: p.update({"authority": {**dict(bkg.IMPORT_AUTHORITY), "create_work_units": True}})),
+        ("operation_identity", lambda p: p.update({"operation_id": "importop-" + "22" * 12})),
+        ("unknown-field", lambda p: p.update({"sneaky_field": 1})),
+    ]
+    for label, mutate in cases:
+        with tempfile.TemporaryDirectory(prefix="p1c-corr-effect-") as td:
+            cdir, data = init_campaign(td)
+            op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+            run_operation_until(cdir, data, f"import-operation/{op_id}/receipt-recorded")
+            assert artifact_file_count(cdir) == 3, "intermediate state must be intent + observation + effect-observed"
+            artifact_id = f"import-operation/{op_id}/effect-observed"
+            files_before = artifact_file_count(cdir)
+
+            def recompute(payload):
+                mutate(payload)
+                payload["record_digest"] = bkg.compute_record_digest(payload)
+                payload["record_id"] = bkg.derive_record_id(payload["record_digest"])
+
+            tamper_artifact(cdir, data["id"], artifact_id, recompute)
+            reader, calls = make_reader(
+                lambda: {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D},
+                campaign_dir=cdir, campaign_id=data["id"], idempotency_key=RUNTIME_IDEMPOTENCY, state={},
+            )
+            try:
+                run_operation(cdir, data, reader=reader)
+                raise AssertionError(f"tampered effect-observed ({label}) must be rejected")
+            except bkg.ImportOperationInvalid:
+                pass
+            assert len(calls) == 0, f"reader must not be invoked during recovery ({label})"
+            assert artifact_file_count(cdir) == files_before
+            assert bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/receipt-recorded") is None
+            assert bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/confirmed") is None
+    ok(f"lifecycle-record continuity corruption: {len(cases)} tamper scenarios rejected before receipt/confirmation extension")
+
+
+def test_confirmed_chain_corruption() -> None:
+    """Regression group 4: confirmed-chain corruption.
+
+    Tamper receipt-recorded and confirmed independently with recomputed inner
+    and outer digests; no confirmed result is returned and no new artifact is
+    written; the corrupted chain is rejected.
+    """
+    # 4a: receipt-recorded receipt tampered (internally consistent).
+    with tempfile.TemporaryDirectory(prefix="p1c-corr-receipt-") as td:
+        cdir, data = init_campaign(td)
+        run_operation(cdir, data)
+        op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+        artifact_id = f"import-operation/{op_id}/receipt-recorded"
+        files_before = artifact_file_count(cdir)
+
+        def tamper_receipt(payload):
+            payload["receipt"]["outcome"] = "unavailable"
+            payload["receipt"]["receipt_digest"] = bkg.compute_receipt_digest(payload["receipt"])
+            payload["receipt"]["receipt_id"] = bkg.derive_receipt_id(payload["receipt"]["receipt_digest"])
+            payload["record_digest"] = bkg.compute_record_digest(payload)
+            payload["record_id"] = bkg.derive_record_id(payload["record_digest"])
+
+        tamper_artifact(cdir, data["id"], artifact_id, tamper_receipt)
+        try:
+            run_operation(cdir, data)
+            raise AssertionError("tampered receipt-recorded must reject the confirmed replay")
+        except bkg.ImportOperationInvalid:
+            pass
+        assert artifact_file_count(cdir) == files_before, "no new artifact may be written"
+
+    # 4b: confirmed observation reference tampered (internally consistent).
+    with tempfile.TemporaryDirectory(prefix="p1c-corr-confirmed-") as td:
+        cdir, data = init_campaign(td)
+        run_operation(cdir, data)
+        op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+        artifact_id = f"import-operation/{op_id}/confirmed"
+        files_before = artifact_file_count(cdir)
+
+        def tamper_confirmed(payload):
+            payload["observation"]["observation_digest"] = HEX64_C
+            payload["observation"]["observation_id"] = "srcobs_" + HEX64_C
+            payload["record_digest"] = bkg.compute_record_digest(payload)
+            payload["record_id"] = bkg.derive_record_id(payload["record_digest"])
+
+        tamper_artifact(cdir, data["id"], artifact_id, tamper_confirmed)
+        try:
+            run_operation(cdir, data)
+            raise AssertionError("tampered confirmed must be rejected")
+        except bkg.ImportOperationInvalid:
+            pass
+        assert artifact_file_count(cdir) == files_before, "no new artifact may be written"
+    ok("confirmed-chain corruption: receipt-recorded and confirmed tamper scenarios rejected; no result, no new artifact")
+
+
+def test_mutating_reader_regression() -> None:
+    """Regression group 5: malicious/mutating-reader.
+
+    The reader receives private defensive copies of the authoritative inputs;
+    mutating them must not affect the durable intent, later builders, the
+    caller's objects, or the request digest. The operation completes with the
+    original authoritative source/request and every persisted record validates.
+    """
+    with tempfile.TemporaryDirectory(prefix="p1c-mutreader-") as td:
+        cdir, data = init_campaign(td)
+        caller_source_identity = dict(SOURCE_IDENTITY)
+        caller_request = json.loads(json.dumps(RUNTIME_REQUEST))
+        original_si = json.loads(json.dumps(caller_source_identity))
+        original_req = json.loads(json.dumps(caller_request))
+        state: dict = {}
+
+        def mutating_reader(ctx: dict) -> dict:
+            # State-first: durable intent exists and matches authoritative inputs.
+            op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+            intent_payload = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/intent")
+            assert intent_payload is not None, "intent must be durably persisted before reader runs"
+            assert intent_payload["source_identity"] == SOURCE_IDENTITY
+            assert intent_payload["request"] == RUNTIME_REQUEST
+            # Mutate the reader's private context copies aggressively.
+            ctx["source_identity"]["canonical_id"] = "MUTATED-ORIGIN"
+            ctx["source_identity"]["nested_mutation"] = {"hacked": True}
+            ctx["request"]["issue"] = "MUTATED-REQ"
+            ctx["request"]["nested"] = {"injected": True}
+            state["reader_ctx_ref"] = ctx
+            state["reader_mutated"] = True
+            return {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D}
+
+        result = run_operation(
+            cdir, data, source_identity=caller_source_identity, request=caller_request,
+            reader=mutating_reader, reader_state=state,
+        )
+        assert result["status"] == "confirmed"
+        assert state.get("reader_mutated") is True
+        # The reader's mutations stayed in its private context copy.
+        reader_ctx = state["reader_ctx_ref"]
+        assert reader_ctx["source_identity"]["canonical_id"] == "MUTATED-ORIGIN"
+        assert reader_ctx["request"]["issue"] == "MUTATED-REQ"
+        # Caller-provided objects were NOT mutated.
+        assert caller_source_identity == original_si
+        assert caller_request == original_req
+
+        op_id = result["operation_id"]
+        intent = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/intent")
+        effect = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/effect-observed")
+        receipt_recorded = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/receipt-recorded")
+        confirmed = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/confirmed")
+        observation = bkg._try_get_payload(cdir, data["id"], f"source-observation/{op_id}")
+        expected_digest = bkg.compute_request_digest(RUNTIME_REQUEST)
+        for record in (intent, effect, receipt_recorded, confirmed):
+            assert record["source_identity"] == SOURCE_IDENTITY, "lifecycle record source_identity diverged"
+            assert record["request"] == RUNTIME_REQUEST, "lifecycle record request diverged"
+            assert record["request_digest"] == expected_digest, "lifecycle record request_digest diverged"
+            assert bkg.validate_import_record_semantics(record) == []
+            assert bkg._intent_mismatch_errors(record, intent) == []
+        assert observation["source_identity"] == SOURCE_IDENTITY
+        assert observation["request_digest"] == expected_digest
+        assert bkg.validate_source_observation_semantics(observation) == []
+        assert bkg.validate_lifecycle_chain([intent, effect, receipt_recorded, confirmed]) == []
+        assert result["request_digest"] == expected_digest
+    ok("mutating-reader: private-context mutations isolated; operation completes with original authoritative source/request; caller objects unmutated; all persisted records validate")
+
+
+def test_reader_exception_after_mutation_regression() -> None:
+    """Regression group 6: mutation-plus-exception.
+
+    A reader that mutates its private context and then raises an unexpected
+    exception leaves the durable intent valid and unchanged; no observation,
+    effect, receipt, or confirmed artifact exists; replay with a valid reader
+    continues from the original intent.
+    """
+    with tempfile.TemporaryDirectory(prefix="p1c-mutexc-") as td:
+        cdir, data = init_campaign(td)
+        state: dict = {}
+
+        def bad_reader(ctx: dict) -> dict:
+            ctx["source_identity"]["canonical_id"] = "MUTATED-ORIGIN"
+            ctx["request"]["issue"] = "MUTATED-REQ"
+            state["reader_mutated"] = True
+            raise RuntimeError("boom after mutation")
+
+        try:
+            run_operation(cdir, data, reader=bad_reader, reader_state=state)
+            raise AssertionError("reader exception must escape")
+        except RuntimeError as exc:
+            assert "boom after mutation" in str(exc)
+        assert state.get("reader_mutated") is True
+
+        op_id = bkg.derive_operation_id(data["id"], RUNTIME_IDEMPOTENCY)
+        intent = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/intent")
+        assert intent is not None
+        assert bkg.validate_import_record_semantics(intent) == []
+        assert intent["source_identity"] == SOURCE_IDENTITY
+        assert intent["request"] == RUNTIME_REQUEST
+        assert intent["request_digest"] == bkg.compute_request_digest(RUNTIME_REQUEST)
+        # No downstream artifact exists.
+        assert artifact_file_count(cdir) == 1, "only the intent may be durable"
+        assert bkg._try_get_payload(cdir, data["id"], f"source-observation/{op_id}") is None
+        for stage in ("effect-observed", "receipt-recorded", "confirmed"):
+            assert bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/{stage}") is None
+
+        # Replay with a valid reader continues from the original intent.
+        reader2, calls2 = make_reader(
+            lambda: {"status": "observed", "observed_version": "v7", "content_digest": HEX64_D},
+            campaign_dir=cdir, campaign_id=data["id"], idempotency_key=RUNTIME_IDEMPOTENCY, state={},
+        )
+        result = run_operation(cdir, data, reader=reader2)
+        assert result["status"] == "confirmed"
+        assert len(calls2) == 1
+        effect = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/effect-observed")
+        confirmed = bkg._try_get_payload(cdir, data["id"], f"import-operation/{op_id}/confirmed")
+        assert effect["source_identity"] == SOURCE_IDENTITY
+        assert effect["request"] == RUNTIME_REQUEST
+        assert confirmed["request_digest"] == bkg.compute_request_digest(RUNTIME_REQUEST)
+        for record in (intent, effect, confirmed):
+            assert bkg.validate_import_record_semantics(record) == []
+    ok("mutation-plus-exception: durable intent unchanged and valid; no downstream artifact; replay continues from original intent")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -955,12 +1340,26 @@ def main() -> int:
         test_secret_rejection,
         test_lifecycle_chain_and_continuity,
         test_mapping_counts_and_projection_descriptors,
+        # WU-P1-003-C corrective regression groups.
+        test_persisted_record_corruption,
+        test_source_observation_continuity_corruption,
+        test_lifecycle_record_continuity_corruption,
+        test_confirmed_chain_corruption,
+        test_mutating_reader_regression,
+        test_reader_exception_after_mutation_regression,
     ]
     for test in tests:
         test()
     print(f"assertion_checks: {TEST_COUNT} ok checks, 0 failed")
     print(f"positive_fixture_results: source-observation=6 import-operation=4 passed")
     print(f"negative_fixture_results: source-observation={len(_source_negative_fixtures())} import-operation={len(_import_negative_fixtures())} passed")
+    print("regression_corrective_results:")
+    print("  persisted-record corruption: 2 scenarios rejected (envelope-internally-valid tamper)")
+    print("  authority corruption (source-observation continuity): 6 scenarios -> ImportOperationInvalid, reader not invoked")
+    print("  immutable-purpose continuity (lifecycle-record corruption): 7 scenarios rejected before receipt/confirmation extension")
+    print("  confirmed-chain corruption: 2 scenarios rejected; no result, no new artifact")
+    print("  mutating reader: 1 regression (private-context mutations isolated)")
+    print("  exception-after-mutation recovery: 1 regression (durable intent unchanged, replay continues)")
     print("source-import contract tests: PASS")
     return 0
 
