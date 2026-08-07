@@ -1,0 +1,16 @@
+{
+  "status": "ok",
+  "repository": "owner/repo",
+  "issues": [
+    {
+      "number": "1",
+      "title": "Bad",
+      "state": "open",
+      "labels": [],
+      "milestone": null,
+      "updated_at": null,
+      "body": "raw"
+    }
+  ],
+  "milestones": []
+}

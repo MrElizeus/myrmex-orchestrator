@@ -1,0 +1,49 @@
+{
+  "status": "ok",
+  "repository": "owner/repo",
+  "issues": [
+    {
+      "number": 1,
+      "title": "Fix auth properly",
+      "state": "open",
+      "labels": [
+        "bug",
+        "security"
+      ],
+      "milestone": {
+        "number": 1
+      },
+      "updated_at": "2026-08-01T10:00:00Z",
+      "body": "RAW-ISSUE-BODY-SENTINEL-001"
+    },
+    {
+      "number": 2,
+      "title": "Add docs",
+      "state": "closed",
+      "labels": [
+        "docs"
+      ],
+      "milestone": null,
+      "updated_at": "2026-08-02T11:00:00Z",
+      "body": "RAW-ISSUE-BODY-SENTINEL-002"
+    }
+  ],
+  "milestones": [
+    {
+      "number": 1,
+      "title": "M1",
+      "state": "open",
+      "due_on": "2026-09-01T00:00:00Z",
+      "updated_at": "2026-08-01T09:00:00Z",
+      "description": "RAW-MILESTONE-DESCRIPTION-SENTINEL-001"
+    },
+    {
+      "number": 2,
+      "title": "M2",
+      "state": "closed",
+      "due_on": null,
+      "updated_at": "2026-07-15T09:00:00Z",
+      "description": "RAW-MILESTONE-DESCRIPTION-SENTINEL-002"
+    }
+  ]
+}

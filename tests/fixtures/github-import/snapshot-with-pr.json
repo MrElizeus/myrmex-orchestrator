@@ -1,0 +1,28 @@
+{
+  "status": "ok",
+  "repository": "owner/repo",
+  "issues": [
+    {
+      "number": 3,
+      "title": "PR #3",
+      "state": "open",
+      "labels": [],
+      "milestone": null,
+      "updated_at": null,
+      "body": "raw-pr",
+      "pull_request": {
+        "url": "https://example.test/pr/3"
+      }
+    },
+    {
+      "number": 4,
+      "title": "Real issue",
+      "state": "open",
+      "labels": [],
+      "milestone": null,
+      "updated_at": null,
+      "body": "raw-real"
+    }
+  ],
+  "milestones": []
+}
