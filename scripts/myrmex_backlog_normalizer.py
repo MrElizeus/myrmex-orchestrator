@@ -319,40 +319,116 @@ def _build_github_item(neutral: dict[str, Any], issue: dict[str, Any], source_id
     return normalized
 
 
+BACKLOG_ITEM_ID_RE = re.compile(r"^backlog_[0-9a-f]{64}$")
+ITEM_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+LOCAL_ENTITY_ID_RE = re.compile(r"^srcitem_[0-9a-f]{64}$")
+LOCAL_OBJECTIVE_ID_RE = re.compile(r"^srcobj_[0-9a-f]{64}$")
+GITHUB_ISSUE_ID_RE = re.compile(r"^ghissue_[0-9a-f]{64}$")
+GITHUB_MILESTONE_ID_RE = re.compile(r"^ghmilestone_[0-9a-f]{64}$")
+
+ADAPTER_ENTITY_KINDS = {
+    ("local-markdown-roadmap/v1", "local-item"): "local-roadmap",
+    ("local-manifest-json/v1", "local-item"): "local-manifest",
+    ("local-manifest-yaml/v1", "local-item"): "local-manifest",
+    ("github-issues-milestones/v1", "github-issue"): "github-issues-milestones",
+}
+
+
+def _require_sorted_unique_strings(value: Any, label: str) -> None:
+    if not isinstance(value, list):
+        raise BacklogNormalizationInvalid(f"{label} must be an array of strings")
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            raise BacklogNormalizationInvalid(f"{label} entries must be non-empty strings")
+    if value != sorted(set(value)):
+        raise BacklogNormalizationInvalid(f"{label} must be sorted and unique")
+
+
 def validate_normalized_item(item: Any) -> None:
     _obj_fields(item, NORMALIZED_ITEM_FIELDS, "normalized item")
     if item["schema"] != NORMALIZED_ITEM_SCHEMA:
         raise BacklogNormalizationInvalid("normalized item schema mismatch")
+    if not isinstance(item.get("backlog_item_id"), str) or not BACKLOG_ITEM_ID_RE.fullmatch(item["backlog_item_id"]):
+        raise BacklogNormalizationInvalid("backlog_item_id must match ^backlog_[0-9a-f]{64}$")
+    if not isinstance(item.get("item_digest"), str) or not ITEM_DIGEST_RE.fullmatch(item["item_digest"]):
+        raise BacklogNormalizationInvalid("item_digest must be a 64-hex digest")
     if item["backlog_item_id"] != compute_backlog_item_id(
         item["source_adapter"], item["source_identity"], item["source_entity_id"]
     ):
         raise BacklogNormalizationInvalid("backlog_item_id does not recompute")
     if item["item_digest"] != compute_item_digest(item):
         raise BacklogNormalizationInvalid("item_digest does not recompute")
-    if not isinstance(item["source_identity"], dict) or not item["source_identity"]:
-        raise BacklogNormalizationInvalid("source_identity must be a non-empty object")
-    if item["source_entity_type"] not in ("local-item", "github-issue"):
+    # exact source_identity {kind, canonical_id}
+    si = item["source_identity"]
+    if not isinstance(si, dict) or sorted(si.keys()) != ["canonical_id", "kind"]:
+        raise BacklogNormalizationInvalid("source_identity must be exactly {kind, canonical_id}")
+    if not isinstance(si.get("kind"), str) or not si["kind"]:
+        raise BacklogNormalizationInvalid("source_identity.kind must be a non-empty string")
+    if not isinstance(si.get("canonical_id"), str) or not si["canonical_id"]:
+        raise BacklogNormalizationInvalid("source_identity.canonical_id must be a non-empty string")
+    # exact adapter/entity/source-kind combination
+    combo = (item["source_adapter"], item["source_entity_type"])
+    if combo not in ADAPTER_ENTITY_KINDS:
+        raise BacklogNormalizationInvalid("unknown adapter/entity-type combination")
+    if ADAPTER_ENTITY_KINDS[combo] != si["kind"]:
+        raise BacklogNormalizationInvalid("source_identity.kind does not match adapter/entity-type")
+    # source entity ID format by type
+    if item["source_entity_type"] == "local-item":
+        if not LOCAL_ENTITY_ID_RE.fullmatch(item["source_entity_id"]):
+            raise BacklogNormalizationInvalid("local source_entity_id must match ^srcitem_[0-9a-f]{64}$")
+    elif item["source_entity_type"] == "github-issue":
+        if not GITHUB_ISSUE_ID_RE.fullmatch(item["source_entity_id"]):
+            raise BacklogNormalizationInvalid("github source_entity_id must match ^ghissue_[0-9a-f]{64}$")
+    else:
         raise BacklogNormalizationInvalid("unknown source_entity_type")
+    # arrays sorted unique
     for key in ("dependency_hints", "constraints", "context_constraints", "labels"):
-        if not isinstance(item.get(key), list):
-            raise BacklogNormalizationInvalid(f"{key} must be an array")
-    for key in ("title",):
-        if not isinstance(item.get(key), str) or not item[key]:
-            raise BacklogNormalizationInvalid("title must be a non-empty string")
+        _require_sorted_unique_strings(item.get(key), key)
+    # type-level shape
+    if not isinstance(item.get("title"), str) or not item["title"]:
+        raise BacklogNormalizationInvalid("title must be a non-empty string")
     if item.get("priority") is not None and not isinstance(item["priority"], str):
         raise BacklogNormalizationInvalid("priority must be string or null")
-    if item.get("state") is not None and item["state"] not in ("open", "closed"):
-        raise BacklogNormalizationInvalid("state must be open|closed|null")
-    if item.get("group_ref") is not None:
-        gr = item["group_ref"]
-        if gr.get("kind") == "local-objective":
+    if item["source_entity_type"] == "local-item":
+        if item.get("state") is not None:
+            raise BacklogNormalizationInvalid("local items must have state=null")
+        if item.get("labels") != []:
+            raise BacklogNormalizationInvalid("local items must have labels=[]")
+        gr = item.get("group_ref")
+        if gr is not None:
             _obj_fields(gr, GROUP_REF_LOCAL_FIELDS, "local group_ref")
-        elif gr.get("kind") == "github-milestone":
+            if gr["kind"] != "local-objective":
+                raise BacklogNormalizationInvalid("local group_ref kind must be local-objective")
+            if not LOCAL_OBJECTIVE_ID_RE.fullmatch(gr["id"]):
+                raise BacklogNormalizationInvalid("local group_ref.id must match ^srcobj_[0-9a-f]{64}$")
+            if not isinstance(gr["title"], str) or not gr["title"]:
+                raise BacklogNormalizationInvalid("local group_ref.title must be non-empty")
+    else:  # github-issue
+        if item.get("priority") is not None:
+            raise BacklogNormalizationInvalid("github items must have priority=null")
+        if item.get("dependency_hints") != [] or item.get("constraints") != [] or item.get("context_constraints") != []:
+            raise BacklogNormalizationInvalid("github items must have empty dependency/constraint arrays")
+        if item.get("state") not in ("open", "closed"):
+            raise BacklogNormalizationInvalid("github items must have state open|closed")
+        gr = item.get("group_ref")
+        if gr is not None:
             _obj_fields(gr, GROUP_REF_GITHUB_FIELDS, "github group_ref")
-            if not isinstance(gr.get("number"), int) or gr["number"] < 1:
+            if gr["kind"] != "github-milestone":
+                raise BacklogNormalizationInvalid("github group_ref kind must be github-milestone")
+            if not GITHUB_MILESTONE_ID_RE.fullmatch(gr["id"]):
+                raise BacklogNormalizationInvalid("github group_ref.id must match ^ghmilestone_[0-9a-f]{64}$")
+            if isinstance(gr.get("number"), bool) or not isinstance(gr.get("number"), int) or gr["number"] < 1:
                 raise BacklogNormalizationInvalid("github group_ref.number must be a positive integer")
-        else:
-            raise BacklogNormalizationInvalid("unknown group_ref kind")
+            if not isinstance(gr.get("title"), str) or not gr["title"]:
+                raise BacklogNormalizationInvalid("github group_ref.title must be non-empty")
+            if gr.get("state") not in ("open", "closed"):
+                raise BacklogNormalizationInvalid("github group_ref.state must be open|closed")
+            if gr.get("due_on") is not None and (not isinstance(gr["due_on"], str) or not gr["due_on"]):
+                raise BacklogNormalizationInvalid("github group_ref.due_on must be non-empty string or null")
+            # milestone id must derive from same repository + milestone number
+            expected_ms_id = github_reader._milestone_id(si["canonical_id"], gr["number"])
+            if gr["id"] != expected_ms_id:
+                raise BacklogNormalizationInvalid("github group_ref.id does not derive from repository+number")
 
 
 def build_normalized_items(sources: list[dict[str, Any]], observations: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -408,18 +484,100 @@ def compute_snapshot_record_digest(payload: dict[str, Any]) -> str:
     return sha256_hex(canonical_json_bytes(core))
 
 
+def compute_snapshot_digest_from_snapshot(snapshot: dict[str, Any]) -> str:
+    """Recompute the semantic snapshot_digest directly from a snapshot payload."""
+    semantic_sources = []
+    for prov in snapshot.get("sources", []):
+        semantic_sources.append({
+            "adapter": prov.get("adapter"),
+            "source_identity": prov.get("source_identity"),
+            "request_digest": prov.get("request_digest"),
+            "content_digest": prov.get("content_digest"),
+        })
+    semantic_sources.sort(key=canonical_json_bytes)
+    item_descriptors = sorted(
+        [{"backlog_item_id": d["backlog_item_id"], "item_digest": d["item_digest"]} for d in snapshot.get("items", [])],
+        key=lambda d: d["backlog_item_id"],
+    )
+    core = {
+        "schema": NORMALIZED_SNAPSHOT_SCHEMA,
+        "sources": semantic_sources,
+        "items": item_descriptors,
+    }
+    return sha256_hex(canonical_json_bytes(core))
+
+
 def validate_normalized_snapshot(snapshot: Any) -> None:
     _obj_fields(snapshot, SNAPSHOT_FIELDS, "normalized snapshot")
     if snapshot["schema"] != NORMALIZED_SNAPSHOT_SCHEMA:
         raise BacklogNormalizationInvalid("snapshot schema mismatch")
+    if not isinstance(snapshot.get("snapshot_digest"), str) or not SHA256_HEX_RE.fullmatch(snapshot["snapshot_digest"]):
+        raise BacklogNormalizationInvalid("snapshot_digest must be a 64-hex digest")
+    if not isinstance(snapshot.get("snapshot_record_digest"), str) or not SHA256_HEX_RE.fullmatch(snapshot["snapshot_record_digest"]):
+        raise BacklogNormalizationInvalid("snapshot_record_digest must be a 64-hex digest")
+    if not isinstance(snapshot.get("snapshot_record_id"), str) or not re.fullmatch(r"^blsnaprec_[0-9a-f]{64}$", snapshot["snapshot_record_id"]):
+        raise BacklogNormalizationInvalid("snapshot_record_id must match ^blsnaprec_[0-9a-f]{64}$")
+    if isinstance(snapshot.get("source_count"), bool) or not isinstance(snapshot.get("source_count"), int) or snapshot["source_count"] < 0:
+        raise BacklogNormalizationInvalid("source_count must be a non-negative integer")
+    if isinstance(snapshot.get("item_count"), bool) or not isinstance(snapshot.get("item_count"), int) or snapshot["item_count"] < 1:
+        raise BacklogNormalizationInvalid("item_count must be a positive integer")
+
+    # Semantic snapshot_digest recomputation must match exactly.
+    if compute_snapshot_digest_from_snapshot(snapshot) != snapshot["snapshot_digest"]:
+        raise BacklogNormalizationInvalid("snapshot_digest does not recompute from semantic descriptors")
+
+    # Source provenance exact shapes + deterministic ordering + no duplicates.
+    sources = snapshot.get("sources")
+    if not isinstance(sources, list) or len(sources) != snapshot["source_count"]:
+        raise BacklogNormalizationInvalid("source_count mismatch")
+    seen_sources: list[str] = []
+    for prov in sources:
+        _obj_fields(prov, ("operation_id", "observation_id", "observation_digest", "request_digest", "content_digest", "outcome", "adapter", "source_identity"), "source provenance")
+        if not OPERATION_ID_RE.fullmatch(prov["operation_id"]):
+            raise BacklogNormalizationInvalid("source provenance operation_id format")
+        if not re.fullmatch(r"^srcobs_[0-9a-f]{64}$", prov["observation_id"]):
+            raise BacklogNormalizationInvalid("source provenance observation_id format")
+        for key in ("observation_digest", "request_digest", "content_digest"):
+            if not SHA256_HEX_RE.fullmatch(prov[key]):
+                raise BacklogNormalizationInvalid(f"source provenance {key} format")
+        if prov["outcome"] not in ("changed", "unchanged"):
+            raise BacklogNormalizationInvalid("source provenance outcome must be changed|unchanged")
+        if not isinstance(prov.get("adapter"), str) or not prov["adapter"]:
+            raise BacklogNormalizationInvalid("source provenance adapter must be non-empty")
+        si = prov.get("source_identity")
+        if not isinstance(si, dict) or sorted(si.keys()) != ["canonical_id", "kind"]:
+            raise BacklogNormalizationInvalid("source provenance source_identity must be {kind, canonical_id}")
+        seen_sources.append(prov["operation_id"])
+    if len(seen_sources) != len(set(seen_sources)):
+        raise BacklogNormalizationInvalid("duplicate source provenance operation_id")
+    if sources != sorted(sources, key=canonical_json_bytes):
+        raise BacklogNormalizationInvalid("sources must be deterministically sorted")
+
+    # Item descriptors exact shapes + deterministic ordering + no duplicates.
+    items = snapshot.get("items")
+    if not isinstance(items, list) or len(items) != snapshot["item_count"]:
+        raise BacklogNormalizationInvalid("item_count mismatch")
+    seen_items: list[str] = []
+    for desc in items:
+        _obj_fields(desc, ("backlog_item_id", "item_digest", "artifact_id"), "snapshot item descriptor")
+        if not BACKLOG_ITEM_ID_RE.fullmatch(desc["backlog_item_id"]):
+            raise BacklogNormalizationInvalid("snapshot item backlog_item_id format")
+        if not ITEM_DIGEST_RE.fullmatch(desc["item_digest"]):
+            raise BacklogNormalizationInvalid("snapshot item item_digest format")
+        expected_artifact = f"normalized-backlog/item/{desc['backlog_item_id']}/{desc['item_digest']}"
+        if desc["artifact_id"] != expected_artifact:
+            raise BacklogNormalizationInvalid("snapshot item artifact_id does not derive from id+digest")
+        seen_items.append(desc["backlog_item_id"])
+    if len(seen_items) != len(set(seen_items)):
+        raise BacklogNormalizationInvalid("duplicate snapshot backlog_item_id")
+    if [d["backlog_item_id"] for d in items] != sorted(seen_items):
+        raise BacklogNormalizationInvalid("items must be deterministically sorted by backlog_item_id")
+
+    # Record digest/id recomputation (after semantic structure).
     if snapshot["snapshot_record_digest"] != compute_snapshot_record_digest(snapshot):
         raise BacklogNormalizationInvalid("snapshot_record_digest does not recompute")
     if snapshot["snapshot_record_id"] != "blsnaprec_" + snapshot["snapshot_record_digest"]:
         raise BacklogNormalizationInvalid("snapshot_record_id does not derive from digest")
-    if not isinstance(snapshot.get("sources"), list) or len(snapshot.get("sources", [])) != snapshot.get("source_count"):
-        raise BacklogNormalizationInvalid("source_count mismatch")
-    if not isinstance(snapshot.get("items"), list) or len(snapshot.get("items", [])) != snapshot.get("item_count"):
-        raise BacklogNormalizationInvalid("item_count mismatch")
 
 
 def _snapshot_payload(
