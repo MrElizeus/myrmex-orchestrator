@@ -358,6 +358,122 @@ def main() -> None:
         except rdr.LocalSourcePolicyError:
             check(True, "secret content rejected")
 
+        # ---- Frontier corrective-plan regressions (p1-004-val-req-0001) ----
+        # F1/F2: pre-intent handling is lexical only; separator canonicalization before traversal
+        before_lexical = count_artifacts(campaign_dir)
+        for bad in ("../outside.md", "..\\outside.md", "docs/../../outside.md", "docs\\..\\..\\outside.md", "/etc/passwd", "C:\\x\\y.md", "//server/share.md"):
+            try:
+                import_local(repo, campaign_dir, campaign_id, "lex-" + str(abs(hash(bad))), bad)
+                check(False, f"lexical path {bad!r} should be rejected")
+            except rdr.LocalSourceError:
+                check(True, f"lexical path {bad!r} rejected")
+        check(count_artifacts(campaign_dir) == before_lexical, "lexical rejections create no intent artifact")
+
+        # F3: fail-closed safety backend — simulate import failure of the safety module
+        import importlib
+        saved_intel = rdr.intel
+        try:
+            rdr.intel = None  # type: ignore
+            # _policy_reject must fail (no silent pass)
+            try:
+                rdr._policy_reject({"title": "x"}, "$")
+                check(False, "fail-closed: policy with missing backend must raise")
+            except AttributeError:
+                check(True, "fail-closed: missing backend raises")
+        finally:
+            rdr.intel = saved_intel  # type: ignore
+
+        # F3b: module import fails closed with LocalSourceError when the backend is blocked
+        import subprocess as _sp
+        import textwrap as _tw
+        _probe = _tw.dedent(
+            """
+            import sys, importlib.abc
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name == "myrmex_campaign_intelligence":
+                        raise ImportError("blocked for test")
+                    return None
+            sys.meta_path.insert(0, Blocker())
+            sys.path.insert(0, "scripts")
+            try:
+                import myrmex_roadmap_reader
+                print("IMPORTED")
+            except Exception as e:
+                print(type(e).__name__)
+            """
+        )
+        _r = _sp.run([sys.executable, "-c", _probe], capture_output=True, text=True, cwd=str(ROOT))
+        check("LocalSourceError" in _r.stdout, "module import fails closed with LocalSourceError")
+
+        # F4: strict manifest types — no str() coercion; malformed values rejected
+        for bad_manifest in (
+            {"constraints": {"a": 1}},
+            {"constraints": "scalar"},
+            {"objectives": [{"title": "O", "constraints": [{"x": 1}]}]},
+            {"items": [{"title": "I", "constraints": [True]}]},
+            {"items": [{"title": "I", "depends_on": [{"x": 1}]}]},
+            {"items": [{"title": "I", "objective": {"x": 1}}]},
+            {"items": [{"title": "I", "objective": 5}]},
+        ):
+            try:
+                rdr.parse_manifest_object(bad_manifest, "bad.json", "manifest_json")
+                check(False, f"strict manifest should reject {str(bad_manifest)[:40]}")
+            except rdr.LocalSourceMalformed:
+                check(True, f"strict manifest rejected {str(bad_manifest)[:40]}")
+
+        # JSON non-finite constants rejected
+        for bad_json in ('{"title": NaN}', '{"title": Infinity}', '{"title": -Infinity}'):
+            try:
+                rdr.parse_json_manifest(bad_json, "bad.json")
+                check(False, f"non-finite JSON should reject {bad_json}")
+            except rdr.LocalSourceMalformed:
+                check(True, f"non-finite JSON rejected {bad_json}")
+
+        # F5: bullet-prefixed metadata is metadata, not a candidate item
+        bullet = rdr.parse_markdown_roadmap(
+            "# T\n\n## O\n\n### I\n\n- Priority: P1\n- Depends on: a, b\n- Constraints: c1; c2\n", "b.md"
+        )
+        rdr.validate_neutral_representation(bullet)
+        check(len(bullet["items"]) == 1, "bullet metadata creates no extra item")
+        check(bullet["items"][0]["priority"] == "P1", "bullet priority populated")
+        check(bullet["items"][0]["dependency_hints"] == ["a", "b"], "bullet deps populated")
+        check(bullet["items"][0]["constraints"] == ["c1", "c2"], "bullet constraints populated")
+
+        # F6: objective-reference precedence — explicit ID wins; ambiguous title unresolved
+        ref_data = {
+            "objectives": [
+                {"id": "same-title", "title": "Shared Title"},
+                {"id": "other", "title": "Shared Title"},
+            ],
+            "items": [{"title": "I", "objective": "Shared Title"}],
+        }
+        ref_parsed = rdr.parse_manifest_object(ref_data, "ref.json", "manifest_json")
+        check(
+            any(a["code"] == "unresolved_objective_reference" for a in ref_parsed["ambiguities"]),
+            "ambiguous shared title -> unresolved",
+        )
+        check(ref_parsed["items"][0]["objective_id"] is None, "no first-by-order winner")
+
+        # F7: YAML quoted punctuation allowed; 2-space jumps enforced
+        y_ok = rdr.parse_yaml_manifest('title: "R&D!"\n', "q.yaml")
+        rdr.validate_neutral_representation(y_ok)
+        check(y_ok["title"] == "R&D!", "quoted YAML punctuation allowed")
+        y_ok2 = rdr.parse_yaml_manifest("title: 'Progress > 90%'\n", "q2.yaml")
+        rdr.validate_neutral_representation(y_ok2)
+        check(y_ok2["title"] == "Progress > 90%", "quoted YAML > % allowed")
+        try:
+            rdr.parse_yaml_manifest("a:\n    b: 1\n", "jump.yaml")
+            check(False, "4-space jump must be malformed")
+        except rdr.LocalSourceMalformed:
+            check(True, "4-space jump rejected")
+
+        # F8: repository immutability — capture before/after file manifest
+        before_map = {p.relative_to(repo).as_posix(): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+        import_local(repo, campaign_dir, campaign_id, "import-immut-001", "roadmap.md")
+        after_map = {p.relative_to(repo).as_posix(): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+        check(before_map == after_map, "adapter never mutates repository files")
+
     print(f"local backlog import test: {'FAIL' if failures else 'PASS'} ({len(failures)} failures)")
     if failures:
         for f in failures:
