@@ -474,6 +474,135 @@ def main() -> None:
         after_map = {p.relative_to(repo).as_posix(): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
         check(before_map == after_map, "adapter never mutates repository files")
 
+        # ---- Frontier second corrective-plan regressions (p1-004-val-req-0002) ----
+        # F1: reader construction is filesystem-free (no resolve at build time)
+        reader = rdr.make_local_source_reader(str(repo))
+        check(callable(reader), "reader is callable")
+
+        # F2: null-vs-omitted manifest fields — explicit null is malformed
+        for null_manifest in (
+            {"constraints": None},
+            {"objectives": None},
+            {"items": None},
+            {"objectives": [{"title": "O", "constraints": None}]},
+            {"objectives": [{"title": "O", "items": None}]},
+            {"items": [{"title": "I", "depends_on": None}]},
+            {"items": [{"title": "I", "constraints": None}]},
+        ):
+            try:
+                rdr.parse_manifest_object(null_manifest, "null.json", "manifest_json")
+                check(False, f"explicit null should be malformed: {str(null_manifest)[:40]}")
+            except rdr.LocalSourceMalformed:
+                check(True, f"explicit null rejected: {str(null_manifest)[:40]}")
+
+        # F3: YAML inline JSON non-finite rejected
+        for bad_yaml in (
+            "items: [{\"title\": \"I\", \"priority\": NaN}]\n",
+            "items: [{\"title\": \"I\", \"priority\": Infinity}]\n",
+        ):
+            try:
+                rdr.parse_yaml_manifest(bad_yaml, "bad.yaml")
+                check(False, f"YAML inline non-finite should reject {bad_yaml.strip()}")
+            except rdr.LocalSourceMalformed:
+                check(True, f"YAML inline non-finite rejected {bad_yaml.strip()}")
+
+        # F4: YAML merge keys rejected
+        for merge_yaml in ("<<: *x\n", "a:\n  <<: {b: 1}\n"):
+            try:
+                rdr.parse_yaml_manifest(merge_yaml, "merge.yaml")
+                check(False, f"YAML merge key should reject {merge_yaml.strip()}")
+            except rdr.LocalSourceMalformed:
+                check(True, f"YAML merge key rejected {merge_yaml.strip()}")
+
+        # F5: escaped double quotes in YAML quoted scalars
+        esc = rdr.parse_yaml_manifest('title: "Use \\"A!\\" > safely"\n', "esc.yaml")
+        rdr.validate_neutral_representation(esc)
+        check(esc["title"] == 'Use "A!" > safely', "escaped double quotes parsed")
+
+        # F6: duplicate-objective by semantic ID — distinct explicit IDs sharing a title are distinct
+        dup_sem = rdr.parse_manifest_object(
+            {"objectives": [{"id": "a", "title": "Shared"}, {"id": "b", "title": "Shared"}]},
+            "sem.json", "manifest_json",
+        )
+        check(
+            not any(a["code"] == "duplicate_objective_identity" for a in dup_sem["ambiguities"]),
+            "distinct explicit IDs sharing title are not duplicate identities",
+        )
+        # ... but a title reference to both is unresolved
+        dup_ref = rdr.parse_manifest_object(
+            {
+                "objectives": [{"id": "a", "title": "Shared"}, {"id": "b", "title": "Shared"}],
+                "items": [{"title": "I", "objective": "Shared"}],
+            },
+            "sem2.json", "manifest_json",
+        )
+        check(
+            any(a["code"] == "unresolved_objective_reference" for a in dup_ref["ambiguities"]),
+            "title ref to shared title unresolved",
+        )
+        # explicit ID ref resolves
+        exp_ref = rdr.parse_manifest_object(
+            {
+                "objectives": [{"id": "a", "title": "Shared"}, {"id": "b", "title": "Shared"}],
+                "items": [{"title": "I", "objective": "a"}],
+            },
+            "sem3.json", "manifest_json",
+        )
+        check(exp_ref["items"][0]["objective_id"] is not None, "explicit ID ref resolves")
+
+        # F7: state-first filesystem access + replay read-count
+        import myrmex_backlog_import as bimport
+        # instrument: capture filesystem operations through reader closure — reader does resolve only on call
+        # count reader invocations by wrapping
+        call_log = {"count": 0}
+        orig_reader = rdr.make_local_source_reader
+        def counting_reader(repo_root):
+            def wrapped(context):
+                call_log["count"] += 1
+                return orig_reader(repo_root)(context)
+            return wrapped
+        rdr.make_local_source_reader = counting_reader
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-sf-001", "roadmap.md")
+            first_count = call_log["count"]
+            import_local(repo, campaign_dir, campaign_id, "import-sf-001", "roadmap.md")
+            second_count = call_log["count"]
+            check(first_count == 1, "first execution: exactly one source read")
+            check(second_count == 1, "replay: zero additional source reads (count unchanged)")
+        finally:
+            rdr.make_local_source_reader = orig_reader
+
+        # F8: malformed lifecycle for all three formats — intent only
+        for fmt_name, content in (
+            ("roadmap-malformed.md", fixture("roadmap-malformed.md").decode()),
+            ("malformed.json", '{"title": "x", "title": "y"}'),
+            ("malformed.yaml", "title: x\ntitle: y\n"),
+        ):
+            target = repo / fmt_name
+            target.write_text(content, encoding="utf-8")
+            before_m = count_artifacts(campaign_dir)
+            try:
+                import_local(repo, campaign_dir, campaign_id, "ml-" + fmt_name.replace(".", "-"), fmt_name)
+                check(False, f"malformed {fmt_name} should not confirm")
+            except rdr.LocalSourceMalformed:
+                check(True, f"malformed {fmt_name} raises")
+            check(count_artifacts(campaign_dir) == before_m + 1, f"malformed {fmt_name}: intent only")
+
+        # Repair/replay for JSON manifest
+        target = repo / "malformed.json"
+        target.write_text('{"title": "Fixed", "objectives": [{"title": "O", "items": [{"title": "I"}]}]}', encoding="utf-8")
+        r_fix = import_local(repo, campaign_dir, campaign_id, "ml-malformed-json", "malformed.json")
+        check(r_fix["status"] == "confirmed", "JSON repair replay confirmed")
+
+        # Semantic-change lifecycle: new digest differs, outcome changed, item_id stable
+        base_neutral = rdr.parse_markdown_roadmap(fixture("roadmap.md").decode(), "roadmap.md")
+        base_digest = rdr.semantic_source_digest(base_neutral)
+        changed_file = repo / "changed.md"
+        changed_file.write_text(
+            "# Myrmex P1 Roadmap\n\n## Campaign Intelligence\n\n### Deterministic planning\n\nPriority: P9\nDepends on: Contract Foundation, Storage Primitives\nConstraints: Must be deterministic; Must preserve P0\n\n- [ ] Backlog normalization\n- [x] Plan revision store\nConstraints: Immutable revisions\n\n## Colony Intelligence\n\n### Portfolio scheduler\n\nPriority: P2\nDepends on: Campaign Intelligence\nConstraints: Bounded concurrency\n\n- Candidate coordination\nConstraints: Read-only adapters\n", encoding="utf-8")
+        r_change = import_local(repo, campaign_dir, campaign_id, "import-change-001", "changed.md", previous=base_digest)
+        check(r_change["status"] == "confirmed" and r_change["outcome"] == "changed", "semantic change -> changed")
+
     print(f"local backlog import test: {'FAIL' if failures else 'PASS'} ({len(failures)} failures)")
     if failures:
         for f in failures:
