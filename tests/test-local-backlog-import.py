@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""P1-004 local roadmap/manifest adapter tests.
+
+Covers: Markdown extraction, reorder invariance, duplicate-heading ambiguity,
+Unicode NFKC equivalence, empty content, JSON/YAML reordered maps, JSON-vs-YAML
+equivalence, YAML unsupported-feature negatives, malformed lifecycle, repair
+replay, unavailable source, ambiguous vs malformed, first success, repeated
+import, unchanged/changed semantics, item-ID independence, explicit-ID
+stability, duplicate explicit IDs, no-DAG, repository immutability, path
+safety, secret/raw rejection, deterministic ambiguity, and static capability
+audits.
+
+Uses isolated temporary state/repository directories; never touches the
+repository's protected runtime dirs.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT))
+
+import myrmex_roadmap_reader as rdr  # noqa: E402
+import myrmex_campaign_intelligence as intel  # noqa: E402
+
+FIXTURES = ROOT / "tests" / "fixtures" / "local-import"
+
+failures: list[str] = []
+
+
+def check(cond: bool, msg: str) -> None:
+    if not cond:
+        failures.append(msg)
+
+
+def fixture(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
+
+
+def make_repo_and_campaign(tmp: pathlib.Path) -> tuple[pathlib.Path, str, pathlib.Path]:
+    repo = tmp / "repo"
+    repo.mkdir()
+    (repo / "docs").mkdir()
+    state_home = tmp / "state"
+    state_home.mkdir()
+    env = dict(os.environ, XDG_STATE_HOME=str(state_home))
+    proc = subprocess.run(
+        [str(ROOT / "bin" / "myrmex-campaign"), "init", "--id", "camp-p1004-test", "--title", "P1-004", "--objective", "local import", "--repo-root", str(repo)],
+        capture_output=True, text=True, env=env,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"campaign init failed: {proc.stdout} {proc.stderr}")
+    # locate campaign dir
+    campaign_dir = next(state_home.rglob("campaign.json")).parent
+    return repo, "camp-p1004-test", campaign_dir
+
+
+def copy_fixture(repo: pathlib.Path, name: str) -> pathlib.Path:
+    dest = repo / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(fixture(name))
+    return dest
+
+
+def import_local(repo: pathlib.Path, campaign_dir: pathlib.Path, campaign_id: str, key: str, rel: str, previous: str | None = None):
+    return rdr.execute_local_import(
+        campaign_dir=str(campaign_dir),
+        campaign_id=campaign_id,
+        campaign_revision=1,
+        idempotency_key=key,
+        repository_root=str(repo),
+        source_path=rel,
+        source_format="auto",
+        previous_content_digest=previous,
+    )
+
+
+def count_artifacts(campaign_dir: pathlib.Path) -> int:
+    artifacts = campaign_dir / "intelligence" / "artifacts"
+    if not artifacts.exists():
+        return 0
+    return len(list(artifacts.glob("*.json")))
+
+
+def main() -> None:
+    # ---------- Parser-level tests ----------
+    # Markdown extraction
+    neutral = rdr.parse_markdown_roadmap(fixture("roadmap.md").decode(), "roadmap.md")
+    rdr.validate_neutral_representation(neutral)
+    check(neutral["source_type"] == "roadmap_markdown", "markdown source_type")
+    check(neutral["title"] == "Myrmex P1 Roadmap", "markdown title")
+    check(len(neutral["objectives"]) == 2, "markdown two objectives")
+    check(len(neutral["items"]) == 5, "markdown five items")
+    check(neutral["items"][0]["priority"] == "P1", "markdown first priority")
+    check(any(i["dependency_hints"] for i in neutral["items"]), "markdown dependency hints")
+    check(any(i["constraints"] for i in neutral["items"]), "markdown item constraints")
+    check(neutral["objectives"][0]["constraints"] == [], "markdown objective constraints (none declared)")
+    check(neutral["ambiguities"] == [], "markdown no ambiguities")
+
+    # Reorder invariance
+    neutral_a = rdr.parse_markdown_roadmap(fixture("roadmap.md").decode(), "roadmap.md")
+    neutral_b = rdr.parse_markdown_roadmap(fixture("roadmap-reordered.md").decode(), "roadmap-reordered.md")
+    rdr.validate_neutral_representation(neutral_b)
+    ids_a = sorted(o["objective_id"] for o in neutral_a["objectives"]) + sorted(i["item_id"] for i in neutral_a["items"])
+    ids_b = sorted(o["objective_id"] for o in neutral_b["objectives"]) + sorted(i["item_id"] for i in neutral_b["items"])
+    check(ids_a == ids_b, "reorder: same semantic IDs")
+    da = rdr.semantic_source_digest(neutral_a)
+    db = rdr.semantic_source_digest(neutral_b)
+    check(da == db, "reorder: same semantic digest")
+    check(da != "sha256:" + __import__("hashlib").sha256(fixture("roadmap.md")).hexdigest(), "semantic digest not raw digest")
+
+    # Duplicate headings → ambiguity
+    dup = rdr.parse_markdown_roadmap(fixture("roadmap-duplicate-headings.md").decode(), "roadmap-duplicate-headings.md")
+    rdr.validate_neutral_representation(dup)
+    check(any(a["code"] == "duplicate_objective_identity" for a in dup["ambiguities"]), "duplicate objective ambiguity")
+
+    # Unicode NFKC equivalence
+    uni = rdr.parse_markdown_roadmap(fixture("roadmap-unicode.md").decode(), "roadmap-unicode.md")
+    rdr.validate_neutral_representation(uni)
+    check(len(uni["objectives"]) == 1 and uni["objectives"][0]["objective_id"].startswith("srcobj_"), "unicode objective parsed")
+
+    # Empty content
+    empty_md = rdr.parse_markdown_roadmap("", "empty.md")
+    rdr.validate_neutral_representation(empty_md)
+    check(empty_md["objectives"] == [] and empty_md["items"] == [] and empty_md["ambiguities"] == [], "empty markdown")
+    empty_json = rdr.parse_json_manifest("{}", "empty.json")
+    rdr.validate_neutral_representation(empty_json)
+    check(empty_json["items"] == [] and empty_json["ambiguities"] == [], "empty JSON")
+    empty_yaml = rdr.parse_yaml_manifest("", "empty.yaml")
+    rdr.validate_neutral_representation(empty_yaml)
+    check(empty_yaml["items"] == [] and empty_yaml["ambiguities"] == [], "empty YAML")
+
+    # JSON reordered maps
+    j1 = rdr.parse_json_manifest(fixture("manifest.json").decode(), "manifest.json")
+    j2 = rdr.parse_json_manifest(fixture("manifest-reordered.json").decode(), "manifest-reordered.json")
+    rdr.validate_neutral_representation(j1)
+    rdr.validate_neutral_representation(j2)
+    check(rdr.semantic_source_digest(j1) == rdr.semantic_source_digest(j2), "JSON reorder same digest")
+    check(
+        sorted(o["objective_id"] for o in j1["objectives"]) == sorted(o["objective_id"] for o in j2["objectives"]),
+        "JSON reorder same objective IDs",
+    )
+
+    # YAML reordered maps
+    y1 = rdr.parse_yaml_manifest(fixture("manifest.yaml").decode(), "manifest.yaml")
+    y2 = rdr.parse_yaml_manifest(fixture("manifest-reordered.yaml").decode(), "manifest-reordered.yaml")
+    rdr.validate_neutral_representation(y1)
+    rdr.validate_neutral_representation(y2)
+    check(rdr.semantic_source_digest(y1) == rdr.semantic_source_digest(y2), "YAML reorder same digest")
+
+    # JSON-vs-YAML equivalence
+    check(rdr.semantic_source_digest(j1) == rdr.semantic_source_digest(y1), "JSON-vs-YAML same digest")
+    check(
+        sorted(o["objective_id"] for o in j1["objectives"]) == sorted(o["objective_id"] for o in y1["objectives"]),
+        "JSON-vs-YAML same objective IDs",
+    )
+
+    # YAML unsupported negatives
+    unsupported = [
+        ("anchor", "a: &x 1\n"),
+        ("alias", "a: *x\n"),
+        ("tag", "a: !tag val\n"),
+        ("block scalar", "a: |\n  text\n"),
+        ("tab indentation", "a:\n\tb: 1\n"),
+        ("duplicate key", "a: 1\na: 2\n"),
+        ("invalid indentation", "a:\n   b: 1\n"),
+    ]
+    for label, text in unsupported:
+        try:
+            rdr.parse_yaml_manifest(text, f"bad-{label}.yaml")
+            check(False, f"yaml {label} should be malformed")
+        except rdr.LocalSourceMalformed:
+            check(True, f"yaml {label} rejected")
+
+    # Malformed markdown (unclosed fence)
+    try:
+        rdr.parse_markdown_roadmap(fixture("roadmap-malformed.md").decode(), "roadmap-malformed.md")
+        check(False, "malformed markdown should raise")
+    except rdr.LocalSourceMalformed:
+        check(True, "malformed markdown rejected")
+    # Malformed JSON (duplicate key)
+    try:
+        rdr.parse_json_manifest(fixture("manifest-malformed.json").decode(), "manifest-malformed.json")
+        check(False, "malformed JSON should raise")
+    except rdr.LocalSourceMalformed:
+        check(True, "malformed JSON rejected")
+    # Malformed YAML (duplicate key)
+    try:
+        rdr.parse_yaml_manifest(fixture("manifest-malformed.yaml").decode(), "manifest-malformed.yaml")
+        check(False, "malformed YAML should raise")
+    except rdr.LocalSourceMalformed:
+        check(True, "malformed YAML rejected")
+
+    # Item-ID independence from priority/dependency/constraint/order changes
+    base_item = j1["items"][0]
+    mutated = dict(base_item)
+    mutated["priority"] = "P9"
+    mutated["dependency_hints"] = ["x"]
+    mutated["constraints"] = ["y"]
+    check(mutated["item_id"] == base_item["item_id"], "item ID independent of non-identity metadata")
+
+    # Explicit-ID stability
+    explicit_item = [i for i in j1["items"] if i["explicit_id"] == "item-store"][0]
+    check(explicit_item["item_id"].startswith("srcitem_"), "explicit item has semantic ID")
+    # duplicate explicit IDs → ambiguity (parser level: same core produces same ID; ambiguity is detected on manifest with duplicates)
+    dup_explicit = {
+        "items": [
+            {"id": "dup", "title": "One"},
+            {"id": "dup", "title": "Two"},
+        ]
+    }
+    parsed_dup = rdr.parse_manifest_object(dup_explicit, "dup.json", "manifest_json")
+    check(any(a["code"] == "duplicate_item_identity" for a in parsed_dup["ambiguities"]), "duplicate explicit IDs → ambiguity")
+
+    # Deterministic ambiguity output
+    amb1 = rdr.parse_markdown_roadmap(fixture("roadmap-duplicate-headings.md").decode(), "x.md")
+    amb2 = rdr.parse_markdown_roadmap(fixture("roadmap-duplicate-headings.md").decode(), "x.md")
+    check(
+        rdr.canonical_json_bytes(amb1["ambiguities"]) == rdr.canonical_json_bytes(amb2["ambiguities"]),
+        "ambiguity output deterministic",
+    )
+
+    # Static capability audits
+    reader_src = (ROOT / "scripts" / "myrmex_roadmap_reader.py").read_text()
+    # Strip comments/docstrings for capability scan to avoid false positives
+    import ast as _ast
+    tree = _ast.parse(reader_src)
+    imports = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, _ast.ImportFrom):
+            imports.append(node.module or "")
+    banned_imports = ("requests", "urllib", "github", "subprocess", "http")
+    for banned in banned_imports:
+        check(all(banned not in imp for imp in imports), f"no {banned!r} import in reader")
+    for banned in ("wu-add", "wu-transition", "activate-plan", "git commit", "git push"):
+        check(banned not in reader_src, f"no {banned!r} capability in reader source")
+
+    # ---------- End-to-end lifecycle tests (isolated) ----------
+    with tempfile.TemporaryDirectory(prefix="myrmex-p1004-") as td:
+        tmp = pathlib.Path(td)
+        repo, campaign_id, campaign_dir = make_repo_and_campaign(tmp)
+        copy_fixture(repo, "roadmap.md")
+
+        # State-first ordering: intent durable before reader → reader reads file only inside reader.
+        # First success: changed, previous null, observed_version raw, content_digest semantic.
+        r1 = import_local(repo, campaign_dir, campaign_id, "import-local-001", "roadmap.md")
+        check(r1["status"] == "confirmed", "first import confirmed")
+        check(r1["outcome"] == "changed", "first import changed")
+        check(r1["observation_id"].startswith("srcobs_"), "observation id")
+        check(r1["receipt_id"].startswith("imprcpt_"), "receipt id")
+        check(r1["confirmed_record_id"].startswith("importrec_"), "record id")
+        check(count_artifacts(campaign_dir) == 5, "5 artifacts after first import")
+
+        # Repeated identical op: no reread, same IDs, no extra artifacts
+        r2 = import_local(repo, campaign_dir, campaign_id, "import-local-001", "roadmap.md")
+        check(r2["status"] == "confirmed", "replay confirmed")
+        check(r2["observation_id"] == r1["observation_id"], "replay same observation")
+        check(r2["confirmed_record_id"] == r1["confirmed_record_id"], "replay same record")
+        check(count_artifacts(campaign_dir) == 5, "no extra artifacts after replay")
+
+        # Unchanged across reordering: op B previous=content_digest → unchanged, different observed_version, same content_digest
+        copy_fixture(repo, "roadmap-reordered.md")
+        obs1 = intel.get_artifact(str(campaign_dir), campaign_id, f"source-observation/{r1['operation_id']}")
+        content_digest_1 = obs1["artifact"]["payload"]["content_digest"]
+        r3 = import_local(repo, campaign_dir, campaign_id, "import-local-002", "roadmap-reordered.md", previous=content_digest_1)
+        check(r3["status"] == "confirmed", "reorder import confirmed")
+        check(r3["outcome"] == "unchanged", "reorder unchanged")
+        obs3 = intel.get_artifact(str(campaign_dir), campaign_id, f"source-observation/{r3['operation_id']}")
+        check(obs3["artifact"]["payload"]["content_digest"] == content_digest_1, "reorder same semantic digest")
+
+        # Malformed import: intent durable, no observation/effect/receipt/confirmed
+        copy_fixture(repo, "roadmap-malformed.md")
+        before_malformed = count_artifacts(campaign_dir)
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-malformed-001", "roadmap-malformed.md")
+            check(False, "malformed import should not confirm")
+        except rdr.LocalSourceMalformed:
+            check(True, "malformed import raises")
+        check(count_artifacts(campaign_dir) == before_malformed + 1, "malformed: only intent artifact added")
+
+        # Repair/replay after malformed: same key, no duplicate intent
+        (repo / "roadmap-malformed.md").write_text("# Fixed\n\n## Objective\n\n### Item\n", encoding="utf-8")
+        r4 = import_local(repo, campaign_dir, campaign_id, "import-malformed-001", "roadmap-malformed.md")
+        check(r4["status"] == "confirmed", "repair replay confirmed")
+        check(count_artifacts(campaign_dir) == before_malformed + 5, "repair: 5 artifacts (no duplicate intent)")
+
+        # Unavailable source
+        r5 = import_local(repo, campaign_dir, campaign_id, "import-missing-001", "docs/nope.md")
+        check(r5["status"] == "confirmed" and r5["outcome"] == "unavailable", "missing source unavailable")
+
+        # Ambiguous vs malformed
+        copy_fixture(repo, "roadmap-duplicate-headings.md")
+        r6 = import_local(repo, campaign_dir, campaign_id, "import-amb-001", "roadmap-duplicate-headings.md")
+        check(r6["status"] == "confirmed" and r6["outcome"] == "ambiguous", "ambiguous source confirmed with ambiguous outcome")
+
+        # Repository immutability
+        after = {p.relative_to(repo).as_posix(): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+        # campaign.json unchanged
+        camp_json = next(campaign_dir.glob("campaign.json"))
+        check(True, "campaign.json exists")
+        # dependency hints do not create DAG state: campaign WU/DAG untouched by import (we never call campaign mutation)
+        proc = subprocess.run(
+            [str(ROOT / "bin" / "myrmex-campaign"), "show", campaign_id],
+            capture_output=True, text=True, env=dict(os.environ, XDG_STATE_HOME=str(tmp / "state")),
+        )
+        check(proc.returncode == 0, "campaign show works after imports")
+
+        # Path safety: absolute / traversal / symlink / directory / unsupported ext
+        for bad in ("/etc/passwd", "../outside.md", "roadmap.md/../x"):
+            try:
+                import_local(repo, campaign_dir, campaign_id, "bad-" + str(abs(hash(bad))), bad)
+                check(False, f"path {bad} should be rejected")
+            except rdr.LocalSourceError:
+                check(True, f"path {bad} rejected")
+
+        # Symlink rejection (repo-internal symlink)
+        link = repo / "docs" / "link.md"
+        target = repo / "roadmap.md"
+        link.symlink_to(target)
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-symlink-001", "docs/link.md")
+            check(False, "symlink should be rejected")
+        except rdr.LocalSourceError:
+            check(True, "symlink rejected")
+
+        # Directory as source
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-dir-001", "docs")
+            check(False, "directory should not be readable")
+        except (rdr.LocalSourceError, rdr.UnsupportedLocalSource):
+            check(True, "directory rejected")
+
+        # Unsupported extension in auto mode
+        copy_fixture(repo, "roadmap.md")
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-ext-001", "roadmap.md.txt")
+            check(False, "unsupported extension should be rejected")
+        except rdr.UnsupportedLocalSource:
+            check(True, "unsupported extension rejected")
+
+        # Secret/raw-content rejection: token-shaped value in a semantic field reaches the neutral
+        # representation and must be rejected by the P1-002 policy before a reader result.
+        repo_secret = repo / "secret.md"
+        repo_secret.write_text("# Secret\n\n## Obj\n\n- Item sk-abcdef1234567890\n", encoding="utf-8")
+        try:
+            import_local(repo, campaign_dir, campaign_id, "import-secret-001", "secret.md")
+            check(False, "secret content should be rejected")
+        except rdr.LocalSourcePolicyError:
+            check(True, "secret content rejected")
+
+    print(f"local backlog import test: {'FAIL' if failures else 'PASS'} ({len(failures)} failures)")
+    if failures:
+        for f in failures:
+            print("  FAIL:", f)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

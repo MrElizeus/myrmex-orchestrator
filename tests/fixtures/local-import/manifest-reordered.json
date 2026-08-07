@@ -1,0 +1,40 @@
+{
+  "constraints": [
+    "English-first",
+    "Preserve P0"
+  ],
+  "items": [
+    {
+      "constraints": [
+        "Immutable"
+      ],
+      "priority": "P0",
+      "objective": "obj-intelligence",
+      "title": "Store",
+      "id": "item-store"
+    }
+  ],
+  "objectives": [
+    {
+      "items": [
+        {
+          "constraints": [
+            "Bounded"
+          ],
+          "depends_on": [
+            "item-store"
+          ],
+          "priority": 1,
+          "title": "Planner",
+          "id": "item-planner"
+        }
+      ],
+      "constraints": [
+        "Deterministic"
+      ],
+      "title": "Intelligence",
+      "id": "obj-intelligence"
+    }
+  ],
+  "title": "Myrmex Manifest"
+}
