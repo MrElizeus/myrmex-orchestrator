@@ -394,6 +394,15 @@ def validate_normalized_item(item: Any) -> None:
             raise BacklogNormalizationInvalid("local items must have state=null")
         if item.get("labels") != []:
             raise BacklogNormalizationInvalid("local items must have labels=[]")
+        # canonical local semantic fields
+        if item["title"] != roadmap_reader.normalize_text(item["title"]):
+            raise BacklogNormalizationInvalid("local item title must be canonical (normalize_text)")
+        if item.get("priority") is not None and item["priority"] != roadmap_reader.normalize_text(item["priority"]):
+            raise BacklogNormalizationInvalid("local item priority must be canonical (normalize_text)")
+        for key in ("dependency_hints", "constraints", "context_constraints"):
+            for entry in item[key]:
+                if entry != roadmap_reader.normalize_text(entry):
+                    raise BacklogNormalizationInvalid(f"local item {key} entries must be canonical (normalize_text)")
         gr = item.get("group_ref")
         if gr is not None:
             _obj_fields(gr, GROUP_REF_LOCAL_FIELDS, "local group_ref")
@@ -403,7 +412,12 @@ def validate_normalized_item(item: Any) -> None:
                 raise BacklogNormalizationInvalid("local group_ref.id must match ^srcobj_[0-9a-f]{64}$")
             if not isinstance(gr["title"], str) or not gr["title"]:
                 raise BacklogNormalizationInvalid("local group_ref.title must be non-empty")
+            if gr["title"] != roadmap_reader.normalize_text(gr["title"]):
+                raise BacklogNormalizationInvalid("local group_ref.title must be canonical (normalize_text)")
     else:  # github-issue
+        # canonical GitHub repository identity
+        if si["canonical_id"] != github_reader.canonical_repository(si["canonical_id"]):
+            raise BacklogNormalizationInvalid("github item source_identity.canonical_id must be canonical")
         if item.get("priority") is not None:
             raise BacklogNormalizationInvalid("github items must have priority=null")
         if item.get("dependency_hints") != [] or item.get("constraints") != [] or item.get("context_constraints") != []:
@@ -522,23 +536,26 @@ def validate_normalized_snapshot(snapshot: Any) -> None:
     if isinstance(snapshot.get("item_count"), bool) or not isinstance(snapshot.get("item_count"), int) or snapshot["item_count"] < 1:
         raise BacklogNormalizationInvalid("item_count must be a positive integer")
 
-    # Semantic snapshot_digest recomputation must match exactly.
-    if compute_snapshot_digest_from_snapshot(snapshot) != snapshot["snapshot_digest"]:
-        raise BacklogNormalizationInvalid("snapshot_digest does not recompute from semantic descriptors")
-
-    # Source provenance exact shapes + deterministic ordering + no duplicates.
+    # ---- Structural checks BEFORE any digest recomputation (no incidental exceptions) ----
     sources = snapshot.get("sources")
     if not isinstance(sources, list) or len(sources) != snapshot["source_count"]:
         raise BacklogNormalizationInvalid("source_count mismatch")
     seen_sources: list[str] = []
     for prov in sources:
+        if not isinstance(prov, dict):
+            raise BacklogNormalizationInvalid("source provenance must be an object")
         _obj_fields(prov, ("operation_id", "observation_id", "observation_digest", "request_digest", "content_digest", "outcome", "adapter", "source_identity"), "source provenance")
-        if not OPERATION_ID_RE.fullmatch(prov["operation_id"]):
+        if not isinstance(prov["operation_id"], str) or not OPERATION_ID_RE.fullmatch(prov["operation_id"]):
             raise BacklogNormalizationInvalid("source provenance operation_id format")
-        if not re.fullmatch(r"^srcobs_[0-9a-f]{64}$", prov["observation_id"]):
+        if not isinstance(prov["observation_id"], str) or not re.fullmatch(r"^srcobs_[0-9a-f]{64}$", prov["observation_id"]):
             raise BacklogNormalizationInvalid("source provenance observation_id format")
-        for key in ("observation_digest", "request_digest", "content_digest"):
-            if not SHA256_HEX_RE.fullmatch(prov[key]):
+        if not isinstance(prov["observation_digest"], str) or not SHA256_HEX_RE.fullmatch(prov["observation_digest"]):
+            raise BacklogNormalizationInvalid("source provenance observation_digest format")
+        # observation_id must derive from observation_digest
+        if prov["observation_id"] != "srcobs_" + prov["observation_digest"]:
+            raise BacklogNormalizationInvalid("observation_id does not derive from observation_digest")
+        for key in ("request_digest", "content_digest"):
+            if not isinstance(prov[key], str) or not SHA256_HEX_RE.fullmatch(prov[key]):
                 raise BacklogNormalizationInvalid(f"source provenance {key} format")
         if prov["outcome"] not in ("changed", "unchanged"):
             raise BacklogNormalizationInvalid("source provenance outcome must be changed|unchanged")
@@ -547,6 +564,23 @@ def validate_normalized_snapshot(snapshot: Any) -> None:
         si = prov.get("source_identity")
         if not isinstance(si, dict) or sorted(si.keys()) != ["canonical_id", "kind"]:
             raise BacklogNormalizationInvalid("source provenance source_identity must be {kind, canonical_id}")
+        if not isinstance(si.get("kind"), str) or not si["kind"]:
+            raise BacklogNormalizationInvalid("source provenance source_identity.kind must be a non-empty string")
+        if not isinstance(si.get("canonical_id"), str) or not si["canonical_id"]:
+            raise BacklogNormalizationInvalid("source provenance source_identity.canonical_id must be a non-empty string")
+        # bounded adapter -> expected source-kind map
+        expected_kind = {
+            "local-markdown-roadmap/v1": "local-roadmap",
+            "local-manifest-json/v1": "local-manifest",
+            "local-manifest-yaml/v1": "local-manifest",
+            "github-issues-milestones/v1": "github-issues-milestones",
+        }.get(prov["adapter"])
+        if expected_kind is None or si["kind"] != expected_kind:
+            raise BacklogNormalizationInvalid("source provenance unsupported adapter/source-kind combination")
+        # canonical GitHub repository identity
+        if prov["adapter"] == "github-issues-milestones/v1":
+            if si["canonical_id"] != github_reader.canonical_repository(si["canonical_id"]):
+                raise BacklogNormalizationInvalid("source provenance github repository must be canonical")
         seen_sources.append(prov["operation_id"])
     if len(seen_sources) != len(set(seen_sources)):
         raise BacklogNormalizationInvalid("duplicate source provenance operation_id")
@@ -559,11 +593,15 @@ def validate_normalized_snapshot(snapshot: Any) -> None:
         raise BacklogNormalizationInvalid("item_count mismatch")
     seen_items: list[str] = []
     for desc in items:
+        if not isinstance(desc, dict):
+            raise BacklogNormalizationInvalid("snapshot item descriptor must be an object")
         _obj_fields(desc, ("backlog_item_id", "item_digest", "artifact_id"), "snapshot item descriptor")
-        if not BACKLOG_ITEM_ID_RE.fullmatch(desc["backlog_item_id"]):
+        if not isinstance(desc["backlog_item_id"], str) or not BACKLOG_ITEM_ID_RE.fullmatch(desc["backlog_item_id"]):
             raise BacklogNormalizationInvalid("snapshot item backlog_item_id format")
-        if not ITEM_DIGEST_RE.fullmatch(desc["item_digest"]):
+        if not isinstance(desc["item_digest"], str) or not ITEM_DIGEST_RE.fullmatch(desc["item_digest"]):
             raise BacklogNormalizationInvalid("snapshot item item_digest format")
+        if not isinstance(desc["artifact_id"], str):
+            raise BacklogNormalizationInvalid("snapshot item artifact_id must be a string")
         expected_artifact = f"normalized-backlog/item/{desc['backlog_item_id']}/{desc['item_digest']}"
         if desc["artifact_id"] != expected_artifact:
             raise BacklogNormalizationInvalid("snapshot item artifact_id does not derive from id+digest")
@@ -573,7 +611,11 @@ def validate_normalized_snapshot(snapshot: Any) -> None:
     if [d["backlog_item_id"] for d in items] != sorted(seen_items):
         raise BacklogNormalizationInvalid("items must be deterministically sorted by backlog_item_id")
 
-    # Record digest/id recomputation (after semantic structure).
+    # ---- Semantic snapshot_digest recomputation (structure verified above) ----
+    if compute_snapshot_digest_from_snapshot(snapshot) != snapshot["snapshot_digest"]:
+        raise BacklogNormalizationInvalid("snapshot_digest does not recompute from semantic descriptors")
+
+    # ---- Record digest/id recomputation ----
     if snapshot["snapshot_record_digest"] != compute_snapshot_record_digest(snapshot):
         raise BacklogNormalizationInvalid("snapshot_record_digest does not recompute")
     if snapshot["snapshot_record_id"] != "blsnaprec_" + snapshot["snapshot_record_digest"]:

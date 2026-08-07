@@ -431,6 +431,197 @@ def main() -> None:
             check(True, "non-ready raises")
         check(count_normalized(campaign_dir) == before_nonready, "non-ready produces zero normalized writes")
 
+        # ---- Frontier third corrective-plan regressions (p1-006-val-req-0002) ----
+        # F1: fresh snapshot-last failure with NO pre-existing completion snapshot
+        # Use a NEW manifest with explicit item id on a fresh path; its snapshot was never persisted.
+        manifest2_path = repo / "manifest2.json"
+        manifest2_path.write_text(json.dumps({
+            "title": "Manifest2",
+            "objectives": [],
+            "items": [{"id": "item-explicit", "title": "Explicit Title", "priority": 1}],
+        }, ensure_ascii=False), encoding="utf-8")
+        r_manifest2 = roadmap.execute_local_import(str(campaign_dir), campaign_id, 1, "norm-manifest2-001", str(repo), "manifest2.json")
+        m2_neutral = roadmap.parse_json_manifest(manifest2_path.read_text(encoding="utf-8"), "manifest2.json")
+        m2_desc = [{"operation_id": r_manifest2["operation_id"], "neutral": m2_neutral}]
+        # compute expected items without persisting snapshot
+        # (normalize will write items first, then we block the snapshot)
+        expected_m2_items = 1
+        intel_mod.put_artifact = failing_put  # failing_put raises on snapshot artifact IDs
+        injected["failed"] = False
+        try:
+            try:
+                norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, m2_desc)
+                check(False, "fresh snapshot failure should raise")
+            except RuntimeError:
+                check(injected["failed"], "fresh snapshot write failed as injected")
+        finally:
+            intel_mod.put_artifact = orig_put
+        # prove expected snapshot artifact is ABSENT
+        # find the expected record id by computing what normalize would produce
+        obs_m2 = intel.get_artifact(str(campaign_dir), campaign_id, f"source-observation/{r_manifest2['operation_id']}")["artifact"]["payload"]
+        m2_items = norm.build_normalized_items(m2_desc, {r_manifest2["operation_id"]: obs_m2})
+        m2_snap_digest = norm.compute_snapshot_digest(m2_desc, {r_manifest2["operation_id"]: obs_m2}, m2_items)
+        # rebuild the payload to get record id
+        m2_payload = norm._snapshot_payload(m2_desc, {r_manifest2["operation_id"]: obs_m2}, m2_items, m2_snap_digest)
+        expected_snap_id = f"normalized-backlog/snapshot/{m2_payload['snapshot_record_id']}"
+        snap_missing = True
+        try:
+            intel.get_artifact(str(campaign_dir), campaign_id, expected_snap_id)
+            snap_missing = False
+        except Exception:
+            pass
+        check(snap_missing, "fresh snapshot completion artifact absent after injected failure")
+        # item artifacts durable
+        item_present = 0
+        for it in m2_items:
+            aid = f"normalized-backlog/item/{it['backlog_item_id']}/{it['item_digest']}"
+            try:
+                env = intel.get_artifact(str(campaign_dir), campaign_id, aid)
+                if env["artifact"]["artifact_id"] == aid:
+                    item_present += 1
+            except Exception:
+                pass
+        check(item_present == expected_m2_items, "fresh items durable after failure")
+        # retry: reuse items, create snapshot
+        r_m2_retry = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, m2_desc)
+        check(r_m2_retry["item_artifacts_created"] == 0, "fresh retry reuses items")
+        check(r_m2_retry["item_artifacts_reused"] == expected_m2_items, "fresh retry reuses all items")
+        check(r_m2_retry["snapshot_artifact_status"] == "created", "fresh retry creates snapshot")
+        # third run: reuse everything
+        r_m2_third = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, m2_desc)
+        check(r_m2_third["snapshot_artifact_status"] == "reused", "third run reuses snapshot")
+
+        # F2/F3: intra-source content reorder (roadmap-reordered + github snapshot-reordered)
+        # roadmap reorder: same path, op B with reordered content
+        (repo / "roadmap.md").write_text((ROOT / "tests" / "fixtures" / "local-import" / "roadmap-reordered.md").read_text(encoding="utf-8"), encoding="utf-8")
+        r_roadmap_b = roadmap.execute_local_import(str(campaign_dir), campaign_id, 1, "norm-roadmap-reorder-001", str(repo), "roadmap.md")
+        roadmap_b_neutral = roadmap.parse_markdown_roadmap((repo / "roadmap.md").read_text(encoding="utf-8"), "roadmap.md")
+        # github reorder
+        gh_reorder_transport = FakeTransport(json.loads((ROOT / "tests" / "fixtures" / "github-import" / "snapshot-reordered.json").read_text()))
+        r_github_b = github.execute_github_import(str(campaign_dir), campaign_id, 1, "norm-github-reorder-001", "Owner/Repo", gh_reorder_transport)
+        gh_b_neutral = github.normalize_github_snapshot(json.loads((ROOT / "tests" / "fixtures" / "github-import" / "snapshot-reordered.json").read_text()), "owner/repo")
+        # normalize original roadmap+github-only and reordered roadmap+github-only; compare sets
+        orig_roadmap_op = [op for op, (label, _) in sources_map.items() if label == "roadmap"][0]
+        orig_github_op = [op for op, (label, _) in sources_map.items() if label == "github"][0]
+        orig_rg = [
+            {"operation_id": orig_roadmap_op, "neutral": sources_map[orig_roadmap_op][1]},
+            {"operation_id": orig_github_op, "neutral": sources_map[orig_github_op][1]},
+        ]
+        reorder_rg = [
+            {"operation_id": r_roadmap_b["operation_id"], "neutral": roadmap_b_neutral},
+            {"operation_id": r_github_b["operation_id"], "neutral": gh_b_neutral},
+        ]
+        # normalize each set separately on the same campaign; snapshot digest should match for equivalent semantics
+        r_orig_rg = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, orig_rg)
+        r_reorder_rg = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, reorder_rg)
+        check(r_reorder_rg["snapshot_digest"] == r_orig_rg["snapshot_digest"], "intra-source reorder preserves snapshot digest")
+        # item identity sets equal
+        snap_orig = intel.get_artifact(str(campaign_dir), campaign_id, f"normalized-backlog/snapshot/{r_orig_rg['snapshot_record_id']}")["artifact"]["payload"]
+        snap_reorder = intel.get_artifact(str(campaign_dir), campaign_id, f"normalized-backlog/snapshot/{r_reorder_rg['snapshot_record_id']}")["artifact"]["payload"]
+        orig_ids = {(d["backlog_item_id"], d["item_digest"]) for d in snap_orig["items"]}
+        reorder_ids = {(d["backlog_item_id"], d["item_digest"]) for d in snap_reorder["items"]}
+        check(orig_ids == reorder_ids, "intra-source reorder preserves item identities/digests")
+
+        # F4: equivalent new observations preserve semantic digest + distinct lineage
+        # create new equivalent observations (roadmap reorder content == same semantics, github reorder)
+        r_eq = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, reorder_rg, previous_snapshot_digest=r_orig_rg["snapshot_digest"])
+        check(r_eq["outcome"] == "unchanged", "equivalent new observations -> unchanged")
+        check(r_eq["snapshot_digest"] == r_orig_rg["snapshot_digest"], "equivalent new observations same semantic digest")
+        # lineage differs: provenance operation ids differ
+        snap_eq = intel.get_artifact(str(campaign_dir), campaign_id, f"normalized-backlog/snapshot/{r_eq['snapshot_record_id']}")["artifact"]["payload"]
+        orig_ops = {p["operation_id"] for p in snap_orig["sources"]}
+        eq_ops = {p["operation_id"] for p in snap_eq["sources"]}
+        check(len(orig_ops & eq_ops) == 0, "equivalent observations have distinct operation lineage")
+
+        # F5: explicit manifest-ID versioning preserves backlog identity
+        manifest2_path.write_text(json.dumps({
+            "title": "Manifest2",
+            "objectives": [],
+            "items": [{"id": "item-explicit", "title": "Explicit Title Changed", "priority": 9}],
+        }, ensure_ascii=False), encoding="utf-8")
+        r_manifest2b = roadmap.execute_local_import(str(campaign_dir), campaign_id, 1, "norm-manifest2-002", str(repo), "manifest2.json")
+        m2b_neutral = roadmap.parse_json_manifest(manifest2_path.read_text(encoding="utf-8"), "manifest2.json")
+        m2b_desc = [{"operation_id": r_manifest2b["operation_id"], "neutral": m2b_neutral}]
+        r_m2b = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, m2b_desc)
+        m2b_snap = intel.get_artifact(str(campaign_dir), campaign_id, f"normalized-backlog/snapshot/{r_m2b['snapshot_record_id']}")["artifact"]["payload"]
+        # compare with original manifest2 item
+        r_m2_first = norm.normalize_backlog_sources(campaign_dir, campaign_id, 1, m2_desc)
+        m2_first_snap = intel.get_artifact(str(campaign_dir), campaign_id, f"normalized-backlog/snapshot/{r_m2_first['snapshot_record_id']}")["artifact"]["payload"]
+        first_item = m2_first_snap["items"][0]
+        second_item = next(d for d in m2b_snap["items"] if d["backlog_item_id"] == first_item["backlog_item_id"])
+        check(second_item["item_digest"] != first_item["item_digest"], "explicit manifest ID versioning: different item_digest")
+
+        # F6/F11: adversarial recomputed-digest matrix
+        # item corruption: local non-normalized title (recompute digests)
+        bad_canon = dict(valid_item)
+        bad_canon["title"] = "  Non   Canonical  "
+        bad_canon["item_digest"] = norm.compute_item_digest(bad_canon)
+        try:
+            norm.validate_normalized_item(bad_canon)
+            check(False, "non-canonical local title should be rejected")
+        except norm.BacklogNormalizationInvalid:
+            check(True, "non-canonical local title rejected")
+        # github non-canonical repo
+        bad_gh = dict(valid_item)
+        if bad_gh["source_entity_type"] == "github-issue":
+            bad_gh["source_identity"] = {"kind": "github-issues-milestones", "canonical_id": "Owner/Repo"}
+            bad_gh["backlog_item_id"] = norm.compute_backlog_item_id(bad_gh["source_adapter"], bad_gh["source_identity"], bad_gh["source_entity_id"])
+            bad_gh["item_digest"] = norm.compute_item_digest(bad_gh)
+            try:
+                norm.validate_normalized_item(bad_gh)
+                check(False, "non-canonical github repo should be rejected")
+            except norm.BacklogNormalizationInvalid:
+                check(True, "non-canonical github repo rejected")
+        # snapshot corruption: observation_id not derived
+        bad_snap2 = copy.deepcopy(snap_payload)
+        bad_snap2["sources"] = copy.deepcopy(snap_payload["sources"])
+        bad_snap2["sources"][0]["observation_id"] = "srcobs_" + "0" * 64
+        bad_snap2["snapshot_digest"] = norm.compute_snapshot_digest_from_snapshot(bad_snap2)
+        bad_snap2["snapshot_record_digest"] = norm.compute_snapshot_record_digest(bad_snap2)
+        bad_snap2["snapshot_record_id"] = "blsnaprec_" + bad_snap2["snapshot_record_digest"]
+        try:
+            norm.validate_normalized_snapshot(bad_snap2)
+            check(False, "snapshot with non-derived observation_id should be rejected")
+        except norm.BacklogNormalizationInvalid:
+            check(True, "snapshot non-derived observation_id rejected")
+        # provenance wrong source_identity value type
+        bad_snap3 = copy.deepcopy(snap_payload)
+        bad_snap3["sources"] = copy.deepcopy(snap_payload["sources"])
+        bad_snap3["sources"][0]["source_identity"] = {"kind": 123, "canonical_id": []}
+        bad_snap3["snapshot_digest"] = norm.compute_snapshot_digest_from_snapshot(bad_snap3)
+        bad_snap3["snapshot_record_digest"] = norm.compute_snapshot_record_digest(bad_snap3)
+        bad_snap3["snapshot_record_id"] = "blsnaprec_" + bad_snap3["snapshot_record_digest"]
+        try:
+            norm.validate_normalized_snapshot(bad_snap3)
+            check(False, "snapshot with wrong source_identity value types should be rejected")
+        except norm.BacklogNormalizationInvalid:
+            check(True, "snapshot wrong source_identity value types rejected")
+        # provenance wrong-kind string (cross-adapter kind swap)
+        bad_snap4 = copy.deepcopy(snap_payload)
+        bad_snap4["sources"] = copy.deepcopy(snap_payload["sources"])
+        bad_snap4["sources"][0]["source_identity"] = {"kind": "garbage-kind", "canonical_id": "x"}
+        bad_snap4["snapshot_digest"] = norm.compute_snapshot_digest_from_snapshot(bad_snap4)
+        bad_snap4["snapshot_record_digest"] = norm.compute_snapshot_record_digest(bad_snap4)
+        bad_snap4["snapshot_record_id"] = "blsnaprec_" + bad_snap4["snapshot_record_digest"]
+        try:
+            norm.validate_normalized_snapshot(bad_snap4)
+            check(False, "snapshot with wrong-kind string should be rejected")
+        except norm.BacklogNormalizationInvalid:
+            check(True, "snapshot wrong-kind string rejected")
+        # malformed provenance (non-dict) must produce typed failure, not AttributeError
+        bad_snap5 = copy.deepcopy(snap_payload)
+        bad_snap5["sources"] = [42]
+        bad_snap5["snapshot_digest"] = "0" * 64
+        bad_snap5["snapshot_record_digest"] = norm.compute_snapshot_record_digest(bad_snap5)
+        bad_snap5["snapshot_record_id"] = "blsnaprec_" + bad_snap5["snapshot_record_digest"]
+        try:
+            norm.validate_normalized_snapshot(bad_snap5)
+            check(False, "snapshot with non-dict provenance should raise typed error")
+        except norm.BacklogNormalizationInvalid:
+            check(True, "snapshot non-dict provenance raises typed error")
+        except Exception as exc:
+            check(False, f"snapshot non-dict provenance raised incidental {type(exc).__name__}")
+
     print(f"backlog normalization test: {'FAIL' if failures else 'PASS'} ({len(failures)} failures)")
     if failures:
         for f in failures:
