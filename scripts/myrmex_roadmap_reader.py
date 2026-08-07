@@ -43,11 +43,18 @@ import sys
 import unicodedata
 from typing import Any, Callable
 
+
+class LocalSourceError(Exception):
+    """Base error for local-source adapters."""
+
+
 try:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import myrmex_campaign_intelligence as intel  # type: ignore
-except Exception:  # pragma: no cover - import-time only
-    intel = None  # type: ignore
+except Exception as exc:  # pragma: no cover - import-time only
+    raise LocalSourceError(
+        "P1-002 safety backend is unavailable; local-source adapters fail closed"
+    ) from exc
 
 
 NEUTRAL_SCHEMA = "myrmex.local-source-neutral/v1"
@@ -93,10 +100,6 @@ AMBIGUITY_CODES = {
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-class LocalSourceError(Exception):
-    """Base error for local-source adapters."""
-
-
 class LocalSourceMalformed(LocalSourceError):
     """Source content is syntactically invalid or uses unsupported syntax."""
 
@@ -110,9 +113,12 @@ class UnsupportedLocalSource(LocalSourceError):
 
 
 def _policy_reject(value: Any, where: str = "$") -> None:
-    """Apply the P1-002 secret/raw-content policy; never echo the value."""
-    if intel is None:
-        return
+    """Apply the P1-002 secret/raw-content policy; never echo the value.
+
+    Fails closed: if the P1-002 backend is unavailable the module could not
+    have been imported successfully (see module import), so this helper can
+    rely on ``intel`` being present.
+    """
     try:
         intel.reject_secret_or_raw(value, where)
     except intel.IntelligencePayloadRejected as exc:
@@ -154,7 +160,7 @@ def display_text(value: str) -> str:
 # Neutral representation validation
 
 
-def _obj_fields(value: Any, allowed: tuple[str, ...], label: str) -> None:
+def _obj_fields(value: Any, allowed: tuple[str, ...], label: str, require_all: bool = False) -> None:
     if not isinstance(value, dict):
         raise LocalSourceMalformed(f"{label} must be an object")
     unknown = sorted(set(value) - set(allowed))
@@ -162,10 +168,16 @@ def _obj_fields(value: Any, allowed: tuple[str, ...], label: str) -> None:
         raise LocalSourceMalformed(
             f"{label} has unknown fields: {', '.join(sorted(unknown))}"
         )
+    if require_all:
+        missing = [field for field in allowed if field not in value]
+        if missing:
+            raise LocalSourceMalformed(
+                f"{label} is missing required fields: {', '.join(sorted(missing))}"
+            )
 
 
 def _validate_location(value: Any) -> None:
-    _obj_fields(value, SEMANTIC_LOCATION_FIELDS, "source_location")
+    _obj_fields(value, SEMANTIC_LOCATION_FIELDS, "source_location", require_all=True)
     if not isinstance(value.get("path"), str) or not value["path"]:
         raise LocalSourceMalformed("source_location.path must be a non-empty string")
     if value.get("locator_type") not in ("line", "json-pointer"):
@@ -175,7 +187,7 @@ def _validate_location(value: Any) -> None:
 
 
 def _validate_ambiguity(value: Any) -> None:
-    _obj_fields(value, SEMANTIC_AMBIGUITY_FIELDS, "ambiguity")
+    _obj_fields(value, SEMANTIC_AMBIGUITY_FIELDS, "ambiguity", require_all=True)
     if value.get("code") not in AMBIGUITY_CODES:
         raise LocalSourceMalformed(f"ambiguity has unknown code {value.get('code')!r}")
     if value.get("entity_id") is not None and not isinstance(value["entity_id"], str):
@@ -188,7 +200,7 @@ def _validate_ambiguity(value: Any) -> None:
 
 
 def _validate_objective(value: Any) -> None:
-    _obj_fields(value, SEMANTIC_OBJECTIVE_FIELDS, "objective")
+    _obj_fields(value, SEMANTIC_OBJECTIVE_FIELDS, "objective", require_all=True)
     if not isinstance(value.get("objective_id"), str) or not value["objective_id"].startswith("srcobj_"):
         raise LocalSourceMalformed("objective.objective_id must be a srcobj_ id")
     if value.get("explicit_id") is not None and not isinstance(value["explicit_id"], str):
@@ -203,7 +215,7 @@ def _validate_objective(value: Any) -> None:
 
 
 def _validate_item(value: Any) -> None:
-    _obj_fields(value, SEMANTIC_ITEM_FIELDS, "item")
+    _obj_fields(value, SEMANTIC_ITEM_FIELDS, "item", require_all=True)
     if not isinstance(value.get("item_id"), str) or not value["item_id"].startswith("srcitem_"):
         raise LocalSourceMalformed("item.item_id must be a srcitem_ id")
     for key in ("explicit_id", "objective_id", "priority"):
@@ -237,7 +249,7 @@ def _recompute_item_id(item: dict[str, Any]) -> str:
 
 def validate_neutral_representation(neutral: Any) -> None:
     """Validate a neutral representation; raise LocalSourceMalformed on violation."""
-    _obj_fields(neutral, SEMANTIC_TOP_FIELDS, "neutral representation")
+    _obj_fields(neutral, SEMANTIC_TOP_FIELDS, "neutral representation", require_all=True)
     if neutral.get("schema") != NEUTRAL_SCHEMA:
         raise LocalSourceMalformed(f"schema must be {NEUTRAL_SCHEMA}")
     if neutral.get("source_type") not in SOURCE_TYPES:
@@ -348,7 +360,7 @@ def _split_lines(text: str) -> list[str]:
 def parse_markdown_roadmap(text: str, source_path: str) -> dict[str, Any]:
     """Parse a bounded Markdown roadmap into a neutral representation."""
     lines = _split_lines(text)
-    titles: list[str] = []
+    titles: list[tuple[str, int]] = []
     objectives: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
     constraints: list[str] = []
@@ -412,7 +424,7 @@ def parse_markdown_roadmap(text: str, source_path: str) -> dict[str, Any]:
 
         m = _H1_RE.match(raw)
         if m:
-            titles.append(display_text(m.group(1)))
+            titles.append((display_text(m.group(1)), lineno))
             current_item = None
             continue
         m = _H2_RE.match(raw)
@@ -429,19 +441,6 @@ def parse_markdown_roadmap(text: str, source_path: str) -> dict[str, Any]:
             current_item = None
             continue
         m = _H3_RE.match(raw)
-        if m:
-            title = display_text(m.group(1))
-            item = make_item(title, current_objective, lineno)
-            norm = normalize_text(title)
-            key = (current_objective["objective_id"] if current_objective else None, norm)
-            if key in item_index:
-                add_ambiguity("duplicate_item_identity", item["item_id"], lineno)
-            else:
-                item_index[key] = len(items)
-                items.append(item)
-            current_item = item
-            continue
-        m = _LIST_RE.match(raw)
         if m:
             title = display_text(m.group(1))
             item = make_item(title, current_objective, lineno)
@@ -485,6 +484,19 @@ def parse_markdown_roadmap(text: str, source_path: str) -> dict[str, Any]:
                 else:
                     constraints.extend([part.strip() for part in value.split(";") if part.strip()])
             continue
+        m = _LIST_RE.match(raw)
+        if m:
+            title = display_text(m.group(1))
+            item = make_item(title, current_objective, lineno)
+            norm = normalize_text(title)
+            key = (current_objective["objective_id"] if current_objective else None, norm)
+            if key in item_index:
+                add_ambiguity("duplicate_item_identity", item["item_id"], lineno)
+            else:
+                item_index[key] = len(items)
+                items.append(item)
+            current_item = item
+            continue
         # Any other non-empty line: treat as document prose; clear item context.
         current_item = None
 
@@ -493,13 +505,13 @@ def parse_markdown_roadmap(text: str, source_path: str) -> dict[str, Any]:
             f"unclosed fenced code block starting at line {fence_start}"
         )
     if len(titles) > 1:
-        for idx in range(1, len(titles)):
-            add_ambiguity("multiple_document_titles", None, idx + 1)
+        for title_text, title_line in titles[1:]:
+            add_ambiguity("multiple_document_titles", None, title_line)
 
     return {
         "schema": NEUTRAL_SCHEMA,
         "source_type": "roadmap_markdown",
-        "title": titles[0] if titles else None,
+        "title": titles[0][0] if titles else None,
         "objectives": objectives,
         "items": items,
         "constraints": constraints,
@@ -528,6 +540,18 @@ def _normalize_priority(value: Any) -> str | None:
     raise LocalSourceMalformed("priority must be a string, number, or null")
 
 
+def _require_string_array(value: Any, field: str, allow_omitted: bool = True) -> list[str]:
+    """Require an array of strings for one manifest field (no coercion)."""
+    if value is None and allow_omitted:
+        return []
+    if not isinstance(value, list):
+        raise LocalSourceMalformed(f"manifest {field} must be an array of strings")
+    for entry in value:
+        if not isinstance(entry, str):
+            raise LocalSourceMalformed(f"manifest {field} entries must be strings")
+    return list(value)
+
+
 def parse_manifest_object(
     data: Any, source_path: str, source_type: str,
 ) -> dict[str, Any]:
@@ -539,13 +563,11 @@ def parse_manifest_object(
     ambiguities: list[dict[str, Any]] = []
     objectives: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
-    constraints: list[str] = []
+    constraints = _require_string_array(data.get("constraints"), "constraints")
 
     title = data.get("title")
     if title is not None and not isinstance(title, str):
         raise LocalSourceMalformed("manifest title must be a string or null")
-    if isinstance(data.get("constraints"), list):
-        constraints = [str(c) for c in data["constraints"]]
 
     def add_ambiguity(code: str, entity_id: str | None, pointer: str) -> None:
         ambiguities.append({
@@ -554,8 +576,8 @@ def parse_manifest_object(
             "locations": [{"path": source_path, "locator_type": "json-pointer", "locator": pointer}],
         })
 
-    explicit_objective_index: dict[str, int] = {}
-    title_objective_index: dict[str, int] = {}
+    explicit_objective_index: dict[str, list[int]] = {}
+    title_objective_index: dict[str, list[int]] = {}
     item_id_index: dict[str, int] = {}
 
     def make_objective(obj: dict[str, Any], pointer: str) -> dict[str, Any]:
@@ -570,10 +592,7 @@ def parse_manifest_object(
         else:
             core = {"title": normalize_text(obj["title"])}
         oid = "srcobj_" + sha256_hex(canonical_json_bytes(core))
-        if isinstance(obj.get("constraints"), list):
-            cstr = [str(c) for c in obj["constraints"]]
-        else:
-            cstr = []
+        cstr = _require_string_array(obj.get("constraints"), "objective.constraints")
         return {
             "objective_id": oid,
             "explicit_id": explicit,
@@ -593,25 +612,16 @@ def parse_manifest_object(
             raise LocalSourceMalformed(
                 "manifest item must not specify objective when nested inside an objective"
             )
+        obj_ref = item.get("objective")
+        if obj_ref is not None and not isinstance(obj_ref, str):
+            raise LocalSourceMalformed("manifest item.objective must be a string, null, or omitted")
         if explicit is not None:
             core = {"explicit_id": normalize_text(explicit)}
         else:
             core = {"objective_id": obj["objective_id"] if obj else None, "title": normalize_text(item["title"])}
         iid = "srcitem_" + sha256_hex(canonical_json_bytes(core))
-        depends = item.get("depends_on")
-        if depends is None:
-            depends = []
-        elif isinstance(depends, list):
-            depends = [str(d) for d in depends]
-        else:
-            raise LocalSourceMalformed("manifest item.depends_on must be an array")
-        cstr = item.get("constraints")
-        if cstr is None:
-            cstr = []
-        elif isinstance(cstr, list):
-            cstr = [str(c) for c in cstr]
-        else:
-            raise LocalSourceMalformed("manifest item.constraints must be an array")
+        depends = _require_string_array(item.get("depends_on"), "item.depends_on")
+        cstr = _require_string_array(item.get("constraints"), "item.constraints")
         return {
             "item_id": iid,
             "explicit_id": explicit,
@@ -630,17 +640,21 @@ def parse_manifest_object(
         pointer = f"/objectives/{idx}"
         parsed = make_objective(obj, pointer)
         norm_explicit = normalize_text(parsed["explicit_id"]) if parsed["explicit_id"] else None
+        duplicate = False
         if norm_explicit and norm_explicit in explicit_objective_index:
+            duplicate = True
+        norm_title = normalize_text(parsed["title"])
+        if norm_title in title_objective_index:
+            duplicate = True
+        if duplicate:
             add_ambiguity("duplicate_objective_identity", parsed["objective_id"], pointer)
-        else:
-            if norm_explicit:
-                explicit_objective_index[norm_explicit] = len(objectives)
-            norm_title = normalize_text(parsed["title"])
-            if norm_title in title_objective_index:
-                add_ambiguity("duplicate_objective_identity", parsed["objective_id"], pointer)
-            else:
-                title_objective_index[norm_title] = len(objectives)
-            objectives.append(parsed)
+        # Always index every objective (including duplicates) so reference
+        # resolution can detect zero/multiple matches and never pick a
+        # first-by-order winner.
+        if norm_explicit:
+            explicit_objective_index.setdefault(norm_explicit, []).append(len(objectives))
+        title_objective_index.setdefault(norm_title, []).append(len(objectives))
+        objectives.append(parsed)
         nested_items = obj.get("items")
         if nested_items is not None and not isinstance(nested_items, list):
             raise LocalSourceMalformed("manifest objective.items must be an array")
@@ -657,20 +671,25 @@ def parse_manifest_object(
         raise LocalSourceMalformed("manifest items must be an array")
     for idx, item in enumerate(items_raw or []):
         pointer = f"/items/{idx}"
-        obj_ref = item.get("objective") if isinstance(item, dict) else None
+        if not isinstance(item, dict):
+            raise LocalSourceMalformed("manifest item must be an object")
+        obj_ref = item.get("objective")
         target_obj: dict[str, Any] | None = None
         if obj_ref is not None:
-            norm_ref = normalize_text(str(obj_ref))
-            matches = []
-            if norm_ref in explicit_objective_index:
-                matches.append(explicit_objective_index[norm_ref])
-            if norm_ref in title_objective_index:
-                matches.append(title_objective_index[norm_ref])
-            matches = sorted(set(matches))
-            if len(matches) != 1:
+            if not isinstance(obj_ref, str):
+                raise LocalSourceMalformed("manifest item.objective must be a string, null, or omitted")
+            norm_ref = normalize_text(obj_ref)
+            explicit_matches = explicit_objective_index.get(norm_ref, [])
+            if len(explicit_matches) == 1:
+                target_obj = objectives[explicit_matches[0]]
+            elif len(explicit_matches) > 1:
                 add_ambiguity("unresolved_objective_reference", None, pointer)
             else:
-                target_obj = objectives[matches[0]]
+                title_matches = title_objective_index.get(norm_ref, [])
+                if len(title_matches) == 1:
+                    target_obj = objectives[title_matches[0]]
+                else:
+                    add_ambiguity("unresolved_objective_reference", None, pointer)
         parsed_item = make_item(item, target_obj, pointer)
         if parsed_item["item_id"] in item_id_index:
             add_ambiguity("duplicate_item_identity", parsed_item["item_id"], pointer)
@@ -698,9 +717,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonfinite(value: str) -> Any:
+    raise LocalSourceMalformed(f"non-standard JSON constant {value!r}")
+
+
 def parse_json_manifest(text: str, source_path: str) -> dict[str, Any]:
     try:
-        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        data = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
     except LocalSourceMalformed:
         raise
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
@@ -716,18 +743,37 @@ class _YamlSubsetError(Exception):
     pass
 
 
+def _has_yaml_meta_token(raw: str) -> bool:
+    """Return True when a YAML meta-syntax character appears outside quoted text."""
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch in ("&", "*", "!", "|", ">", "%") and not in_single and not in_double:
+            return True
+        i += 1
+    return False
+
+
 def _yaml_parse(text: str) -> Any:
     """Parse a deliberately narrow YAML subset into Python objects.
 
     Supported: UTF-8, spaces-only indentation, mappings, sequences (including
-    sequences of mappings and sequences of sequences), nesting, plain scalars,
-    double/single-quoted strings, null, true/false, integers, finite decimals,
-    inline JSON []/{}, full-line comments.
+    sequences of mappings), nesting, plain scalars, double/single-quoted
+    strings (which may contain literal & * ! | > % characters), null,
+    true/false, integers, finite decimals, inline JSON []/{}, full-line
+    comments.
 
     Rejected (raises _YamlSubsetError): tabs indentation, anchors, aliases,
     tags, merge keys, block scalars, directives, multiple document streams,
-    duplicate mapping keys, uneven/non-two indentation, malformed structure,
-    non-finite numbers.
+    duplicate mapping keys, uneven/non-two indentation jumps, malformed
+    structure, non-finite numbers.
     """
     if "\t" in text:
         raise _YamlSubsetError("tabs are not allowed in YAML indentation")
@@ -744,7 +790,7 @@ def _yaml_parse(text: str) -> Any:
     if not lines:
         return {}
     for _, raw, lineno in lines:
-        if any(ch in raw for ch in ("&", "*", "!", "|", ">", "%")):
+        if _has_yaml_meta_token(raw):
             raise _YamlSubsetError(
                 f"unsupported YAML construct on line {lineno}: {raw.split(':', 1)[0]!r}"
             )
@@ -777,12 +823,17 @@ def _yaml_parse(text: str) -> Any:
         ``idx`` points at the CURRENT mapping/sequence entry line; the
         value's inline content is on that same line. An inline value
         therefore advances to ``idx + 1``; an empty value may consume a
-        nested block starting at ``idx + 1``.
+        nested block starting at ``idx + 1`` which must advance EXACTLY two
+        spaces from the parent indentation.
         """
         nxt = idx + 1
         if rest == "":
-            if nxt < len(lines) and lines[nxt][0] > indent:
+            if nxt < len(lines) and lines[nxt][0] == indent + 2:
                 return parse_block(nxt, lines[nxt][0])
+            if nxt < len(lines) and lines[nxt][0] > indent:
+                raise _YamlSubsetError(
+                    f"nested block must advance exactly two spaces (line {lineno})"
+                )
             return None, nxt
         if rest.startswith("[") or rest.startswith("{"):
             try:
@@ -825,10 +876,14 @@ def _yaml_parse(text: str) -> Any:
                 break
             rest = raw[1:].strip() if raw != "-" else ""
             if rest == "":
-                # Nested block on following indented lines.
+                # Nested block on following indented lines (must advance exactly two spaces).
                 nxt = idx + 1
-                if nxt < len(lines) and lines[nxt][0] > indent:
+                if nxt < len(lines) and lines[nxt][0] == indent + 2:
                     value, idx = parse_block(nxt, lines[nxt][0])
+                elif nxt < len(lines) and lines[nxt][0] > indent:
+                    raise _YamlSubsetError(
+                        f"nested block must advance exactly two spaces (line {lineno})"
+                    )
                 else:
                     value, idx = None, nxt
                 seq.append(value)
@@ -949,24 +1004,29 @@ def _format_from_path(source_path: str) -> str:
     return fmt
 
 
-def _normalize_relative_path(source_path: str, repository_root: str | pathlib.Path) -> str:
-    """Validate and normalize a repository-relative POSIX source path."""
+def _normalize_relative_path(source_path: str) -> str:
+    """Lexically validate and normalize a repository-relative POSIX source path.
+
+    Purely lexical: performs NO filesystem resolution (no resolve/exists/
+    lstat/stat/open/read). Separator canonicalization happens BEFORE component
+    validation so backslash traversal variants are rejected before any
+    operation intent is created.
+    """
     if not isinstance(source_path, str) or not source_path:
         raise LocalSourceError("source_path must be a non-empty string")
-    if source_path.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", source_path):
+    canonical = source_path.replace("\\", "/")
+    if canonical.startswith("/"):
         raise LocalSourceError("source_path must be repository-relative, not absolute")
-    parts = pathlib.PurePosixPath(source_path).parts
+    if re.match(r"^[A-Za-z]:", canonical):
+        raise LocalSourceError("source_path must not be a Windows drive path")
+    if canonical.startswith("//"):
+        raise LocalSourceError("source_path must not be a UNC path")
+    parts = pathlib.PurePosixPath(canonical).parts
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise LocalSourceError("source_path contains invalid or traversal components")
-    root = pathlib.Path(repository_root).resolve()
-    candidate = (root / source_path).resolve()
-    if candidate == root:
-        raise LocalSourceError("source_path resolves to the repository root itself")
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise LocalSourceError("source_path escapes the repository root") from exc
-    return source_path.replace("\\", "/")
+    if canonical in ("", "."):
+        raise LocalSourceError("source_path must not resolve to the repository root itself")
+    return canonical
 
 
 def make_local_source_reader(repository_root: str | pathlib.Path) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -1034,7 +1094,7 @@ def execute_local_import(
     """
     from myrmex_backlog_import import execute_import_operation  # type: ignore
 
-    normalized = _normalize_relative_path(source_path, repository_root)
+    normalized = _normalize_relative_path(source_path)
     if source_format == "auto":
         fmt = _format_from_path(normalized)
     else:
