@@ -1,0 +1,75 @@
+{
+  "status": "ok",
+  "repository": "owner/repo",
+  "issues": [
+    {
+      "body": "RAW-ISSUE-BODY-SENTINEL-002",
+      "html_url": "https://example.test/2",
+      "user": {
+        "login": "y"
+      },
+      "comments": 0,
+      "milestone": null,
+      "updated_at": "2026-08-02T11:00:00Z",
+      "state": "closed",
+      "number": 2,
+      "title": "Add docs",
+      "labels": [
+        "docs"
+      ]
+    },
+    {
+      "comments": 3,
+      "user": {
+        "login": "x"
+      },
+      "html_url": "https://example.test/1",
+      "body": "RAW-ISSUE-BODY-SENTINEL-001",
+      "milestone": {
+        "description": "ignored",
+        "title": "M1",
+        "number": 1
+      },
+      "updated_at": "2026-08-01T10:00:00Z",
+      "labels": [
+        "security",
+        {
+          "description": "ignored",
+          "color": "d73a4a",
+          "name": "bug"
+        }
+      ],
+      "state": "open",
+      "number": 1,
+      "title": "Fix auth"
+    }
+  ],
+  "milestones": [
+    {
+      "open_issues": 0,
+      "creator": {
+        "login": "w"
+      },
+      "html_url": "https://example.test/m2",
+      "description": "RAW-MILESTONE-DESCRIPTION-SENTINEL-002",
+      "updated_at": "2026-07-15T09:00:00Z",
+      "due_on": null,
+      "state": "closed",
+      "number": 2,
+      "title": "M2"
+    },
+    {
+      "open_issues": 1,
+      "creator": {
+        "login": "z"
+      },
+      "html_url": "https://example.test/m1",
+      "description": "RAW-MILESTONE-DESCRIPTION-SENTINEL-001",
+      "updated_at": "2026-08-01T09:00:00Z",
+      "due_on": "2026-09-01T00:00:00Z",
+      "state": "open",
+      "number": 1,
+      "title": "M1"
+    }
+  ]
+}
