@@ -32,6 +32,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import sys
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -606,13 +607,21 @@ def get_plan_record(campaign_dir, campaign_id, record_id: str) -> dict[str, Any]
     artifact_id = ARTIFACT_NAMESPACE + record_id
     storage_path = _artifact_storage_key(campaign_dir, campaign_id, artifact_id)
     # Distinguish actually-absent from corrupt/malformed durable records.
-    if not storage_path.exists() or not storage_path.is_file() or storage_path.is_symlink():
+    try:
+        st = storage_path.lstat()
+    except FileNotFoundError:
         raise PlanRecordNotFound(f"plan record not found: {record_id}")
+    except OSError:
+        raise PlanStoreBackendUnavailable(f"plan record path unavailable: {record_id}")
+    if stat.S_ISLNK(st.st_mode):
+        raise PlanStoreBackendUnavailable(f"plan record path is a symlink: {record_id}")
+    if not stat.S_ISREG(st.st_mode):
+        raise PlanStoreBackendUnavailable(f"plan record path is not a regular file: {record_id}")
     try:
         env = intel.get_artifact(pathlib.Path(campaign_dir), campaign_id, artifact_id)
-    except intel.IntelligenceArtifactInvalid as exc:
+    except intel.IntelligenceStoreError as exc:
         raise PlanStoreBackendUnavailable(
-            f"plan record is corrupt or malformed: {record_id}"
+            f"plan record exists but durable integrity validation failed: {record_id}"
         ) from exc
     if not isinstance(env, dict) or not isinstance(env.get("artifact"), dict):
         raise PlanStoreBackendUnavailable(f"plan record envelope is invalid: {record_id}")

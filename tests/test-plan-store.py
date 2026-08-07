@@ -499,10 +499,22 @@ def main() -> None:
                 print("NOERROR")
             except Exception as e:
                 print(type(e).__name__)
+            # Count P1-007 plan artifacts on disk — must be zero.
+            _art_dir = cdir / "intelligence" / "artifacts"
+            _plan_n = 0
+            if _art_dir.exists():
+                for _f in _art_dir.glob("*.json"):
+                    try:
+                        if "plan-revision/record/" in _f.read_text(errors="ignore"):
+                            _plan_n += 1
+                    except Exception:
+                        pass
+            print(f"PLAN_ARTIFACTS:{_plan_n}")
             """
         )
         _r = subprocess.run([sys.executable, "-c", _fcntl_probe], capture_output=True, text=True, cwd=str(ROOT))
         check("PlanStoreBackendUnavailable" in _r.stdout, "fcntl-unavailable raises PlanStoreBackendUnavailable")
+        check("PLAN_ARTIFACTS:0" in _r.stdout, "fcntl-unavailable zero writes")
 
         # F6/F11: direct namespace-kind mismatch — seed kind=backlog in plan namespace
         # Use a NEW valid record (not yet persisted) so P1-002 allows the backlog-kind write.
@@ -522,8 +534,8 @@ def main() -> None:
 
         # ---- Frontier second corrective-plan regressions (p1-007-val-req-0002) ----
         # F1: self-consistent incomplete projection must not be lifecycle authority.
-        # Build proposed2 -> reviewed2 on a fresh revision; then omit reviewed2 from
-        # projection.json while keeping it internally self-consistent (doctor=projection_stale).
+        # Build proposed2 -> reviewed2 on a fresh revision; then rewrite projection.json
+        # with all 4 artifact kind keys but omit the reviewed-head descriptor from plan list.
         p2 = make_record(campaign_id, status="proposed", created_at="2026-08-07T22:00:00+00:00")
         p2["assumptions"][0]["statement"] = "proj-incomplete"
         p2["plan_digest"] = store.compute_plan_digest(p2)
@@ -533,32 +545,64 @@ def main() -> None:
         store.store_plan_record(campaign_dir, campaign_id, 1, p2)
         r2b = store.build_lifecycle_record(p2, "reviewed", "2026-08-07T22:01:00+00:00")
         store.store_plan_record(campaign_dir, campaign_id, 1, r2b)
-        # Rewrite projection.json to contain only proposed2 descriptor, recomputing source_digest.
+        # Rewrite projection.json with all 4 kind keys but omit r2b from plan list.
         from myrmex_campaign_intelligence import canonical_json_bytes as intel_canon
         proj_path = campaign_dir / "intelligence" / "projection.json"
         proj = json.loads(proj_path.read_text(encoding="utf-8"))
-        new_artifacts = {"plan": []}
         p2_artifact_id = store.ARTIFACT_NAMESPACE + p2["record_id"]
         env_p2 = intel.get_artifact(str(campaign_dir), campaign_id, p2_artifact_id)["artifact"]
-        new_artifacts["plan"] = [{
+        p2_desc = {
             "artifact_id": p2_artifact_id,
             "artifact_digest": env_p2["artifact_digest"],
             "payload_digest": env_p2["payload_digest"],
             "created_at": env_p2["created_at"],
             "storage_key": intel.artifact_storage_key(p2_artifact_id),
-        }]
+        }
+        # Dummy descriptors for the other 3 artifact kinds.
+        _dummy_digest = "0" * 64
+        _dummy_created = "2026-08-07T22:00:00+00:00"
+        _backlog_id = "backlog/dummy-000"
+        _review_id = "review/dummy-000"
+        _decision_id = "decision/dummy-000"
+        new_artifacts = {
+            "backlog": [{
+                "artifact_id": _backlog_id,
+                "artifact_digest": _dummy_digest,
+                "payload_digest": _dummy_digest,
+                "created_at": _dummy_created,
+                "storage_key": intel.artifact_storage_key(_backlog_id),
+            }],
+            "plan": [p2_desc],  # omit reviewed-head (r2b)
+            "review": [{
+                "artifact_id": _review_id,
+                "artifact_digest": _dummy_digest,
+                "payload_digest": _dummy_digest,
+                "created_at": _dummy_created,
+                "storage_key": intel.artifact_storage_key(_review_id),
+            }],
+            "decision": [{
+                "artifact_id": _decision_id,
+                "artifact_digest": _dummy_digest,
+                "payload_digest": _dummy_digest,
+                "created_at": _dummy_created,
+                "storage_key": intel.artifact_storage_key(_decision_id),
+            }],
+        }
         tampered = dict(proj)
         tampered["artifacts"] = new_artifacts
-        tampered["artifact_count"] = 1
+        tampered["artifact_count"] = 4
         tampered["source_digest"] = store.sha256_hex(intel_canon({
             "campaign_id": tampered["campaign_id"],
             "artifact_count": tampered["artifact_count"],
             "artifacts": tampered["artifacts"],
         }))
         proj_path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-        # list_artifacts may report healthy (self-consistent), but doctor must report stale.
+        # list_artifacts(kind="plan") reports healthy (self-consistent projection).
         list_status = intel.list_artifacts(str(campaign_dir), campaign_id, kind="plan").get("status")
+        check(list_status == "healthy", "list_artifacts(kind=plan) healthy on self-consistent projection")
+        # doctor must report projection_stale (r2b exists on disk but not in projection).
         doc_status = intel.doctor(str(campaign_dir), campaign_id).get("status")
+        check(doc_status == "projection_stale", "doctor reports projection_stale on incomplete projection")
         # Attempt a competing successor proposed2 -> rejected; P1-007 must fail closed before write.
         rejected2 = store.build_lifecycle_record(p2, "rejected", "2026-08-07T22:02:00+00:00")
         before_compete = count_plan_artifacts(campaign_dir)
@@ -568,9 +612,16 @@ def main() -> None:
         except (store.PlanStoreBackendUnavailable, store.PlanLifecycleConflict, store.PlanLifecycleInvalid):
             check(True, "competing successor failed closed")
         check(count_plan_artifacts(campaign_dir) == before_compete, "no competing artifact written")
+        # Require exact competing artifact ID absent.
+        rejected2_artifact_id = store.ARTIFACT_NAMESPACE + rejected2["record_id"]
+        _rejected2_path = store._artifact_storage_key(campaign_dir, campaign_id, rejected2_artifact_id)
+        check(not _rejected2_path.exists(), "competing artifact ID absent on disk")
         # After recovery, the true chain is proposed2 -> reviewed2 (length 2).
         chain2 = store._load_plan_chain(campaign_dir, campaign_id, p2["plan_revision_id"])
         check(len(chain2) == 2, "authoritative chain after recovery is [proposed, reviewed]")
+        # doctor must be healthy after _load_plan_chain triggered projection rebuild.
+        doc_after = intel.doctor(str(campaign_dir), campaign_id).get("status")
+        check(doc_after == "healthy", "doctor healthy after projection recovery")
 
         # F2: missing vs corrupt get_plan_record
         missing_id = "planrec_" + "c" * 64
@@ -593,9 +644,12 @@ def main() -> None:
         # restore: remove garbage, rewrite the real artifact, rebuild projection
         if corrupt_path.exists():
             corrupt_path.unlink()
-        intel.put_artifact(campaign_dir, campaign_id, 1, "plan", corrupt_target, r2b)
+        intel.put_artifact(campaign_dir, campaign_id, 1, "plan", corrupt_target, p2)
         intel.rebuild_projection(campaign_dir, campaign_id)
-        check(store.get_plan_record(campaign_dir, campaign_id, r2b["record_id"])["record_id"] == r2b["record_id"], "restored record readable")
+        check(store.get_plan_record(campaign_dir, campaign_id, p2["record_id"])["record_id"] == p2["record_id"], "restored p2 record readable")
+        check(store.get_plan_record(campaign_dir, campaign_id, r2b["record_id"])["record_id"] == r2b["record_id"], "restored r2b record readable")
+        doc_restore = intel.doctor(str(campaign_dir), campaign_id).get("status")
+        check(doc_restore == "healthy", "doctor healthy after corrupt-record restoration")
 
         # F3: malformed lifecycle_status typed failure
         for bad_status in ([], {}, None):
