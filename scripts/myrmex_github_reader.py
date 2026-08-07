@@ -145,8 +145,18 @@ def _require_state(value: Any, allowed: tuple[str, ...], label: str) -> str:
 def _require_optional_string(value: Any, label: str) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str):
-        raise GitHubSnapshotMalformed(f"{label} must be a string, null, or omitted")
+    if not isinstance(value, str) or not value:
+        raise GitHubSnapshotMalformed(f"{label} must be a non-empty string, null, or omitted")
+    return value
+
+
+REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+
+
+def _require_reason_code(value: Any) -> str:
+    """Require a bounded typed transport reason code (no free-form text)."""
+    if not isinstance(value, str) or not REASON_CODE_RE.fullmatch(value):
+        raise GitHubTransportInvalid("unavailable reason_code must match ^[a-z][a-z0-9._-]{0,63}$")
     return value
 
 
@@ -274,13 +284,15 @@ def validate_github_neutral_snapshot(neutral: Any) -> None:
         raise GitHubSnapshotMalformed(f"neutral snapshot is missing: {', '.join(missing)}")
     if neutral["schema"] != NEUTRAL_SCHEMA:
         raise GitHubSnapshotMalformed("neutral snapshot schema mismatch")
-    canonical_repository(neutral["repository"])
+    # Repository must already be canonical.
+    if neutral["repository"] != canonical_repository(neutral["repository"]):
+        raise GitHubSnapshotMalformed("neutral repository must be canonical (lowercase owner/repository)")
     if not isinstance(neutral.get("issues"), list) or not isinstance(neutral.get("milestones"), list):
         raise GitHubSnapshotMalformed("issues/milestones must be arrays")
     if not isinstance(neutral.get("ambiguities"), list):
         raise GitHubSnapshotMalformed("ambiguities must be an array")
 
-    issue_numbers: set[int] = set()
+    issue_numbers: list[int] = []
     for issue in neutral["issues"]:
         unknown_i = sorted(set(issue) - set(SAFE_ISSUE_FIELDS))
         if unknown_i:
@@ -293,7 +305,14 @@ def validate_github_neutral_snapshot(neutral: Any) -> None:
             raise GitHubSnapshotMalformed("issue.issue_id does not derive from repository+number")
         _require_nonempty_string(issue["title"], "issue.title")
         _require_state(issue["state"], ISSUE_STATES, "issue.state")
-        if issue["labels"] != sorted(set(issue["labels"])):
+        # labels must be list of non-empty strings, sorted unique
+        labels = issue["labels"]
+        if not isinstance(labels, list):
+            raise GitHubSnapshotMalformed("issue.labels must be an array of strings")
+        for label in labels:
+            if not isinstance(label, str) or not label:
+                raise GitHubSnapshotMalformed("issue.labels entries must be non-empty strings")
+        if labels != sorted(set(labels)):
             raise GitHubSnapshotMalformed("issue.labels must be sorted unique")
         if issue.get("milestone_number") is not None and (
             isinstance(issue["milestone_number"], bool)
@@ -302,9 +321,13 @@ def validate_github_neutral_snapshot(neutral: Any) -> None:
         ):
             raise GitHubSnapshotMalformed("issue.milestone_number must be a positive integer or null")
         _require_optional_string(issue.get("updated_at"), "issue.updated_at")
-        issue_numbers.add(number)
+        issue_numbers.append(number)
+    if len(issue_numbers) != len(set(issue_numbers)):
+        raise GitHubSnapshotMalformed("issue numbers must be unique")
+    if [i["number"] for i in neutral["issues"]] != sorted(issue_numbers):
+        raise GitHubSnapshotMalformed("issues must be deterministically sorted by number")
 
-    milestone_numbers: set[int] = set()
+    milestone_numbers: list[int] = []
     for ms in neutral["milestones"]:
         unknown_m = sorted(set(ms) - set(SAFE_MILESTONE_FIELDS))
         if unknown_m:
@@ -319,15 +342,42 @@ def validate_github_neutral_snapshot(neutral: Any) -> None:
         _require_state(ms["state"], MILESTONE_STATES, "milestone.state")
         _require_optional_string(ms.get("due_on"), "milestone.due_on")
         _require_optional_string(ms.get("updated_at"), "milestone.updated_at")
-        milestone_numbers.add(number)
+        milestone_numbers.append(number)
+    if len(milestone_numbers) != len(set(milestone_numbers)):
+        raise GitHubSnapshotMalformed("milestone numbers must be unique")
+    if [m["number"] for m in neutral["milestones"]] != sorted(milestone_numbers):
+        raise GitHubSnapshotMalformed("milestones must be deterministically sorted by number")
 
+    # Ambiguities: exact closed shape, deterministic ordering, consistent with references.
     for amb in neutral["ambiguities"]:
         if not isinstance(amb, dict):
             raise GitHubSnapshotMalformed("ambiguity must be an object")
+        if sorted(amb.keys()) != ["code", "entity_id"]:
+            raise GitHubSnapshotMalformed("ambiguity must contain exactly code and entity_id")
         if amb.get("code") not in AMBIGUITY_CODES:
             raise GitHubSnapshotMalformed(f"ambiguity has unknown code {amb.get('code')!r}")
         if amb.get("entity_id") is not None and not isinstance(amb["entity_id"], str):
             raise GitHubSnapshotMalformed("ambiguity.entity_id must be string or null")
+    expected_ambiguities = sorted(neutral["ambiguities"], key=lambda a: (a["code"], a["entity_id"] or ""))
+    if neutral["ambiguities"] != expected_ambiguities:
+        raise GitHubSnapshotMalformed("ambiguities must be deterministically sorted")
+
+    # Unresolved milestone-reference consistency.
+    valid_milestone_numbers = set(milestone_numbers)
+    unresolved_refs = {
+        issue["issue_id"]
+        for issue in neutral["issues"]
+        if issue["milestone_number"] is not None and issue["milestone_number"] not in valid_milestone_numbers
+    }
+    recorded_unresolved = {
+        amb["entity_id"]
+        for amb in neutral["ambiguities"]
+        if amb["code"] == "unresolved_milestone_reference"
+    }
+    if unresolved_refs != recorded_unresolved:
+        raise GitHubSnapshotMalformed(
+            "unresolved_milestone_reference ambiguities must match issue milestone references exactly"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -481,9 +531,7 @@ def make_github_source_reader(transport: Callable[[dict[str, Any]], Any]) -> Cal
                 raise GitHubTransportInvalid(
                     f"transport unavailable payload has unknown fields: {', '.join(unknown)}"
                 )
-            reason = result.get("reason_code")
-            if not isinstance(reason, str) or not reason:
-                raise GitHubTransportInvalid("unavailable reason_code must be a non-empty string")
+            reason = _require_reason_code(result.get("reason_code"))
             return {"status": "unavailable", "reason_code": reason}
         if status != "ok":
             raise GitHubTransportInvalid("transport status must be 'ok' or 'unavailable'")
