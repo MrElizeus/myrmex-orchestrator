@@ -520,6 +520,101 @@ def main() -> None:
         except store.PlanLifecycleInvalid:
             check(True, "namespace-kind mismatch rejected")
 
+        # ---- Frontier second corrective-plan regressions (p1-007-val-req-0002) ----
+        # F1: self-consistent incomplete projection must not be lifecycle authority.
+        # Build proposed2 -> reviewed2 on a fresh revision; then omit reviewed2 from
+        # projection.json while keeping it internally self-consistent (doctor=projection_stale).
+        p2 = make_record(campaign_id, status="proposed", created_at="2026-08-07T22:00:00+00:00")
+        p2["assumptions"][0]["statement"] = "proj-incomplete"
+        p2["plan_digest"] = store.compute_plan_digest(p2)
+        p2["plan_revision_id"] = store.derive_plan_revision_id(p2["plan_digest"])
+        p2["record_digest"] = store.compute_record_digest(p2)
+        p2["record_id"] = store.derive_record_id(p2["record_digest"])
+        store.store_plan_record(campaign_dir, campaign_id, 1, p2)
+        r2b = store.build_lifecycle_record(p2, "reviewed", "2026-08-07T22:01:00+00:00")
+        store.store_plan_record(campaign_dir, campaign_id, 1, r2b)
+        # Rewrite projection.json to contain only proposed2 descriptor, recomputing source_digest.
+        from myrmex_campaign_intelligence import canonical_json_bytes as intel_canon
+        proj_path = campaign_dir / "intelligence" / "projection.json"
+        proj = json.loads(proj_path.read_text(encoding="utf-8"))
+        new_artifacts = {"plan": []}
+        p2_artifact_id = store.ARTIFACT_NAMESPACE + p2["record_id"]
+        env_p2 = intel.get_artifact(str(campaign_dir), campaign_id, p2_artifact_id)["artifact"]
+        new_artifacts["plan"] = [{
+            "artifact_id": p2_artifact_id,
+            "artifact_digest": env_p2["artifact_digest"],
+            "payload_digest": env_p2["payload_digest"],
+            "created_at": env_p2["created_at"],
+            "storage_key": intel.artifact_storage_key(p2_artifact_id),
+        }]
+        tampered = dict(proj)
+        tampered["artifacts"] = new_artifacts
+        tampered["artifact_count"] = 1
+        tampered["source_digest"] = store.sha256_hex(intel_canon({
+            "campaign_id": tampered["campaign_id"],
+            "artifact_count": tampered["artifact_count"],
+            "artifacts": tampered["artifacts"],
+        }))
+        proj_path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        # list_artifacts may report healthy (self-consistent), but doctor must report stale.
+        list_status = intel.list_artifacts(str(campaign_dir), campaign_id, kind="plan").get("status")
+        doc_status = intel.doctor(str(campaign_dir), campaign_id).get("status")
+        # Attempt a competing successor proposed2 -> rejected; P1-007 must fail closed before write.
+        rejected2 = store.build_lifecycle_record(p2, "rejected", "2026-08-07T22:02:00+00:00")
+        before_compete = count_plan_artifacts(campaign_dir)
+        try:
+            store.store_plan_record(campaign_dir, campaign_id, 1, rejected2)
+            check(False, "competing successor on incomplete projection should fail closed")
+        except (store.PlanStoreBackendUnavailable, store.PlanLifecycleConflict, store.PlanLifecycleInvalid):
+            check(True, "competing successor failed closed")
+        check(count_plan_artifacts(campaign_dir) == before_compete, "no competing artifact written")
+        # After recovery, the true chain is proposed2 -> reviewed2 (length 2).
+        chain2 = store._load_plan_chain(campaign_dir, campaign_id, p2["plan_revision_id"])
+        check(len(chain2) == 2, "authoritative chain after recovery is [proposed, reviewed]")
+
+        # F2: missing vs corrupt get_plan_record
+        missing_id = "planrec_" + "c" * 64
+        try:
+            store.get_plan_record(campaign_dir, campaign_id, missing_id)
+            check(False, "missing record should raise PlanRecordNotFound")
+        except store.PlanRecordNotFound:
+            check(True, "missing record -> PlanRecordNotFound")
+        # corrupt: overwrite a durable artifact file with garbage
+        corrupt_target = store.ARTIFACT_NAMESPACE + p2["record_id"]
+        corrupt_path = store._artifact_storage_key(campaign_dir, campaign_id, corrupt_target)
+        corrupt_path.write_text('{"garbage": true}', encoding="utf-8")
+        try:
+            store.get_plan_record(campaign_dir, campaign_id, p2["record_id"])
+            check(False, "corrupt record should raise integrity error, not NotFound")
+        except store.PlanStoreBackendUnavailable:
+            check(True, "corrupt record -> PlanStoreBackendUnavailable")
+        except store.PlanRecordNotFound:
+            check(False, "corrupt record must NOT be PlanRecordNotFound")
+        # restore: remove garbage, rewrite the real artifact, rebuild projection
+        if corrupt_path.exists():
+            corrupt_path.unlink()
+        intel.put_artifact(campaign_dir, campaign_id, 1, "plan", corrupt_target, r2b)
+        intel.rebuild_projection(campaign_dir, campaign_id)
+        check(store.get_plan_record(campaign_dir, campaign_id, r2b["record_id"])["record_id"] == r2b["record_id"], "restored record readable")
+
+        # F3: malformed lifecycle_status typed failure
+        for bad_status in ([], {}, None):
+            bad_ls = make_record(campaign_id, status="proposed", created_at="2026-08-07T23:00:00+00:00")
+            bad_ls["lifecycle_status"] = bad_status
+            bad_ls["record_digest"] = store.compute_record_digest(bad_ls)
+            bad_ls["record_id"] = store.derive_record_id(bad_ls["record_digest"])
+            try:
+                store.validate_plan_revision_record(bad_ls)
+                check(False, f"lifecycle_status={bad_status!r} should fail typed")
+            except store.PlanRecordInvalid:
+                check(True, f"lifecycle_status={bad_status!r} typed rejection")
+            except Exception as exc:
+                check(False, f"lifecycle_status={bad_status!r} raised incidental {type(exc).__name__}")
+        # validate_lifecycle_transition pure helper unhashable safety
+        check(store.validate_lifecycle_transition([], "reviewed") is False, "transition([])->False")
+        check(store.validate_lifecycle_transition("proposed", []) is False, "transition([],->False)")
+        check(store.validate_lifecycle_transition({}, {}) is False, "transition({},{}))->False")
+
     print(f"plan store test: {'FAIL' if failures else 'PASS'} ({len(failures)} failures)")
     if failures:
         for f in failures:
