@@ -27,7 +27,6 @@ Design:
 from __future__ import annotations
 
 import datetime
-import fcntl
 import hashlib
 import json
 import os
@@ -196,12 +195,14 @@ def _require_str(value: Any, label: str, *, nonempty: bool = True) -> str:
     return value
 
 
-def _require_str_list(value: Any, label: str, *, min_items: int = 0) -> list[str]:
+def _require_str_list(value: Any, label: str, *, min_items: int = 0, nonempty_entries: bool = False) -> list[str]:
     if not isinstance(value, list) or len(value) < min_items:
         raise PlanRecordInvalid(f"{label} must be a list with at least {min_items} items")
     for entry in value:
         if not isinstance(entry, str):
             raise PlanRecordInvalid(f"{label} entries must be strings")
+        if nonempty_entries and not entry:
+            raise PlanRecordInvalid(f"{label} entries must be non-empty strings")
     return value
 
 
@@ -229,10 +230,10 @@ def _validate_input_digests(value: Any) -> None:
         if pair in exact:
             raise PlanRecordInvalid("duplicate input_digest entry")
         exact.append(pair)
-        key = (entry["kind"], entry["identity"])
-        if key in seen and seen[key] != entry["sha256"]:
+        # P1-001 semantics: identity is the conflict key regardless of kind.
+        if entry["identity"] in seen and seen[entry["identity"]] != entry["sha256"]:
             raise PlanRecordInvalid("same input identity bound to conflicting digests")
-        seen[key] = entry["sha256"]
+        seen[entry["identity"]] = entry["sha256"]
 
 
 def _validate_assumptions(value: Any) -> None:
@@ -265,7 +266,7 @@ def _validate_work_units(value: Any) -> None:
         _obj_fields(wu["scope"], WU_SCOPE_FIELDS, "work_unit.scope")
         _require_str_list(wu["scope"]["allowed_paths"], "work_unit.scope.allowed_paths")
         _require_str_list(wu["scope"]["forbidden_paths"], "work_unit.scope.forbidden_paths")
-        _require_str_list(wu["acceptance_criteria"], "work_unit.acceptance_criteria", min_items=1)
+        _require_str_list(wu["acceptance_criteria"], "work_unit.acceptance_criteria", min_items=1, nonempty_entries=True)
         _obj_fields(wu["verification"], WU_VERIFICATION_FIELDS, "work_unit.verification")
         _require_str_list(wu["verification"]["commands"], "work_unit.verification.commands")
         _require_str_list(wu["verification"]["manual_checks"], "work_unit.verification.manual_checks")
@@ -275,7 +276,10 @@ def _validate_work_units(value: Any) -> None:
             raise PlanRecordInvalid("work_unit.risk_class must be bounded|unbounded")
         if wu["required_route"] not in ("auto", "direct-only", "delegated", "frontier", "frontier-gated"):
             raise PlanRecordInvalid("work_unit.required_route must be auto|direct-only|delegated|frontier|frontier-gated")
-        for gate in wu["human_gates"]:
+        human_gates = wu["human_gates"]
+        if not isinstance(human_gates, list):
+            raise PlanRecordInvalid("work_unit.human_gates must be a list")
+        for gate in human_gates:
             _obj_fields(gate, HUMAN_GATE_FIELDS, "human_gate")
             _require_str(gate["gate_id"], "human_gate.gate_id")
             _require_str(gate["decision_type"], "human_gate.decision_type")
@@ -324,13 +328,20 @@ def _validate_edges(value: Any, work_units: list[dict[str, Any]]) -> None:
                 raise PlanRecordInvalid("declared dependency missing its edge")
 
 
+RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
 def _validate_datetime(value: Any) -> None:
-    if not isinstance(value, str):
-        raise PlanRecordInvalid("created_at must be an RFC3339 date-time string")
+    if not isinstance(value, str) or not RFC3339_RE.fullmatch(value):
+        raise PlanRecordInvalid(
+            "created_at must be RFC3339 date-time with uppercase T separator and explicit timezone"
+        )
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise PlanRecordInvalid("created_at must be an RFC3339 date-time with timezone") from exc
+        raise PlanRecordInvalid("created_at must be an RFC3339 date-time") from exc
     if parsed.tzinfo is None:
         raise PlanRecordInvalid("created_at must include a timezone")
 
@@ -435,6 +446,10 @@ def build_lifecycle_record(
 @contextmanager
 def _plan_store_lock(campaign_dir: pathlib.Path) -> Iterator[None]:
     """Exclusive per-campaign plan-store lock; fail closed on unavailability."""
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise PlanStoreBackendUnavailable("fcntl is unavailable; plan-store locking fails closed") from exc
     intel_dir = pathlib.Path(campaign_dir) / "intelligence"
     if intel_dir.is_symlink():
         raise PlanStoreBackendUnavailable("intelligence directory must not be a symlink")
@@ -481,16 +496,16 @@ def _list_plan_record_envelopes(campaign_dir, campaign_id) -> list[dict[str, Any
     if status in ("projection_missing", "projection_stale"):
         try:
             intel.rebuild_projection(pathlib.Path(campaign_dir), campaign_id)
-        except Exception:
-            # A missing sidecar with zero artifacts is a valid empty plan store.
-            pass
+        except Exception as exc:
+            raise PlanStoreBackendUnavailable(
+                "plan projection rebuild failed; durable history cannot be reconstructed"
+            ) from exc
         result = intel.list_artifacts(pathlib.Path(campaign_dir), campaign_id, kind="plan")
         status = result.get("status")
-    if status in ("projection_missing", "projection_stale"):
-        # Empty store: no plan artifacts exist yet.
-        return []
     if status != "healthy":
-        raise PlanStoreBackendUnavailable("plan projection unavailable")
+        raise PlanStoreBackendUnavailable(
+            "plan projection is not healthy; durable plan history cannot be trusted as empty"
+        )
     artifacts = result.get("artifacts")
     if isinstance(artifacts, dict):
         plan_descriptors = artifacts.get("plan", [])
@@ -566,8 +581,16 @@ def get_plan_record(campaign_dir, campaign_id, record_id: str) -> dict[str, Any]
         raise PlanRecordNotFound(f"plan record not found: {record_id}") from exc
     if not isinstance(env, dict) or not isinstance(env.get("artifact"), dict):
         raise PlanRecordNotFound(f"plan record not found: {record_id}")
-    payload = env["artifact"].get("payload")
+    artifact = env["artifact"]
+    # Direct lookup is also a trust boundary: enforce kind + namespace + ID derivation.
+    if artifact.get("kind") != "plan":
+        raise PlanLifecycleInvalid("plan-store namespace artifact has non-plan kind")
+    if artifact.get("artifact_id") != artifact_id:
+        raise PlanLifecycleInvalid("plan artifact ID does not match requested record")
+    payload = artifact.get("payload")
     validate_plan_revision_record(payload)
+    if artifact.get("artifact_id") != ARTIFACT_NAMESPACE + payload["record_id"]:
+        raise PlanLifecycleInvalid("plan artifact ID does not derive from payload record_id")
     return payload
 
 
