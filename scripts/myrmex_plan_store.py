@@ -347,10 +347,15 @@ def _validate_datetime(value: Any) -> None:
 
 
 def validate_lifecycle_transition(previous_status: str | None, current_status: str) -> bool:
+    # Typed guards: unhashable/malformed runtime values must return False, never raise TypeError.
+    if not isinstance(current_status, str):
+        return False
     if current_status not in LIFECYCLE_STATES:
         return False
     if previous_status is None:
         return current_status == "proposed"
+    if not isinstance(previous_status, str):
+        return False
     if previous_status not in LIFECYCLE_STATES:
         return False
     return current_status in TRANSITIONS[previous_status]
@@ -382,6 +387,8 @@ def validate_plan_revision_record(record: Any) -> None:
         value = record[key]
         if not isinstance(value, str) or not value or len(value) > 256:
             raise PlanRecordInvalid(f"{key} must be a non-empty string of at most 256 characters")
+    if not isinstance(record["lifecycle_status"], str):
+        raise PlanRecordInvalid("lifecycle_status must be a string")
     if record["lifecycle_status"] not in LIFECYCLE_STATES:
         raise PlanRecordInvalid("lifecycle_status must be one of the seven plan states")
     _validate_parent_revision(record["parent_revision"])
@@ -490,9 +497,16 @@ def _plan_store_lock(campaign_dir: pathlib.Path) -> Iterator[None]:
 # Chain reconstruction
 
 
-def _list_plan_record_envelopes(campaign_dir, campaign_id) -> list[dict[str, Any]]:
-    result = intel.list_artifacts(pathlib.Path(campaign_dir), campaign_id, kind="plan")
-    status = result.get("status")
+def _ensure_authoritative_projection(campaign_dir, campaign_id) -> None:
+    """Cross-check projection descriptors against the actual P1-002 artifact store.
+
+    P1-002's projection.json is reconstructible/non-authoritative; a
+    self-consistent projection that omits durable records must never be
+    treated as lifecycle authority. doctor() performs the actual-store
+    comparison and is the smallest safe consistency check.
+    """
+    doc = intel.doctor(pathlib.Path(campaign_dir), campaign_id)
+    status = doc.get("status")
     if status in ("projection_missing", "projection_stale"):
         try:
             intel.rebuild_projection(pathlib.Path(campaign_dir), campaign_id)
@@ -500,12 +514,21 @@ def _list_plan_record_envelopes(campaign_dir, campaign_id) -> list[dict[str, Any
             raise PlanStoreBackendUnavailable(
                 "plan projection rebuild failed; durable history cannot be reconstructed"
             ) from exc
-        result = intel.list_artifacts(pathlib.Path(campaign_dir), campaign_id, kind="plan")
-        status = result.get("status")
+        doc = intel.doctor(pathlib.Path(campaign_dir), campaign_id)
+        status = doc.get("status")
     if status != "healthy":
         raise PlanStoreBackendUnavailable(
-            "plan projection is not healthy; durable plan history cannot be trusted as empty"
+            "plan projection is not cross-checked against the actual store; history cannot be trusted"
         )
+
+
+def _list_plan_record_envelopes(campaign_dir, campaign_id) -> list[dict[str, Any]]:
+    # Authoritative history: verify projection against the actual artifact store first.
+    _ensure_authoritative_projection(campaign_dir, campaign_id)
+    result = intel.list_artifacts(pathlib.Path(campaign_dir), campaign_id, kind="plan")
+    status = result.get("status")
+    if status not in ("healthy",):
+        raise PlanStoreBackendUnavailable("plan projection unavailable")
     artifacts = result.get("artifacts")
     if isinstance(artifacts, dict):
         plan_descriptors = artifacts.get("plan", [])
@@ -571,16 +594,28 @@ def _load_plan_chain(campaign_dir, campaign_id, plan_revision_id: str) -> list[d
     return chain
 
 
+def _artifact_storage_key(campaign_dir, campaign_id, artifact_id: str) -> pathlib.Path:
+    """Resolve the deterministic P1-002 artifact storage path."""
+    intel_dir = pathlib.Path(campaign_dir) / "intelligence"
+    return intel_dir / "artifacts" / f"{intel.artifact_storage_key(artifact_id)}.json"
+
+
 def get_plan_record(campaign_dir, campaign_id, record_id: str) -> dict[str, Any]:
     if not isinstance(record_id, str) or not RECORD_ID_RE.fullmatch(record_id):
         raise PlanRecordInvalid("record_id must match ^planrec_[0-9a-f]{64}$")
     artifact_id = ARTIFACT_NAMESPACE + record_id
+    storage_path = _artifact_storage_key(campaign_dir, campaign_id, artifact_id)
+    # Distinguish actually-absent from corrupt/malformed durable records.
+    if not storage_path.exists() or not storage_path.is_file() or storage_path.is_symlink():
+        raise PlanRecordNotFound(f"plan record not found: {record_id}")
     try:
         env = intel.get_artifact(pathlib.Path(campaign_dir), campaign_id, artifact_id)
     except intel.IntelligenceArtifactInvalid as exc:
-        raise PlanRecordNotFound(f"plan record not found: {record_id}") from exc
+        raise PlanStoreBackendUnavailable(
+            f"plan record is corrupt or malformed: {record_id}"
+        ) from exc
     if not isinstance(env, dict) or not isinstance(env.get("artifact"), dict):
-        raise PlanRecordNotFound(f"plan record not found: {record_id}")
+        raise PlanStoreBackendUnavailable(f"plan record envelope is invalid: {record_id}")
     artifact = env["artifact"]
     # Direct lookup is also a trust boundary: enforce kind + namespace + ID derivation.
     if artifact.get("kind") != "plan":
@@ -588,7 +623,12 @@ def get_plan_record(campaign_dir, campaign_id, record_id: str) -> dict[str, Any]
     if artifact.get("artifact_id") != artifact_id:
         raise PlanLifecycleInvalid("plan artifact ID does not match requested record")
     payload = artifact.get("payload")
-    validate_plan_revision_record(payload)
+    try:
+        validate_plan_revision_record(payload)
+    except PlanRecordInvalid as exc:
+        raise PlanStoreBackendUnavailable(
+            f"plan record payload is corrupt: {record_id}"
+        ) from exc
     if artifact.get("artifact_id") != ARTIFACT_NAMESPACE + payload["record_id"]:
         raise PlanLifecycleInvalid("plan artifact ID does not derive from payload record_id")
     return payload
