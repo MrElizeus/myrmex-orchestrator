@@ -540,15 +540,35 @@ def _normalize_priority(value: Any) -> str | None:
     raise LocalSourceMalformed("priority must be a string, number, or null")
 
 
+_ABSENT = object()
+
+
 def _require_string_array(value: Any, field: str, allow_omitted: bool = True) -> list[str]:
-    """Require an array of strings for one manifest field (no coercion)."""
-    if value is None and allow_omitted:
+    """Require an array of strings for one manifest field (no coercion).
+
+    Presence-aware: an explicit ``null`` is malformed even when omission is
+    allowed; only absence maps to ``[]``.
+    """
+    if value is _ABSENT and allow_omitted:
         return []
+    if value is None:
+        raise LocalSourceMalformed(f"manifest {field} must not be null")
     if not isinstance(value, list):
         raise LocalSourceMalformed(f"manifest {field} must be an array of strings")
     for entry in value:
         if not isinstance(entry, str):
             raise LocalSourceMalformed(f"manifest {field} entries must be strings")
+    return list(value)
+
+
+def _require_array(value: Any, field: str, allow_omitted: bool = True) -> list[Any]:
+    """Require an array container (objectives/items); explicit null is malformed."""
+    if value is _ABSENT and allow_omitted:
+        return []
+    if value is None:
+        raise LocalSourceMalformed(f"manifest {field} must not be null")
+    if not isinstance(value, list):
+        raise LocalSourceMalformed(f"manifest {field} must be an array")
     return list(value)
 
 
@@ -563,7 +583,7 @@ def parse_manifest_object(
     ambiguities: list[dict[str, Any]] = []
     objectives: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
-    constraints = _require_string_array(data.get("constraints"), "constraints")
+    constraints = _require_string_array(data.get("constraints", _ABSENT), "constraints")
 
     title = data.get("title")
     if title is not None and not isinstance(title, str):
@@ -578,6 +598,7 @@ def parse_manifest_object(
 
     explicit_objective_index: dict[str, list[int]] = {}
     title_objective_index: dict[str, list[int]] = {}
+    objective_id_index: dict[str, int] = {}
     item_id_index: dict[str, int] = {}
 
     def make_objective(obj: dict[str, Any], pointer: str) -> dict[str, Any]:
@@ -592,7 +613,7 @@ def parse_manifest_object(
         else:
             core = {"title": normalize_text(obj["title"])}
         oid = "srcobj_" + sha256_hex(canonical_json_bytes(core))
-        cstr = _require_string_array(obj.get("constraints"), "objective.constraints")
+        cstr = _require_string_array(obj.get("constraints", _ABSENT), "objective.constraints")
         return {
             "objective_id": oid,
             "explicit_id": explicit,
@@ -620,8 +641,8 @@ def parse_manifest_object(
         else:
             core = {"objective_id": obj["objective_id"] if obj else None, "title": normalize_text(item["title"])}
         iid = "srcitem_" + sha256_hex(canonical_json_bytes(core))
-        depends = _require_string_array(item.get("depends_on"), "item.depends_on")
-        cstr = _require_string_array(item.get("constraints"), "item.constraints")
+        depends = _require_string_array(item.get("depends_on", _ABSENT), "item.depends_on")
+        cstr = _require_string_array(item.get("constraints", _ABSENT), "item.constraints")
         return {
             "item_id": iid,
             "explicit_id": explicit,
@@ -633,32 +654,27 @@ def parse_manifest_object(
             "source_location": {"path": source_path, "locator_type": "json-pointer", "locator": pointer},
         }
 
-    objectives_raw = data.get("objectives")
-    if objectives_raw is not None and not isinstance(objectives_raw, list):
-        raise LocalSourceMalformed("manifest objectives must be an array")
-    for idx, obj in enumerate(objectives_raw or []):
+    objectives_raw = _require_array(data.get("objectives", _ABSENT), "objectives")
+    for idx, obj in enumerate(objectives_raw):
         pointer = f"/objectives/{idx}"
         parsed = make_objective(obj, pointer)
-        norm_explicit = normalize_text(parsed["explicit_id"]) if parsed["explicit_id"] else None
-        duplicate = False
-        if norm_explicit and norm_explicit in explicit_objective_index:
-            duplicate = True
-        norm_title = normalize_text(parsed["title"])
-        if norm_title in title_objective_index:
-            duplicate = True
-        if duplicate:
+        # Duplicate detection is based on the derived semantic objective_id,
+        # never on title alone. Distinct explicit IDs sharing a title are
+        # distinct semantic objectives.
+        if parsed["objective_id"] in objective_id_index:
             add_ambiguity("duplicate_objective_identity", parsed["objective_id"], pointer)
+        norm_explicit = normalize_text(parsed["explicit_id"]) if parsed["explicit_id"] else None
+        norm_title = normalize_text(parsed["title"])
         # Always index every objective (including duplicates) so reference
         # resolution can detect zero/multiple matches and never pick a
         # first-by-order winner.
         if norm_explicit:
             explicit_objective_index.setdefault(norm_explicit, []).append(len(objectives))
         title_objective_index.setdefault(norm_title, []).append(len(objectives))
+        objective_id_index[parsed["objective_id"]] = len(objectives)
         objectives.append(parsed)
-        nested_items = obj.get("items")
-        if nested_items is not None and not isinstance(nested_items, list):
-            raise LocalSourceMalformed("manifest objective.items must be an array")
-        for jdx, nitem in enumerate(nested_items or []):
+        nested_items = _require_array(obj.get("items", _ABSENT), "objective.items")
+        for jdx, nitem in enumerate(nested_items):
             parsed_item = make_item(nitem, parsed, f"/objectives/{idx}/items/{jdx}", nested=True)
             if parsed_item["item_id"] in item_id_index:
                 add_ambiguity("duplicate_item_identity", parsed_item["item_id"], f"/objectives/{idx}/items/{jdx}")
@@ -666,10 +682,8 @@ def parse_manifest_object(
                 item_id_index[parsed_item["item_id"]] = len(items)
                 items.append(parsed_item)
 
-    items_raw = data.get("items")
-    if items_raw is not None and not isinstance(items_raw, list):
-        raise LocalSourceMalformed("manifest items must be an array")
-    for idx, item in enumerate(items_raw or []):
+    items_raw = _require_array(data.get("items", _ABSENT), "items")
+    for idx, item in enumerate(items_raw):
         pointer = f"/items/{idx}"
         if not isinstance(item, dict):
             raise LocalSourceMalformed("manifest item must be an object")
@@ -744,18 +758,31 @@ class _YamlSubsetError(Exception):
 
 
 def _has_yaml_meta_token(raw: str) -> bool:
-    """Return True when a YAML meta-syntax character appears outside quoted text."""
+    """Return True when a YAML meta-syntax character appears outside quoted text.
+
+    Escape-aware: inside double quotes, backslash escapes (\\\" and \\\\) do
+    not terminate the quoted state, so a quoted scalar may contain literal
+    & * ! | > % characters.
+    """
     in_single = False
     in_double = False
     i = 0
     n = len(raw)
     while i < n:
         ch = raw[i]
-        if ch == "'" and not in_double:
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
             in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        elif ch in ("&", "*", "!", "|", ">", "%") and not in_single and not in_double:
+        elif ch == '"':
+            in_double = True
+        elif ch in ("&", "*", "!", "|", ">", "%") and not in_single:
             return True
         i += 1
     return False
@@ -812,7 +839,7 @@ def _yaml_parse(text: str) -> Any:
     def _parse_scalar_line(raw: str, lineno: int) -> Any:
         if raw.startswith("[") or raw.startswith("{"):
             try:
-                return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+                return json.loads(raw, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_nonfinite)
             except Exception as exc:
                 raise _YamlSubsetError(f"invalid inline JSON value (line {lineno})") from exc
         return _yaml_scalar(raw, lineno)
@@ -837,7 +864,7 @@ def _yaml_parse(text: str) -> Any:
             return None, nxt
         if rest.startswith("[") or rest.startswith("{"):
             try:
-                return json.loads(rest, object_pairs_hook=_reject_duplicate_keys), nxt
+                return json.loads(rest, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_nonfinite), nxt
             except Exception as exc:
                 raise _YamlSubsetError(f"invalid inline JSON value (line {lineno})") from exc
         return _yaml_scalar(rest, lineno), nxt
@@ -858,6 +885,8 @@ def _yaml_parse(text: str) -> Any:
             key = _yaml_scalar(key_part.strip(), lineno)
             if not isinstance(key, str):
                 raise _YamlSubsetError(f"mapping key must be a string (line {lineno})")
+            if key == "<<":
+                raise _YamlSubsetError(f"YAML merge keys are not supported (line {lineno})")
             if key in mapping:
                 raise _YamlSubsetError(f"duplicate mapping key {key!r} (line {lineno})")
             value, idx = _consume_value(value_part.strip(), idx, indent, lineno)
@@ -894,6 +923,8 @@ def _yaml_parse(text: str) -> Any:
                 key = _yaml_scalar(key_part.strip(), lineno)
                 if not isinstance(key, str):
                     raise _YamlSubsetError(f"mapping key must be a string (line {lineno})")
+                if key == "<<":
+                    raise _YamlSubsetError(f"YAML merge keys are not supported (line {lineno})")
                 item_map: dict[str, Any] = {key: None}
                 value, idx = _consume_value(value_part.strip(), idx, indent + 2, lineno)
                 item_map[key] = value
@@ -913,6 +944,8 @@ def _yaml_parse(text: str) -> Any:
                     k2 = _yaml_scalar(kpart.strip(), cline)
                     if not isinstance(k2, str):
                         raise _YamlSubsetError(f"mapping key must be a string (line {cline})")
+                    if k2 == "<<":
+                        raise _YamlSubsetError(f"YAML merge keys are not supported (line {cline})")
                     if k2 in item_map:
                         raise _YamlSubsetError(f"duplicate mapping key {k2!r} (line {cline})")
                     v2, idx = _consume_value(vpart.strip(), idx, item_indent, cline)
@@ -957,7 +990,7 @@ def _yaml_scalar(raw: str, lineno: int) -> Any:
         return value
     if raw.startswith(("[", "{")):
         try:
-            return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+            return json.loads(raw, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_nonfinite)
         except Exception as exc:
             raise _YamlSubsetError(f"invalid inline JSON value (line {lineno})") from exc
     return raw
@@ -1030,10 +1063,16 @@ def _normalize_relative_path(source_path: str) -> str:
 
 
 def make_local_source_reader(repository_root: str | pathlib.Path) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """Return a P1-003-compatible reader for local roadmap/manifest files."""
-    root = pathlib.Path(repository_root).resolve()
+    """Return a P1-003-compatible reader for local roadmap/manifest files.
+
+    Construction is filesystem-free: the repository root is captured as a
+    lexical string. All resolution/read operations happen inside the reader
+    callback, which P1-003 invokes only after the durable intent exists.
+    """
+    repository_root_spec = os.fspath(repository_root)
 
     def reader(context: dict[str, Any]) -> dict[str, Any]:
+        root = pathlib.Path(repository_root_spec).resolve()
         request = copy.deepcopy(context["request"])
         source_path = request["source_path"]
         source_format = request["source_format"]
