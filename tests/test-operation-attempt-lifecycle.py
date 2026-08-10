@@ -116,4 +116,115 @@ with tempfile.TemporaryDirectory(prefix="myrmex-attempt-lifecycle-") as td:
     assert "incomplete delegation batches" in denied.stderr
     assert batch_state["delegation_batches"][0]["status"] == "waiting-for-delegations"
 
+    # Task identity is state-first. A crash immediately before transport or
+    # immediately after a terminal result can only resume/collect the exact
+    # persisted operation; exact retries are byte-preserving no-ops.
+    replay_run = run(
+        "init", "--run-id", "task-result-crash-replay", "--objective", "task replay",
+        "--repository-root", repo, "--mode", "autonomous", "--scope", "narrow",
+        "--execution-policy", "auto", env=env,
+    ).stdout.strip()
+    replay_preflight_args = (
+        "delegation-preflight", replay_run, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "state-first task identity", "--task-id", "task-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo,
+    )
+    task_intent = payload(run(*replay_preflight_args, "--expect-revision", "0", env=env))
+    operation = task_intent["pending_operations"][0]
+    replay_path = Path(env["MYRMEX_STATE_HOME"]) / "runs" / replay_run / "state.json"
+    replay_events = replay_path.parent / "events.jsonl"
+    intent_state_bytes, intent_event_bytes = replay_path.read_bytes(), replay_events.read_bytes()
+    replayed_intent = payload(run(*replay_preflight_args, "--expect-revision", "999", env=env))
+    assert replayed_intent["revision"] == 1
+    assert replay_path.read_bytes() == intent_state_bytes and replay_events.read_bytes() == intent_event_bytes
+    decision = payload(run("reconcile", replay_run, env=env))
+    assert decision["action"] == "COLLECT_DELEGATIONS"
+    terminal_result = payload(run(
+        "delegation", replay_run, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "state-first task identity", "--task-id", "task-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo, "--status", "success",
+        "--evidence-json", '{"result":"confirmed"}', "--expect-revision", "1", env=env,
+    ))
+    assert terminal_result["pending_operations"][0]["status"] == "confirmed"
+    terminal_state_bytes, terminal_event_bytes = replay_path.read_bytes(), replay_events.read_bytes()
+    replayed_result = payload(run(
+        "delegation", replay_run, "--agent", "myrmex-worker", "--role", "writer",
+        "--reason", "state-first task identity", "--task-id", "task-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo, "--status", "success",
+        "--evidence-json", '{"result":"confirmed"}', "--expect-revision", "999", env=env,
+    ))
+    assert replayed_result["revision"] == 2
+    assert replay_path.read_bytes() == terminal_state_bytes and replay_events.read_bytes() == terminal_event_bytes
+    assert len(replayed_result["delegation_ledger"]) == 1
+
+    # The same state-first/result pattern is mandatory for independent
+    # verification tasks. A pending verifier is collected, never redispatched
+    # under a new identity, and a confirmed verifier result is immutable.
+    verifier_args = (
+        "delegation-preflight", replay_run, "--agent", "myrmex-verifier", "--role", "verifier",
+        "--reason", "verification crash boundary", "--task-id", "task-verifier-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo,
+    )
+    verifier_intent = payload(run(*verifier_args, "--expect-revision", "2", env=env))
+    verifier_operation = verifier_intent["pending_operations"][-1]
+    assert payload(run("reconcile", replay_run, env=env))["action"] == "COLLECT_DELEGATIONS"
+    verifier_result = payload(run(
+        "delegation", replay_run, "--agent", "myrmex-verifier", "--role", "verifier",
+        "--reason", "verification crash boundary", "--task-id", "task-verifier-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo, "--status", "success",
+        "--evidence-json", '{"verification":"PASS"}', "--expect-revision", "3", env=env,
+    ))
+    verifier_bytes, verifier_event_bytes = replay_path.read_bytes(), replay_events.read_bytes()
+    verifier_replay = payload(run(
+        "delegation", replay_run, "--agent", "myrmex-verifier", "--role", "verifier",
+        "--reason", "verification crash boundary", "--task-id", "task-verifier-crash-replay",
+        "--work-unit-id", "WU-CRASH", "--workspace", repo, "--status", "success",
+        "--evidence-json", '{"verification":"PASS"}', "--expect-revision", "999", env=env,
+    ))
+    assert verifier_result["revision"] == verifier_replay["revision"] == 4
+    assert replay_path.read_bytes() == verifier_bytes and replay_events.read_bytes() == verifier_event_bytes
+
+    # CI uses the generic typed operation lifecycle. Intent is the pre-effect
+    # crash state; effect/receipt/confirmation are independently replayable and
+    # exact terminal replay cannot consume a revision or repeat the CI effect.
+    ci_intent = payload(run(
+        "operation", replay_run, "intent", "--kind", "ci", "--idempotency-key", "ci:p1-019",
+        "--intent-json", '{"required":true,"work_unit_id":"WU-CRASH"}',
+        "--expect-revision", "4", env=env,
+    ))
+    ci_operation = ci_intent["pending_operations"][-1]
+    assert payload(run("reconcile", replay_run, env=env))["action"] == "RUN_LOCAL_VERIFICATION"
+    run(
+        "operation", replay_run, "observe", "--operation-id", ci_operation["operation_id"],
+        "--effect-json", '{"job_id":"ci-p1-019","status":"pass"}',
+        "--expect-revision", "5", env=env,
+    )
+    run(
+        "operation", replay_run, "receipt", "--operation-id", ci_operation["operation_id"],
+        "--receipt-json", '{"job_id":"ci-p1-019","status":"pass"}',
+        "--expect-revision", "6", env=env,
+    )
+    ci_confirmed = payload(run(
+        "operation", replay_run, "confirm", "--operation-id", ci_operation["operation_id"],
+        "--status", "confirmed", "--reason", "CI receipt verified",
+        "--expect-revision", "7", env=env,
+    ))
+    ci_bytes, ci_event_bytes = replay_path.read_bytes(), replay_events.read_bytes()
+    ci_replay = payload(run(
+        "operation", replay_run, "confirm", "--operation-id", ci_operation["operation_id"],
+        "--status", "confirmed", "--reason", "CI receipt verified",
+        "--expect-revision", "999", env=env,
+    ))
+    assert ci_confirmed["revision"] == ci_replay["revision"] == 8
+    assert replay_path.read_bytes() == ci_bytes and replay_events.read_bytes() == ci_event_bytes
+    assert len({entry["task_id"] for entry in ci_replay["delegation_ledger"]}) == 2
+    attempt_evidence = {
+        "boundaries": ["task_id", "result", "verification", "ci"],
+        "operation_lineage": [operation["operation_id"], verifier_operation["operation_id"], ci_operation["operation_id"]],
+        "task_ids": ["task-crash-replay", "task-verifier-crash-replay"],
+        "duplicate_count": 0,
+        "reconciliation_decisions": ["COLLECT_DELEGATIONS", "RUN_LOCAL_VERIFICATION", "reuse_confirmed_result"],
+    }
+
+print("CRASH_REPLAY_EVIDENCE=" + json.dumps(attempt_evidence, sort_keys=True))
 print("operation attempt lifecycle test: PASS")

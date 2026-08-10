@@ -1692,13 +1692,16 @@ class CampaignSupervisor:
 
         # 1. Base git SHA and branch capture
         base_sha = wu.get("base_sha")
-        branch = ""
+        # Keep a non-empty parent branch even if fault injection terminates the
+        # short-lived `git branch` child. A blank branch can be persisted in the
+        # state-first run and later makes governed commit recovery impossible.
+        branch = wu.get("branch") or data.get("branch") or "main"
         try:
             proc_branch = run_argv(["git", "branch", "--show-current"], cwd=repo_root, env=agent_env)
-            if proc_branch.returncode == 0:
+            if proc_branch.returncode == 0 and proc_branch.stdout.strip():
                 branch = proc_branch.stdout.strip()
         except Exception:
-            branch = "main"
+            pass
 
         if not base_sha:
             try:

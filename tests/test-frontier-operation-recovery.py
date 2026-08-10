@@ -97,6 +97,23 @@ with tempfile.TemporaryDirectory(prefix="myrmex-frontier-recovery-test-") as td:
         assert recorded["effect"]["frontier_decision"] == decision
         assert recorded["receipt"]["message_id"] == message_id
         operations.append((operation["operation_id"], decision))
+    # A crash after typed evidence confirmation replays byte-for-byte without
+    # repeating the confirmed transport effect or consuming a revision.
+    independent_path = Path(env["MYRMEX_STATE_HOME"]) / "runs" / independent / "state.json"
+    independent_events = independent_path.parent / "events.jsonl"
+    confirmed_state_bytes = independent_path.read_bytes()
+    confirmed_event_bytes = independent_events.read_bytes()
+    first_operation_id, first_decision = operations[0]
+    replayed_confirmation = result(
+        env, independent, first_operation_id, "request-1", "message-1", first_decision,
+        "success", 999, task_id="task-1",
+        effect_json=evidence("request-1", "message-1", first_decision),
+        receipt_json=evidence("request-1", "message-1", first_decision),
+    )
+    assert replayed_confirmation["revision"] == revisions
+    assert independent_path.read_bytes() == confirmed_state_bytes
+    assert independent_events.read_bytes() == confirmed_event_bytes
+
     completed = state(run(
         "complete", independent, "--message", "all decisions are technically confirmed",
         "--expect-revision", str(revisions), env=env,
@@ -265,4 +282,13 @@ with tempfile.TemporaryDirectory(prefix="myrmex-frontier-recovery-test-") as td:
         "patch", protected, "--json-patch", '{"pending_operations":[]}', "--expect-revision", "0", env=env, ok=False,
     )
 
+    frontier_evidence = {
+        "boundaries": ["evidence_confirmation"],
+        "operation_lineage": [operation_id for operation_id, _ in operations],
+        "task_ids": [f"task-{index}" for index in range(1, 4)],
+        "duplicate_count": 0,
+        "reconciliation_decisions": ["RECOVER_FRONTIER_EXCHANGE", "WAIT_FRONTIER", "reuse_confirmed_effect"],
+    }
+
+print("CRASH_REPLAY_EVIDENCE=" + json.dumps(frontier_evidence, sort_keys=True))
 print("frontier operation recovery test: PASS")

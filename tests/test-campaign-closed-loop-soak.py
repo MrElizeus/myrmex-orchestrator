@@ -14,6 +14,8 @@ Verifies:
 from __future__ import annotations
 
 import json
+import importlib.machinery
+import importlib.util
 import os
 import signal
 import subprocess
@@ -26,6 +28,10 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN_CAMPAIGN = ROOT / "bin/myrmex-campaign"
 BIN_HEAD = ROOT / "bin/myrmex-head"
 BIN_STATE = ROOT / "bin/myrmex-state"
+HEAD_LOADER = importlib.machinery.SourceFileLoader("myrmex_head_p1019_soak", str(BIN_HEAD))
+HEAD_SPEC = importlib.util.spec_from_loader(HEAD_LOADER.name, HEAD_LOADER)
+HEAD_RUNTIME = importlib.util.module_from_spec(HEAD_SPEC)
+HEAD_LOADER.exec_module(HEAD_RUNTIME)
 
 
 def run_cmd(cmd: list[str], state_home: str, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -33,7 +39,7 @@ def run_cmd(cmd: list[str], state_home: str, cwd: str | None = None) -> subproce
     return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
 
 
-def test_real_execution_closed_loop_and_chained_commits() -> None:
+def test_real_execution_closed_loop_and_chained_commits() -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="myrmex-soak-repo-") as repo_dir, \
          tempfile.TemporaryDirectory(prefix="myrmex-soak-state-") as state_dir:
 
@@ -238,6 +244,7 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
         assert wu3["evidence"]["ci_operation"]["status"] == "pass"
 
         # 8. Verify durable myrmex-state run bindings
+        task_ids: list[str] = []
         for wu in [wu1, wu2, wu3]:
             run_id = wu["run_id"]
             proc_st = run_cmd([sys.executable, str(BIN_STATE), "show", run_id, "--json"], state_dir)
@@ -249,6 +256,37 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
             assert state_wu["completion_evidence"] == wu["evidence"], (
                 f"Campaign/state evidence mismatch for {wu['id']}"
             )
+            task_ids.extend(
+                entry["task_id"] for entry in st_data["delegation_ledger"]
+                if isinstance(entry, dict) and isinstance(entry.get("task_id"), str)
+            )
+
+        # A restart after evidence confirmation is a read-only terminal replay:
+        # no task, commit, or evidence effect may be repeated.
+        terminal_log = proc_log.stdout
+        terminal_evidence = [wu["evidence"] for wu in (wu1, wu2, wu3)]
+        terminal_replay = run_cmd(
+            [sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", cid],
+            state_dir,
+        )
+        assert terminal_replay.returncode == 0, terminal_replay.stderr
+        replay_log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=repo_dir, capture_output=True, text=True, check=True,
+        ).stdout
+        replayed = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
+        assert replay_log == terminal_log, "terminal replay repeated a commit effect"
+        assert [wu["evidence"] for wu in replayed["work_units"]] == terminal_evidence
+        assert len(task_ids) == len(set(task_ids)), f"duplicate task identities: {task_ids}"
+
+        commit_shas = [wu["evidence"]["commit_sha"] for wu in (wu1, wu2, wu3)]
+        assert len(commit_shas) == len(set(commit_shas)) == 3
+        return {
+            "boundaries": ["verification", "ci", "commit", "evidence_confirmation"],
+            "task_ids": task_ids,
+            "commit_shas": commit_shas,
+            "duplicate_count": 0,
+            "reconciliation_decisions": ["resume_after_interrupt", "reuse_confirmed_terminal_evidence"],
+        }
 
 
 def test_verifier_workspace_mutation_rejection() -> None:
@@ -368,15 +406,93 @@ def test_pre_commit_absence_rewinds_committing_safely() -> None:
         assert log.count("feat(wu-precommit):") == 1, log
 
 
+def test_post_commit_crash_recovers_without_repeating_confirmed_effects() -> str:
+    """A commit effect that outlives its caller is discovered, never repeated."""
+    class InjectedProcessCrash(BaseException):
+        pass
+
+    with tempfile.TemporaryDirectory(prefix="myrmex-postcommit-repo-") as repo_dir, \
+         tempfile.TemporaryDirectory(prefix="myrmex-postcommit-state-") as state_dir:
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "tester@test.local"], cwd=repo_dir, check=True)
+        Path(repo_dir, "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=repo_dir, check=True, capture_output=True)
+        cid = "camp-postcommit-recovery"
+        assert run_cmd([
+            sys.executable, str(BIN_CAMPAIGN), "init", "--id", cid, "--title", "postcommit",
+            "--objective", "recover confirmed effects", "--repo-root", repo_dir,
+        ], state_dir).returncode == 0
+        implementation = f"{sys.executable} -c \"from pathlib import Path; Path('durable.txt').write_text('done')\""
+        verification = f"{sys.executable} -c \"from pathlib import Path; assert Path('durable.txt').read_text() == 'done'\""
+        ci_command = f"{sys.executable} -c \"from pathlib import Path; assert Path('durable.txt').exists()\""
+        assert run_cmd([
+            sys.executable, str(BIN_CAMPAIGN), "wu-add", cid, "--wu-id", "WU-POSTCOMMIT",
+            "--objective", "post commit recovery", "--impl-cmd", implementation,
+            "--verify-cmd", verification, "--ci-cmd", ci_command,
+        ], state_dir).returncode == 0
+
+        supervisor = HEAD_RUNTIME.CampaignSupervisor(
+            campaign_id=cid, once=True, state_home=state_dir, allow_fixture_driver=True,
+        )
+        original_commit = supervisor.produce_governed_commit
+        committed: dict[str, str] = {}
+
+        def commit_then_crash(*args, **kwargs):
+            receipt = original_commit(*args, **kwargs)
+            committed["sha"] = receipt["commit_sha"]
+            raise InjectedProcessCrash("crash after commit effect")
+
+        supervisor.produce_governed_commit = commit_then_crash
+        try:
+            supervisor.process_campaign(cid)
+        except InjectedProcessCrash as error:
+            assert "after commit" in str(error)
+        else:
+            raise AssertionError("post-commit interruption was not injected")
+
+        interrupted = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
+        interrupted_wu = interrupted["work_units"][0]
+        assert interrupted_wu["phase"] == "committing" and interrupted_wu["commit_sha"] is None
+        run_id = interrupted_wu["run_id"]
+        state_before = json.loads(run_cmd([sys.executable, str(BIN_STATE), "show", run_id, "--json"], state_dir).stdout)
+        task_ids_before = [entry["task_id"] for entry in state_before["delegation_ledger"]]
+        assert committed["sha"] == subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        restarted = HEAD_RUNTIME.CampaignSupervisor(
+            campaign_id=cid, once=True, state_home=state_dir, allow_fixture_driver=True,
+        )
+        assert restarted.process_campaign(cid) is True
+        recovered = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
+        recovered_wu = recovered["work_units"][0]
+        assert recovered_wu["status"] == "completed"
+        assert recovered_wu["evidence"]["commit_sha"] == committed["sha"]
+        state_after = json.loads(run_cmd([sys.executable, str(BIN_STATE), "show", run_id, "--json"], state_dir).stdout)
+        task_ids_after = [entry["task_id"] for entry in state_after["delegation_ledger"]]
+        assert task_ids_after == task_ids_before, "recovery repeated a confirmed writer/verifier task"
+        subjects = subprocess.run(
+            ["git", "log", "--format=%s"], cwd=repo_dir, capture_output=True, text=True, check=True,
+        ).stdout
+        assert subjects.count("feat(wu-postcommit):") == 1, subjects
+        return committed["sha"]
+
+
 def main() -> int:
-    print("[1/4] Running real execution closed loop & 3 chained commits soak test...")
-    test_real_execution_closed_loop_and_chained_commits()
-    print("[2/4] Running verifier workspace mutation rejection test...")
+    print("[1/5] Running real execution closed loop & 3 chained commits soak test...")
+    evidence = test_real_execution_closed_loop_and_chained_commits()
+    print("[2/5] Running verifier workspace mutation rejection test...")
     test_verifier_workspace_mutation_rejection()
-    print("[3/4] Running CI failure block test...")
+    print("[3/5] Running CI failure block test...")
     test_ci_failure_blocks_completion()
-    print("[4/4] Running proven pre-commit rewind test...")
+    print("[4/5] Running proven pre-commit rewind test...")
     test_pre_commit_absence_rewinds_committing_safely()
+    print("[5/5] Running post-commit discovery/recovery test...")
+    evidence["post_commit_recovery_sha"] = test_post_commit_crash_recovers_without_repeating_confirmed_effects()
+    evidence["reconciliation_decisions"].append("discover_existing_commit_effect")
+    print("CRASH_REPLAY_EVIDENCE=" + json.dumps(evidence, sort_keys=True))
     print("ALL real execution soak tests PASSED successfully!")
     return 0
 
