@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:backlog-item:v1",
+  "title": "Myrmex Backlog Item v1",
+  "description": "An immutable normalized backlog item derived from one exact source entity. backlog_item_id is stable for the source identity and entity; item_digest versions the complete semantic payload. This contract contains no execution status or repository-effect authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "backlog_item_id",
+    "item_digest",
+    "source_adapter",
+    "source_identity",
+    "source_entity_type",
+    "source_entity_id",
+    "title",
+    "priority",
+    "state",
+    "dependency_hints",
+    "constraints",
+    "context_constraints",
+    "labels",
+    "group_ref"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.backlog-item/v1"},
+    "backlog_item_id": {"type": "string", "pattern": "^backlog_[0-9a-f]{64}$"},
+    "item_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_adapter": {
+      "enum": [
+        "local-markdown-roadmap/v1",
+        "local-manifest-json/v1",
+        "local-manifest-yaml/v1",
+        "github-issues-milestones/v1"
+      ]
+    },
+    "source_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "canonical_id"],
+      "properties": {
+        "kind": {
+          "enum": ["local-roadmap", "local-manifest", "github-issues-milestones"]
+        },
+        "canonical_id": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "source_entity_type": {"enum": ["local-item", "github-issue"]},
+    "source_entity_id": {
+      "type": "string",
+      "pattern": "^(?:srcitem_|ghissue_)[0-9a-f]{64}$"
+    },
+    "title": {"type": "string", "minLength": 1},
+    "priority": {"type": ["string", "null"]},
+    "state": {"enum": ["open", "closed", null]},
+    "dependency_hints": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "constraints": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "context_constraints": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "labels": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "group_ref": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "title"],
+          "properties": {
+            "kind": {"const": "local-objective"},
+            "id": {"type": "string", "pattern": "^srcobj_[0-9a-f]{64}$"},
+            "title": {"type": "string", "minLength": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "number", "title", "state", "due_on"],
+          "properties": {
+            "kind": {"const": "github-milestone"},
+            "id": {"type": "string", "pattern": "^ghmilestone_[0-9a-f]{64}$"},
+            "number": {"type": "integer", "minimum": 1},
+            "title": {"type": "string", "minLength": 1},
+            "state": {"enum": ["open", "closed"]},
+            "due_on": {
+              "oneOf": [
+                {"type": "string", "minLength": 1},
+                {"type": "null"}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source_entity_type": {"const": "local-item"}}},
+      "then": {
+        "properties": {
+          "source_adapter": {
+            "enum": [
+              "local-markdown-roadmap/v1",
+              "local-manifest-json/v1",
+              "local-manifest-yaml/v1"
+            ]
+          },
+          "source_entity_id": {"pattern": "^srcitem_[0-9a-f]{64}$"},
+          "state": {"type": "null"},
+          "labels": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"source_entity_type": {"const": "github-issue"}}},
+      "then": {
+        "properties": {
+          "source_adapter": {"const": "github-issues-milestones/v1"},
+          "source_entity_id": {"pattern": "^ghissue_[0-9a-f]{64}$"},
+          "priority": {"type": "null"},
+          "state": {"enum": ["open", "closed"]},
+          "dependency_hints": {"maxItems": 0},
+          "constraints": {"maxItems": 0},
+          "context_constraints": {"maxItems": 0}
+        }
+      }
+    }
+  ]
+}

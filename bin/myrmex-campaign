@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-def _bundled_scripts_dir() -> Path:
+def _bundled_scripts_dir(required_modules: tuple[str, ...] = ("myrmex_campaign_intelligence.py",)) -> Path:
     """Resolve support modules in a checkout or an installed Myrmex bundle."""
     binary_dir = Path(__file__).resolve().parent
     binary_root = binary_dir.parent
@@ -54,11 +54,11 @@ def _bundled_scripts_dir() -> Path:
             continue
 
     for candidate in dict.fromkeys(path.resolve() for path in candidates):
-        if (candidate / "myrmex_campaign_intelligence.py").is_file():
+        if all((candidate / module).is_file() for module in required_modules):
             return candidate
     searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
     raise ModuleNotFoundError(
-        "myrmex_campaign_intelligence.py is not available in the Myrmex bundle; "
+        f"required support modules {', '.join(required_modules)} are not available in the Myrmex bundle; "
         f"searched: {searched}"
     )
 
@@ -67,6 +67,22 @@ _SCRIPTS_DIR = _bundled_scripts_dir()
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import myrmex_campaign_intelligence as intel  # noqa: E402
+
+
+def _backlog_normalizer():
+    """Load P1 backlog support lazily without weakening standalone P0 CLI use."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py",
+        "myrmex_backlog_import.py",
+        "myrmex_roadmap_reader.py",
+        "myrmex_github_reader.py",
+        "myrmex_backlog_normalizer.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_backlog_normalizer")
 
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
@@ -1296,6 +1312,65 @@ def cmd_intelligence_doctor(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "healthy" else 1
 
 
+# Durable normalized backlog commands (WU-P1-006). These commands only write
+# immutable Campaign Intelligence artifacts; they never create or mutate WUs.
+def cmd_backlog_import(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        data = read_campaign(cid)
+        payload = intel.read_input_json(args.sources_json, data["repository_root"], campaign_dir(cid))
+        if set(payload) != {"sources"} or not isinstance(payload["sources"], list):
+            raise ValueError("backlog import input must be exactly an object with a sources array")
+        backlog = _backlog_normalizer()
+        result = backlog.normalize_backlog_sources(
+            campaign_dir(cid), cid, data["revision"], payload["sources"],
+            previous_snapshot_digest=args.previous_snapshot_digest,
+        )
+    except intel.IntelligencePayloadRejected as exc:
+        _intel_emit_error("input_rejected", str(exc))
+        return 1
+    except Exception as exc:
+        if type(exc).__name__ == "BacklogNormalizationConflict":
+            _intel_emit_error("conflict", str(exc))
+            return 2
+        _intel_emit_error("backlog_import_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_backlog_show(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        backlog = _backlog_normalizer()
+        if not re.fullmatch(r"blsnaprec_[0-9a-f]{64}", args.snapshot_record_id):
+            raise ValueError("snapshot_record_id must match ^blsnaprec_[0-9a-f]{64}$")
+        artifact_id = f"normalized-backlog/snapshot/{args.snapshot_record_id}"
+        snapshot = intel.get_artifact(campaign_dir(cid), cid, artifact_id)["artifact"]["payload"]
+        backlog.validate_normalized_snapshot(snapshot)
+        items = []
+        for descriptor in snapshot["items"]:
+            item = intel.get_artifact(campaign_dir(cid), cid, descriptor["artifact_id"])["artifact"]["payload"]
+            backlog.validate_normalized_item(item)
+            if item["backlog_item_id"] != descriptor["backlog_item_id"] or item["item_digest"] != descriptor["item_digest"]:
+                raise ValueError("snapshot item descriptor does not match its immutable artifact")
+            items.append(item)
+    except intel.IntelligenceArtifactInvalid as exc:
+        if str(exc).startswith("artifact not found"):
+            _intel_emit_error("not_found", str(exc))
+            return 4
+        _intel_emit_error("artifact_invalid", str(exc))
+        return 1
+    except Exception as exc:
+        _intel_emit_error("backlog_show_failed", str(exc))
+        return 1
+    print(json.dumps({"ok": True, "snapshot": snapshot, "items": items}, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1493,6 +1568,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ic_doctor.add_argument("id", help="Campaign ID")
     p_ic_doctor.set_defaults(func=cmd_intelligence_doctor)
+
+    p_backlog_import = sub.add_parser(
+        "backlog-import",
+        help="Normalize validated source observations into an immutable backlog snapshot",
+    )
+    p_backlog_import.add_argument("id", help="Campaign ID")
+    p_backlog_import.add_argument(
+        "--sources-json", required=True,
+        help="JSON object file (or - for stdin) containing exactly a sources array",
+    )
+    p_backlog_import.add_argument("--previous-snapshot-digest")
+    p_backlog_import.set_defaults(func=cmd_backlog_import)
+
+    p_backlog_show = sub.add_parser(
+        "backlog-show",
+        help="Read and validate one immutable backlog snapshot and all referenced items",
+    )
+    p_backlog_show.add_argument("id", help="Campaign ID")
+    p_backlog_show.add_argument("--snapshot-record-id", required=True)
+    p_backlog_show.set_defaults(func=cmd_backlog_show)
 
     return p
 

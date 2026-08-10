@@ -150,6 +150,64 @@ def main() -> None:
         norm.validate_normalized_snapshot(snap["artifact"]["payload"])
         check(snap["artifact"]["payload"]["snapshot_record_id"] == result["snapshot_record_id"], "snapshot record id matches")
 
+        # Public P1-006 schemas validate the runtime payloads and reject unknown fields.
+        try:
+            import jsonschema
+            item_schema = json.loads((ROOT / "contracts" / "backlog-item-v1.schema.json").read_text(encoding="utf-8"))
+            snapshot_schema = json.loads((ROOT / "contracts" / "backlog-snapshot-v1.schema.json").read_text(encoding="utf-8"))
+            first_descriptor = snap["artifact"]["payload"]["items"][0]
+            first_item = intel.get_artifact(str(campaign_dir), campaign_id, first_descriptor["artifact_id"])["artifact"]["payload"]
+            jsonschema.Draft202012Validator(item_schema).validate(first_item)
+            jsonschema.Draft202012Validator(snapshot_schema).validate(snap["artifact"]["payload"])
+            invalid_contract_item = dict(first_item); invalid_contract_item["execution_status"] = "ready"
+            try:
+                jsonschema.Draft202012Validator(item_schema).validate(invalid_contract_item)
+                check(False, "backlog item contract rejects execution status")
+            except jsonschema.ValidationError:
+                check(True, "backlog item contract rejects execution status")
+        except ImportError:
+            check(False, "jsonschema required for P1-006 contract tests")
+
+        # CLI import/show operates on immutable sidecar data and remains replay-safe.
+        cli_payload = tmp / "backlog-import.json"
+        cli_payload.write_text(json.dumps({"sources": descriptors}, ensure_ascii=False), encoding="utf-8")
+        cli_env = dict(os.environ, XDG_STATE_HOME=str(tmp / "state"))
+        cli_import = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "backlog-import", campaign_id,
+            "--sources-json", str(cli_payload),
+            "--previous-snapshot-digest", result["snapshot_digest"],
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_import.returncode == 0, f"backlog-import CLI succeeds: {cli_import.stderr} {cli_import.stdout}")
+        if cli_import.returncode == 0:
+            cli_result = json.loads(cli_import.stdout)
+            check(cli_result["outcome"] == "unchanged", "backlog-import CLI exact replay is unchanged")
+        cli_show = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "backlog-show", campaign_id,
+            "--snapshot-record-id", result["snapshot_record_id"],
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_show.returncode == 0, f"backlog-show CLI succeeds: {cli_show.stderr} {cli_show.stdout}")
+        if cli_show.returncode == 0:
+            cli_projection = json.loads(cli_show.stdout)
+            check(cli_projection["snapshot"]["snapshot_record_id"] == result["snapshot_record_id"], "backlog-show returns exact snapshot")
+            check(len(cli_projection["items"]) == expected_items, "backlog-show validates every referenced item")
+        invalid_cli_payload = tmp / "backlog-import-invalid.json"
+        invalid_cli_payload.write_text(json.dumps({"sources": descriptors, "unexpected": True}), encoding="utf-8")
+        normalized_before_invalid_cli = count_artifacts(campaign_dir)
+        invalid_cli = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "backlog-import", campaign_id,
+            "--sources-json", str(invalid_cli_payload),
+        ], capture_output=True, text=True, env=cli_env)
+        check(invalid_cli.returncode == 1, "backlog-import rejects unknown top-level fields")
+        check(count_artifacts(campaign_dir) == normalized_before_invalid_cli, "invalid CLI import creates no artifacts")
+
+        # Previously emitted internal schema IDs remain readable; new writes use public contracts.
+        legacy_item = copy.deepcopy(first_item)
+        legacy_item["schema"] = norm.LEGACY_NORMALIZED_ITEM_SCHEMA
+        legacy_item["item_digest"] = norm.compute_item_digest(legacy_item)
+        norm.validate_normalized_item(legacy_item)
+        check(first_item["schema"] == "myrmex.backlog-item/v1", "new item uses public backlog-item contract")
+        check(snap["artifact"]["payload"]["schema"] == "myrmex.backlog-snapshot/v1", "new snapshot uses public backlog-snapshot contract")
+
         # No raw bodies/descriptions in any artifact
         found = []
         for path in (campaign_dir / "intelligence" / "artifacts").glob("*.json"):

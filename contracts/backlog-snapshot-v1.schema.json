@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:backlog-snapshot:v1",
+  "title": "Myrmex Backlog Snapshot v1",
+  "description": "An immutable completion marker for one deterministic normalized backlog. It binds exact source observations and immutable item artifacts. A source outage or invalid observation cannot produce this snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "snapshot_record_id",
+    "snapshot_record_digest",
+    "snapshot_digest",
+    "source_count",
+    "sources",
+    "item_count",
+    "items"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.backlog-snapshot/v1"},
+    "snapshot_record_id": {"type": "string", "pattern": "^blsnaprec_[0-9a-f]{64}$"},
+    "snapshot_record_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "snapshot_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_count": {"type": "integer", "minimum": 1},
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "observation_id",
+          "observation_digest",
+          "request_digest",
+          "content_digest",
+          "outcome",
+          "adapter",
+          "source_identity"
+        ],
+        "properties": {
+          "operation_id": {"type": "string", "pattern": "^importop-[0-9a-f]{24}$"},
+          "observation_id": {"type": "string", "pattern": "^srcobs_[0-9a-f]{64}$"},
+          "observation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "request_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "content_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "outcome": {"enum": ["changed", "unchanged"]},
+          "adapter": {
+            "enum": [
+              "local-markdown-roadmap/v1",
+              "local-manifest-json/v1",
+              "local-manifest-yaml/v1",
+              "github-issues-milestones/v1"
+            ]
+          },
+          "source_identity": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "canonical_id"],
+            "properties": {
+              "kind": {
+                "enum": ["local-roadmap", "local-manifest", "github-issues-milestones"]
+              },
+              "canonical_id": {"type": "string", "minLength": 1, "maxLength": 512}
+            }
+          }
+        }
+      }
+    },
+    "item_count": {"type": "integer", "minimum": 1},
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["backlog_item_id", "item_digest", "artifact_id"],
+        "properties": {
+          "backlog_item_id": {"type": "string", "pattern": "^backlog_[0-9a-f]{64}$"},
+          "item_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^normalized-backlog/item/backlog_[0-9a-f]{64}/[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

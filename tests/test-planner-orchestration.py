@@ -24,7 +24,9 @@ def fixture():
     item = {"schema": backlog.NORMALIZED_ITEM_SCHEMA, "backlog_item_id": "", "item_digest": "", "source_adapter": "local-markdown-roadmap/v1", "source_identity": identity, "source_entity_type": "local-item", "source_entity_id": entity, "title": "plan this", "priority": None, "state": None, "dependency_hints": [], "constraints": [], "context_constraints": [], "labels": [], "group_ref": None}
     item["backlog_item_id"] = backlog.compute_backlog_item_id(item["source_adapter"], identity, entity); item["item_digest"] = backlog.compute_item_digest(item)
     item_id = f"normalized-backlog/item/{item['backlog_item_id']}/{item['item_digest']}"; intel.put_artifact(root, cid, 1, "backlog", item_id, item)
-    snap = {"schema": backlog.NORMALIZED_SNAPSHOT_SCHEMA, "snapshot_record_id": "", "snapshot_record_digest": "", "snapshot_digest": "", "source_count": 0, "sources": [], "item_count": 1, "items":[{"backlog_item_id":item["backlog_item_id"],"item_digest":item["item_digest"],"artifact_id":item_id}]}
+    source_digest = "c" * 64
+    source = {"operation_id":"importop-" + "c" * 24, "observation_id":"srcobs_" + source_digest, "observation_digest":source_digest, "request_digest":"d" * 64, "content_digest":"e" * 64, "outcome":"changed", "adapter":"local-markdown-roadmap/v1", "source_identity":identity}
+    snap = {"schema": backlog.NORMALIZED_SNAPSHOT_SCHEMA, "snapshot_record_id": "", "snapshot_record_digest": "", "snapshot_digest": "", "source_count": 1, "sources": [source], "item_count": 1, "items":[{"backlog_item_id":item["backlog_item_id"],"item_digest":item["item_digest"],"artifact_id":item_id}]}
     snap["snapshot_digest"] = backlog.compute_snapshot_digest_from_snapshot(snap); snap["snapshot_record_digest"] = backlog.compute_snapshot_record_digest(snap); snap["snapshot_record_id"] = "blsnaprec_" + snap["snapshot_record_digest"]
     intel.put_artifact(root, cid, 1, "backlog", "normalized-backlog/snapshot/" + snap["snapshot_record_id"], snap)
     constraints = {"allowed_paths": ["src/"], "forbidden_paths": [".git"], "required_invariants": ["planning-only"], "required_sections": ["work_units"]}

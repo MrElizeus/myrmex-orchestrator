@@ -61,6 +61,23 @@ assert str(config.parent/'bin/myrmex-head') in recorded
 assert str(config.parent/'bin/myrmex_campaign_intelligence.py') in recorded
 PY
 
+# The installed campaign CLI resolves the complete P1 support set from the
+# installation record/config root, not from the source checkout.
+INSTALL_STATE="$TMP/installed-campaign-state"
+OPENCODE_CONFIG_DIR="$CONFIG" XDG_STATE_HOME="$INSTALL_STATE" "$BIN/myrmex-campaign" \
+  init --id camp-installed-backlog --title installed --objective backlog --repo-root "$TMP" >/dev/null
+set +e
+INSTALLED_BACKLOG_OUTPUT="$(OPENCODE_CONFIG_DIR="$CONFIG" XDG_STATE_HOME="$INSTALL_STATE" \
+  "$BIN/myrmex-campaign" backlog-show camp-installed-backlog \
+  --snapshot-record-id "blsnaprec_$(printf '0%.0s' {1..64})" 2>&1)"
+INSTALLED_BACKLOG_RC=$?
+set -e
+[[ "$INSTALLED_BACKLOG_RC" -eq 4 ]] || {
+  printf '%s\n' "$INSTALLED_BACKLOG_OUTPUT" >&2
+  echo "installed backlog CLI failed to load packaged support modules" >&2
+  exit 1
+}
+
 "$ROOT/scripts/uninstall.sh" --config-dir "$CONFIG" >"$TMP/uninstall-1.log"
 echo "    uninstall and preservation: OK"
 python3 - "$CONFIG" <<'PY'

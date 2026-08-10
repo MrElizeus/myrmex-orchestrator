@@ -59,8 +59,16 @@ class BacklogNormalizationConflict(BacklogNormalizationError):
     """Derived-ID collision or conflicting immutable artifact."""
 
 
-NORMALIZED_ITEM_SCHEMA = "myrmex.normalized-backlog-item/v1"
-NORMALIZED_SNAPSHOT_SCHEMA = "myrmex.normalized-backlog-snapshot/v1"
+BACKLOG_ITEM_SCHEMA = "myrmex.backlog-item/v1"
+BACKLOG_SNAPSHOT_SCHEMA = "myrmex.backlog-snapshot/v1"
+LEGACY_NORMALIZED_ITEM_SCHEMA = "myrmex.normalized-backlog-item/v1"
+LEGACY_NORMALIZED_SNAPSHOT_SCHEMA = "myrmex.normalized-backlog-snapshot/v1"
+# Compatibility aliases retained for callers introduced before the public
+# P1-006 contracts existed. New artifacts always use the accepted contract IDs.
+NORMALIZED_ITEM_SCHEMA = BACKLOG_ITEM_SCHEMA
+NORMALIZED_SNAPSHOT_SCHEMA = BACKLOG_SNAPSHOT_SCHEMA
+SUPPORTED_ITEM_SCHEMAS = {BACKLOG_ITEM_SCHEMA, LEGACY_NORMALIZED_ITEM_SCHEMA}
+SUPPORTED_SNAPSHOT_SCHEMAS = {BACKLOG_SNAPSHOT_SCHEMA, LEGACY_NORMALIZED_SNAPSHOT_SCHEMA}
 
 LOCAL_SOURCE_TYPES = ("roadmap_markdown", "manifest_json", "manifest_yaml")
 LOCAL_ADAPTER_KINDS = {
@@ -346,7 +354,7 @@ def _require_sorted_unique_strings(value: Any, label: str) -> None:
 
 def validate_normalized_item(item: Any) -> None:
     _obj_fields(item, NORMALIZED_ITEM_FIELDS, "normalized item")
-    if item["schema"] != NORMALIZED_ITEM_SCHEMA:
+    if item["schema"] not in SUPPORTED_ITEM_SCHEMAS:
         raise BacklogNormalizationInvalid("normalized item schema mismatch")
     if not isinstance(item.get("backlog_item_id"), str) or not BACKLOG_ITEM_ID_RE.fullmatch(item["backlog_item_id"]):
         raise BacklogNormalizationInvalid("backlog_item_id must match ^backlog_[0-9a-f]{64}$")
@@ -486,7 +494,7 @@ def compute_snapshot_digest(sources: list[dict[str, Any]], observations: dict[st
         key=lambda d: d["backlog_item_id"],
     )
     core = {
-        "schema": NORMALIZED_SNAPSHOT_SCHEMA,
+        "schema": BACKLOG_SNAPSHOT_SCHEMA,
         "sources": semantic_sources,
         "items": item_descriptors,
     }
@@ -514,7 +522,7 @@ def compute_snapshot_digest_from_snapshot(snapshot: dict[str, Any]) -> str:
         key=lambda d: d["backlog_item_id"],
     )
     core = {
-        "schema": NORMALIZED_SNAPSHOT_SCHEMA,
+        "schema": snapshot.get("schema") if snapshot.get("schema") in SUPPORTED_SNAPSHOT_SCHEMAS else BACKLOG_SNAPSHOT_SCHEMA,
         "sources": semantic_sources,
         "items": item_descriptors,
     }
@@ -523,7 +531,7 @@ def compute_snapshot_digest_from_snapshot(snapshot: dict[str, Any]) -> str:
 
 def validate_normalized_snapshot(snapshot: Any) -> None:
     _obj_fields(snapshot, SNAPSHOT_FIELDS, "normalized snapshot")
-    if snapshot["schema"] != NORMALIZED_SNAPSHOT_SCHEMA:
+    if snapshot["schema"] not in SUPPORTED_SNAPSHOT_SCHEMAS:
         raise BacklogNormalizationInvalid("snapshot schema mismatch")
     if not isinstance(snapshot.get("snapshot_digest"), str) or not SHA256_HEX_RE.fullmatch(snapshot["snapshot_digest"]):
         raise BacklogNormalizationInvalid("snapshot_digest must be a 64-hex digest")
@@ -531,8 +539,8 @@ def validate_normalized_snapshot(snapshot: Any) -> None:
         raise BacklogNormalizationInvalid("snapshot_record_digest must be a 64-hex digest")
     if not isinstance(snapshot.get("snapshot_record_id"), str) or not re.fullmatch(r"^blsnaprec_[0-9a-f]{64}$", snapshot["snapshot_record_id"]):
         raise BacklogNormalizationInvalid("snapshot_record_id must match ^blsnaprec_[0-9a-f]{64}$")
-    if isinstance(snapshot.get("source_count"), bool) or not isinstance(snapshot.get("source_count"), int) or snapshot["source_count"] < 0:
-        raise BacklogNormalizationInvalid("source_count must be a non-negative integer")
+    if isinstance(snapshot.get("source_count"), bool) or not isinstance(snapshot.get("source_count"), int) or snapshot["source_count"] < 1:
+        raise BacklogNormalizationInvalid("source_count must be a positive integer")
     if isinstance(snapshot.get("item_count"), bool) or not isinstance(snapshot.get("item_count"), int) or snapshot["item_count"] < 1:
         raise BacklogNormalizationInvalid("item_count must be a positive integer")
 
@@ -651,7 +659,7 @@ def _snapshot_payload(
         })
     item_descriptors.sort(key=lambda d: d["backlog_item_id"])
     payload = {
-        "schema": NORMALIZED_SNAPSHOT_SCHEMA,
+        "schema": BACKLOG_SNAPSHOT_SCHEMA,
         "snapshot_record_id": "",
         "snapshot_record_digest": "",
         "snapshot_digest": snapshot_digest,

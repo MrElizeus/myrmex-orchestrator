@@ -487,3 +487,9 @@ Re-run `install.sh` from a newer package. Existing Myrmex files and the state bi
 ## Structured planner recovery and replay
 
 Planner requests and responses are addressed by the SHA-256 of their request ID. The request binds one authoritative normalized-backlog snapshot and the context resolves that snapshot and each item directly from artifacts, never from the projection. Repeating an identical request or result reuses the durable bytes; a changed payload is rejected as a conflict. The response is persisted before its embedded proposed plan, so a lost acknowledgement or crash between those writes is recovered by replaying the same result. Missing or stale projections are rebuilt by the existing immutable stores; no planner operation activates a plan or creates execution work.
+
+## Durable backlog commands
+
+`myrmex-campaign backlog-import <campaign> --sources-json <file|->` validates exact source-observation/neutral pairs and writes immutable `myrmex.backlog-item/v1` artifacts followed by one `myrmex.backlog-snapshot/v1` completion marker. The input object must contain exactly `sources`; use `--previous-snapshot-digest` to classify a semantic replay as unchanged. Invalid, unavailable, ambiguous, mismatched, or secret-bearing input fails before a snapshot is confirmed and never creates WUs.
+
+`myrmex-campaign backlog-show <campaign> --snapshot-record-id <blsnaprec_...>` loads the authoritative snapshot and every referenced item directly from immutable artifacts, validates runtime semantics, and rejects missing, corrupt, or mismatched descriptors. Neither command mutates `campaign.json`, the DAG, repository files, or plan activation state.

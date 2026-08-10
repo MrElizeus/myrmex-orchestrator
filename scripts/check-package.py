@@ -58,6 +58,8 @@ REQUIRED_CONTRACTS = {
     "planning-result-v1.schema.json",
     "source-observation-v1.schema.json",
     "import-operation-v1.schema.json",
+    "backlog-item-v1.schema.json",
+    "backlog-snapshot-v1.schema.json",
     "procedural-experiment-v1.schema.json",
     "evidence-receipt-v1.schema.json",
 }

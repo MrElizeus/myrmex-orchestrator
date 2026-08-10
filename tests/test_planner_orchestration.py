@@ -34,12 +34,24 @@ def _fixture(create_request=True):
     item["item_digest"] = backlog.compute_item_digest(item)
     item_id = f"normalized-backlog/item/{item['backlog_item_id']}/{item['item_digest']}"
     intel.put_artifact(root, campaign_id, 1, "backlog", item_id, item)
+    source_digest = "c" * 64
+    source = {
+        "operation_id": "importop-" + "c" * 24,
+        "observation_id": "srcobs_" + source_digest,
+        "observation_digest": source_digest,
+        "request_digest": "d" * 64,
+        "content_digest": "e" * 64,
+        "outcome": "changed",
+        "adapter": "local-markdown-roadmap/v1",
+        "source_identity": identity,
+    }
     snapshot = {
         "schema": backlog.NORMALIZED_SNAPSHOT_SCHEMA, "snapshot_record_id": "",
         "snapshot_record_digest": "", "snapshot_digest": "", "source_count": 0,
-        "sources": [], "item_count": 1,
+        "sources": [source], "item_count": 1,
         "items": [{"backlog_item_id": item["backlog_item_id"], "item_digest": item["item_digest"], "artifact_id": item_id}],
     }
+    snapshot["source_count"] = len(snapshot["sources"])
     snapshot["snapshot_digest"] = backlog.compute_snapshot_digest_from_snapshot(snapshot)
     snapshot["snapshot_record_digest"] = backlog.compute_snapshot_record_digest(snapshot)
     snapshot["snapshot_record_id"] = "blsnaprec_" + snapshot["snapshot_record_digest"]
