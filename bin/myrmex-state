@@ -2682,6 +2682,11 @@ FRONTIER_REQUEST_PAYLOAD_KEYS = ("outbound_message", "payload", "request", "mess
 # change: task/chat/artifact identity.  Every other intent key defines the
 # immutable purpose and must be rejected on retry.
 FRONTIER_RETRY_ALLOWED_OVERRIDE_KEYS = frozenset({"task_id", "chat_url", "artifact_root"})
+# A response-observed correction may carry transport artifacts and audit notes,
+# but never a new purpose or outbound request payload.
+FRONTIER_SUCCESSOR_ALLOWED_OVERRIDE_KEYS = frozenset({
+    "artifact", "artifact_id", "outbound_artifact", "correction_metadata", "correction_reason",
+})
 
 
 def frontier_purpose_components(data: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
@@ -2927,6 +2932,48 @@ def finalize_frontier_supersession(
         successor["predecessor_operation_id"] = predecessor["operation_id"]
     successor["attempt_group_id"] = successor.get("attempt_group_id") or predecessor.get("attempt_group_id")
     predecessor["attempt_group_id"] = predecessor.get("attempt_group_id") or successor.get("attempt_group_id")
+    successor["updated_at"] = now
+    return True
+
+
+def finalize_observed_frontier_supersession(
+    data: dict[str, Any], predecessor: dict[str, Any], successor: dict[str, Any], *, reason: str,
+) -> bool:
+    """Close an observed-effect predecessor without manufacturing no-effect proof.
+
+    This is intentionally separate from ``finalize_frontier_supersession``:
+    response-observed correction attempts retain their original evidence forever.
+    """
+    if predecessor.get("status") == "superseded":
+        if predecessor.get("successor_operation_id") == successor.get("operation_id"):
+            return False
+        raise SystemExit("OPERATION_RESOLUTION_CONFLICT")
+    if predecessor.get("kind") != "frontier_exchange" or successor.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_SUPERSESSION_WRONG_KIND")
+    if predecessor.get("status") != "failed" or not operation_is_effectively_confirmed(successor):
+        raise SystemExit("FRONTIER_OBSERVED_SUPERSESSION_PRECONDITION")
+    if predecessor.get("effective_status") != "confirmed" or predecessor.get("effective_response_type") != "unknown":
+        raise SystemExit("FRONTIER_OBSERVED_SUPERSESSION_REQUIRES_UNKNOWN_RESPONSE")
+    if predecessor.get("effective_effect_stage") != "response_observed":
+        raise SystemExit("FRONTIER_OBSERVED_SUPERSESSION_REQUIRES_RESPONSE_EFFECT")
+    if not predecessor.get("effective_message_id"):
+        raise SystemExit("FRONTIER_OBSERVED_SUPERSESSION_REQUIRES_RESPONSE_IDENTITY")
+    if operation_purpose(predecessor) != operation_purpose(successor):
+        raise SystemExit("OPERATION_SUCCESSOR_PURPOSE_MISMATCH")
+    validate_purpose_digest_continuity(predecessor, successor)
+    require_later_successor(data, predecessor, successor)
+    now = utcnow()
+    predecessor["status"] = "superseded"
+    predecessor["terminal_reason"] = reason
+    predecessor["terminal_disposition"] = "superseded"
+    predecessor["successor_operation_id"] = successor["operation_id"]
+    predecessor["confirmed_at"] = now
+    predecessor["updated_at"] = now
+    predecessor_ids = successor.setdefault("predecessor_operation_ids", [])
+    if predecessor["operation_id"] not in predecessor_ids:
+        predecessor_ids.append(predecessor["operation_id"])
+    successor["predecessor_operation_id"] = predecessor["operation_id"]
+    successor["attempt_group_id"] = successor.get("attempt_group_id") or predecessor.get("attempt_group_id")
     successor["updated_at"] = now
     return True
 
@@ -4141,10 +4188,109 @@ def cmd_frontier_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_frontier_successor(args: argparse.Namespace) -> int:
+    """Record a correction intent for a response-observed malformed exchange."""
+    data = read_state(args.run_id)
+    require_v2(data, "frontier successor")
+    ensure_v2_defaults(data)
+    if data.get("status") == "blocked" and not is_recoverable_frontier_blocker(data):
+        raise SystemExit("FRONTIER_SUCCESSOR_CANNOT_CLEAR_UNRELATED_BLOCKER")
+    predecessor = find_operation(data, args.operation_id)
+    if not isinstance(args.task_id, str) or not args.task_id:
+        raise SystemExit("Frontier successor requires --task-id")
+    if predecessor.get("kind") != "frontier_exchange":
+        raise SystemExit("FRONTIER_SUCCESSOR_WRONG_PREDECESSOR_KIND")
+    if predecessor.get("status") != "failed":
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_FAILED_PREDECESSOR")
+    if predecessor.get("effective_status") != "confirmed" or predecessor.get("effective_response_type") != "unknown":
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_OBSERVED_UNKNOWN_RESPONSE")
+    if predecessor.get("effective_effect_stage") != "response_observed" or not predecessor.get("effective_message_id"):
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_RESPONSE_EFFECT")
+    if predecessor.get("pre_effect_absence_proven") is True:
+        raise SystemExit("FRONTIER_SUCCESSOR_CONFLICTS_WITH_PRE_EFFECT_ABSENCE")
+    identity = frontier_operation_identity(predecessor)
+    if args.request_id == identity["request_id"] or args.task_id == identity["task_id"]:
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_NEW_IDENTITY")
+    intent = copy.deepcopy(predecessor.get("intent"))
+    if not isinstance(intent, dict):
+        raise SystemExit("FRONTIER_SUCCESSOR_INVALID_PREDECESSOR_INTENT")
+    override = parse_object_json(args.intent_json, "--intent-json")
+    disallowed = sorted(set(override) - FRONTIER_SUCCESSOR_ALLOWED_OVERRIDE_KEYS)
+    if disallowed:
+        raise SystemExit("FRONTIER_SUCCESSOR_IMMUTABLE_INTENT_FIELDS: " + ", ".join(disallowed))
+    chat_url = intent.get("chat_url") or data.get("frontier_chat_url")
+    if "chat_url" in override and override["chat_url"] != chat_url:
+        raise SystemExit("FRONTIER_SUCCESSOR_CHAT_URL_MISMATCH")
+    if args.chat_url is not None and args.chat_url != chat_url:
+        raise SystemExit("FRONTIER_SUCCESSOR_CHAT_URL_MISMATCH")
+    if not isinstance(chat_url, str) or not chat_url:
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_PERSISTED_CHAT_URL")
+    intent.update({"request_id": args.request_id, "task_id": args.task_id, "chat_url": chat_url,
+                  "predecessor_operation_id": predecessor["operation_id"]})
+    intent.pop("message_id", None)
+    key = args.idempotency_key or f"frontier-successor:{predecessor['operation_id']}"
+    intent.update(override)
+    expected_purpose_digest = predecessor.get("purpose_digest")
+    if not isinstance(expected_purpose_digest, str) or frontier_purpose_digest(data, predecessor["intent"]) != expected_purpose_digest:
+        raise SystemExit("FRONTIER_SUCCESSOR_PREDECESSOR_PURPOSE_DIGEST_INVALID")
+    successor_purpose_digest = frontier_purpose_digest(data, intent)
+    if successor_purpose_digest != expected_purpose_digest:
+        raise SystemExit("FRONTIER_SUCCESSOR_PURPOSE_DIGEST_MISMATCH")
+    intent_identity = copy.deepcopy(intent)
+    intent_identity["chat_url"] = chat_url
+    linked = None
+    if predecessor.get("successor_operation_id") is not None:
+        linked = find_operation(data, predecessor["successor_operation_id"])
+        if (
+            linked.get("intent") == intent_identity
+            and linked.get("purpose_digest") == expected_purpose_digest
+        ):
+            # A stale replay is safe only when it describes the complete durable identity.
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+        raise SystemExit("FRONTIER_SUCCESSOR_ALREADY_LINKED")
+    if data.get("status") != "blocked" or not is_recoverable_frontier_blocker(data):
+        raise SystemExit("FRONTIER_SUCCESSOR_REQUIRES_BLOCKED_FRONTIER_RECOVERY")
+    operation, created = record_operation_intent(
+        data, kind="frontier_exchange", idempotency_key=key, intent=intent,
+    )
+    if not created:
+        if operation.get("predecessor_operation_id") != predecessor["operation_id"]:
+            raise SystemExit("FRONTIER_SUCCESSOR_IDEMPOTENCY_CONFLICT")
+        print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    operation["predecessor_operation_id"] = predecessor["operation_id"]
+    operation["predecessor_operation_ids"] = [predecessor["operation_id"]]
+    operation["purpose_digest"] = successor_purpose_digest
+    operation["attempt_group_id"] = predecessor.get("attempt_group_id") or f"attempt-{operation['purpose_digest'][:24]}"
+    predecessor["successor_operation_id"] = operation["operation_id"]
+    predecessor["attempt_group_id"] = operation["attempt_group_id"]
+    validate_purpose_digest_continuity(predecessor, operation)
+    data["last_request_id"] = args.request_id
+    data["frontier_task_id"] = args.task_id
+    data["frontier_chat_url"] = chat_url
+    recovery = data.get("recovery") if isinstance(data.get("recovery"), dict) else {}
+    resume_phase = recovery.get("resume_phase") or "requesting-plan"
+    data["phase"] = resume_phase
+    data["status"] = "active"
+    data["blocker"] = None
+    data["recovery"] = {**recovery, "status": "resolved", "successor_pending_operation_id": operation["operation_id"],
+                         "successor_operation_id": operation["operation_id"], "resolved_operation_id": predecessor["operation_id"],
+                         "resume_phase": resume_phase, "resolved_at": recovery.get("resolved_at") or utcnow(), "operation_ids": list(dict.fromkeys(
+                             [*(recovery.get("operation_ids", [])), predecessor["operation_id"], operation["operation_id"]]))}
+    saved = write_state(data, args.expect_revision)
+    append_event(args.run_id, "frontier.successor_intent_recorded", "observed Frontier response correction", {
+        "operation_id": operation["operation_id"], "predecessor_operation_id": predecessor["operation_id"], "revision": saved["revision"]})
+    print(json.dumps(saved, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def cmd_frontier(args: argparse.Namespace) -> int:
     """Persist a Frontier exchange intent before browser transport is invoked."""
     if args.frontier_action == "retry":
         return cmd_frontier_retry(args)
+    if args.frontier_action == "successor":
+        return cmd_frontier_successor(args)
     if args.frontier_action == "result":
         return cmd_frontier_result(args)
     if args.frontier_action == "recover":
@@ -4791,7 +4937,15 @@ def cmd_frontier_result(args: argparse.Namespace) -> int:
     auto_superseded = None
     if terminal_status == "confirmed" and isinstance(operation.get("predecessor_operation_id"), str):
         predecessor = find_operation(data, operation["predecessor_operation_id"])
-        if is_pre_effect_frontier_failure(predecessor):
+        if predecessor.get("effective_status") == "confirmed" and predecessor.get("effective_response_type") == "unknown":
+            if finalize_observed_frontier_supersession(
+                data, predecessor, operation, reason="OBSERVED_RESPONSE_SUCCESSOR_CONFIRMED",
+            ):
+                auto_superseded = predecessor["operation_id"]
+                if isinstance(data.get("recovery"), dict) and data["recovery"].get("successor_pending_operation_id") == operation["operation_id"]:
+                    data["recovery"].pop("successor_pending_operation_id", None)
+                    data["recovery"].pop("successor_operation_id", None)
+        elif is_pre_effect_frontier_failure(predecessor):
             if finalize_frontier_supersession(
                 data, predecessor, operation, reason="PRE_EFFECT_RETRY_SUCCEEDED",
             ):
@@ -6963,7 +7117,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     frontier = sub.add_parser("frontier", help="record and recover typed Frontier exchange outcomes")
     frontier.add_argument("run_id")
-    frontier.add_argument("frontier_action", choices=["start", "result", "recover", "retry"])
+    frontier.add_argument("frontier_action", choices=["start", "result", "recover", "retry", "successor"])
     frontier.add_argument("--request-id", required=True)
     frontier.add_argument("--task-id")
     frontier.add_argument("--idempotency-key")

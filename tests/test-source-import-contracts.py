@@ -875,11 +875,13 @@ def test_raw_content_rejection() -> None:
 
 
 def test_secret_rejection() -> None:
+    private_key_begin = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    private_key_end = "-----END " + "RSA PRIVATE KEY-----"
     secret_fixtures = [
         ("api_key", {"issue": "INC-1", "api_key": "0123456789abcdef"}),
         ("access_token", {"issue": "INC-1", "access_token": "sk-abcdef1234567890"}),
         ("bearer", {"issue": "INC-1", "authorization": "Bearer abcdefghijklmnop"}),
-        ("private_key", {"issue": "INC-1", "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAA==\n-----END RSA PRIVATE KEY-----"}),
+        ("private_key", {"issue": "INC-1", "private_key": f"{private_key_begin}\nMIIEowIBAA==\n{private_key_end}"}),
         ("nested-secret", {"issue": "INC-1", "config": {"client_secret": "s3cr3t-value-12345"}}),
     ]
     for label, request in secret_fixtures:

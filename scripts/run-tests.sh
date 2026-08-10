@@ -26,6 +26,7 @@ PY
 
 printf '%s\n' '[3/9] Config preservation and rollback patcher'
 python3 "$ROOT/tests/test-config-patcher.py"
+python3 "$ROOT/tests/test-sensitive-file-scan.py"
 
 printf '%s\n' '[4/9] Atomic state/project memory, schema validity, and exact frontier DOM parsing'
 python3 - "$ROOT" <<'PYSCHEMA'
@@ -53,6 +54,7 @@ python3 "$ROOT/tests/test-frontier-pre-effect-absence.py"
 python3 "$ROOT/tests/test-frontier-pre-effect-recovery.py"
 python3 "$ROOT/tests/test-frontier-blocked-recovery.py"
 python3 "$ROOT/tests/test-frontier-successor-causality.py"
+python3 "$ROOT/tests/test-frontier-observed-response-successor.py"
 python3 "$ROOT/tests/test-operation-attempt-lifecycle.py"
 python3 "$ROOT/tests/test-eigengrid-blocked-run-recovery.py"
 python3 "$ROOT/tests/test-correction-grant-replay.py"
@@ -64,6 +66,7 @@ python3 "$ROOT/tests/test-campaign-schema-and-store.py"
 python3 "$ROOT/tests/test-campaign-dag.py"
 python3 "$ROOT/tests/test-campaign-budget-and-policy.py"
 python3 "$ROOT/tests/test-campaign-supervisor-head.py"
+python3 "$ROOT/tests/test_planner_orchestration.py"
 python3 "$ROOT/tests/test-campaign-closed-loop-soak.py"
 if command -v node >/dev/null 2>&1; then
   node "$ROOT/tests/test-frontier-dom.js"
@@ -83,32 +86,7 @@ python3 "$ROOT/tests/test-delivery-policy.py"
 python3 "$ROOT/tests/test-github-tracking-issue-recovery.py"
 
 printf '%s\n' '[7/9] Sensitive-file scan'
-python3 - "$ROOT" <<'PYSCAN'
-import re, sys
-from pathlib import Path
-root=Path(sys.argv[1])
-ignored = {'.git', 'external-sources', '.playwright-mcp', '.atl', '.myrmex-work'}
-patterns=[
-    re.compile(rb'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----'),
-    re.compile(rb'AKIA[0-9A-Z]{16}'),
-    re.compile(rb'(?<![A-Za-z0-9])sk-[A-Za-z0-9]{32,}'),
-]
-hits=[]
-for path in root.rglob('*'):
-    if any(part in ignored for part in path.relative_to(root).parts):
-        continue
-    if not path.is_file() or path.name in {'MANIFEST.sha256','PACKAGE-MANIFEST.json'} or '__pycache__' in path.parts:
-        continue
-    try: data=path.read_bytes()
-    except OSError: continue
-    if any(pattern.search(data) for pattern in patterns):
-        hits.append(str(path.relative_to(root)))
-if hits:
-    print('Potential secret-like material found:', file=sys.stderr)
-    for hit in hits: print('  '+hit, file=sys.stderr)
-    raise SystemExit(1)
-print('sensitive-file scan: PASS')
-PYSCAN
+python3 "$ROOT/scripts/scan-sensitive-files.py" "$ROOT"
 
 printf '%s\n' '[8/9] Release builder dry-run'
 python3 "$ROOT/scripts/build-release.py" --skip-tests >/dev/null

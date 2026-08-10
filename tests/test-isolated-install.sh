@@ -52,11 +52,13 @@ assert (config.parent/'bin/myrmex-state').is_file()
 assert (config.parent/'bin/myrmex-memory').is_file()
 assert (config.parent/'bin/myrmex-campaign').is_file()
 assert (config.parent/'bin/myrmex-head').is_file()
+assert (config.parent/'bin/myrmex_campaign_intelligence.py').is_file()
 record=json.loads((config/'myrmex-orchestrator/install-record.json').read_text())
 recorded={item['path'] for item in record['files']}
 assert str(config.parent/'bin/myrmex-memory') in recorded
 assert str(config.parent/'bin/myrmex-campaign') in recorded
 assert str(config.parent/'bin/myrmex-head') in recorded
+assert str(config.parent/'bin/myrmex_campaign_intelligence.py') in recorded
 PY
 
 "$ROOT/scripts/uninstall.sh" --config-dir "$CONFIG" >"$TMP/uninstall-1.log"
@@ -78,6 +80,7 @@ assert not (config.parent/'bin/myrmex-state').exists()
 assert not (config.parent/'bin/myrmex-memory').exists()
 assert not (config.parent/'bin/myrmex-campaign').exists()
 assert not (config.parent/'bin/myrmex-head').exists()
+assert not (config.parent/'bin/myrmex_campaign_intelligence.py').exists()
 PY
 
 # Test added MCP entries and default-agent rollback in a second clean config.

@@ -21,7 +21,49 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+def _bundled_scripts_dir() -> Path:
+    """Resolve support modules in a checkout or an installed Myrmex bundle."""
+    binary_dir = Path(__file__).resolve().parent
+    binary_root = binary_dir.parent
+    candidates = [binary_dir, binary_root / "scripts"]
+
+    for install_root in (
+        os.environ.get("MYRMEX_INSTALL_ROOT"),
+        os.environ.get("OPENCODE_CONFIG_DIR"),
+    ):
+        if install_root:
+            root = Path(install_root).expanduser()
+            candidates.extend((root / "scripts", root / "myrmex-orchestrator" / "scripts"))
+
+    record_paths: list[Path] = []
+    explicit_record = os.environ.get("MYRMEX_INSTALL_RECORD")
+    if explicit_record:
+        record_paths.append(Path(explicit_record).expanduser())
+    config_dirs = [os.environ.get("OPENCODE_CONFIG_DIR"), "~/.config/opencode"]
+    for config_dir in config_dirs:
+        if config_dir:
+            record_paths.append(Path(config_dir).expanduser() / "myrmex-orchestrator" / "install-record.json")
+    for record_path in record_paths:
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            config_dir = record.get("config_dir")
+            if isinstance(config_dir, str) and config_dir:
+                candidates.append(Path(config_dir) / "myrmex-orchestrator" / "scripts")
+            candidates.append(record_path.parent / "scripts")
+        except (OSError, ValueError, TypeError):
+            continue
+
+    for candidate in dict.fromkeys(path.resolve() for path in candidates):
+        if (candidate / "myrmex_campaign_intelligence.py").is_file():
+            return candidate
+    searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
+    raise ModuleNotFoundError(
+        "myrmex_campaign_intelligence.py is not available in the Myrmex bundle; "
+        f"searched: {searched}"
+    )
+
+
+_SCRIPTS_DIR = _bundled_scripts_dir()
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 import myrmex_campaign_intelligence as intel  # noqa: E402
@@ -713,6 +755,27 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
     if args.commit_receipt:
         wu["commit_receipt"] = _parse_receipt(args.commit_receipt)
 
+    correction_runs_arg = None
+    if args.correction_runs:
+        correction_runs = _parse_receipt(args.correction_runs)
+        if not isinstance(correction_runs, list) or any(not isinstance(item, dict) for item in correction_runs):
+            sys.stderr.write("error: correction_runs must be a JSON array of objects\n")
+            return 1
+        correction_runs_arg = correction_runs
+        wu["correction_runs"] = correction_runs
+
+    if args.corrections_used is not None:
+        if args.corrections_used < wu.get("corrections_used", 0):
+            sys.stderr.write("error: corrections_used cannot decrease\n")
+            return 1
+        if args.corrections_used > wu.get("corrections_budget", 0):
+            sys.stderr.write("error: corrections_used exceeds the work-unit budget\n")
+            return 1
+        if correction_runs_arg is not None and len(correction_runs_arg) != args.corrections_used:
+            sys.stderr.write("error: corrections_used must equal the durable correction receipt count\n")
+            return 1
+        wu["corrections_used"] = args.corrections_used
+
     rev = data["revision"]
     write_campaign(data, expected_revision=rev)
     append_event(args.id, "WORK_UNIT_TRANSITION", f"{wuid} transitioned to phase={wu['phase']}, status={wu['status']}", {
@@ -856,6 +919,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             lease["holder"] = None
             lease["acquired_at"] = None
             lease["expires_at"] = None
+            lease["heartbeat_at"] = None
             data["supervisor_pid"] = None
 
     # 2. Check campaign completion
@@ -941,6 +1005,16 @@ def cmd_evidence_record(args: argparse.Namespace) -> int:
     if evidence_data.get("ci_result") not in {"pass", "skipped"}:
         sys.stderr.write(f"error: invalid or failed ci_result in evidence: {evidence_data.get('ci_result')}\n")
         return 1
+    correction_runs = evidence_data.get("correction_runs", [])
+    if not isinstance(correction_runs, list) or any(not isinstance(item, dict) for item in correction_runs):
+        sys.stderr.write("error: evidence correction_runs must be an array of objects\n")
+        return 1
+    if len(correction_runs) > wu.get("corrections_budget", 0):
+        sys.stderr.write("error: evidence correction_runs exceeds the work-unit budget\n")
+        return 1
+    if len(correction_runs) < wu.get("corrections_used", 0):
+        sys.stderr.write("error: evidence correction_runs cannot discard durable correction receipts\n")
+        return 1
 
     wu["evidence"] = evidence_data
     if "candidate_sha" in evidence_data:
@@ -959,6 +1033,9 @@ def cmd_evidence_record(args: argparse.Namespace) -> int:
         wu["ci_operation"] = evidence_data["ci_operation"]
     if "commit_receipt" in evidence_data and evidence_data["commit_receipt"]:
         wu["commit_receipt"] = evidence_data["commit_receipt"]
+    if "correction_runs" in evidence_data:
+        wu["correction_runs"] = correction_runs
+        wu["corrections_used"] = len(correction_runs)
 
     rev = data["revision"]
     write_campaign(data, expected_revision=rev)
@@ -1299,6 +1376,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_wut.add_argument("--verifier-receipt", help="JSON string or file path for verifier receipt")
     p_wut.add_argument("--ci-op", help="JSON string or file path for CI operation")
     p_wut.add_argument("--commit-receipt", help="JSON string or file path for commit receipt")
+    p_wut.add_argument("--correction-runs", help="JSON array of durable correction receipts")
+    p_wut.add_argument("--corrections-used", type=int, help="Monotonic correction-attempt count")
     p_wut.add_argument("--pr-number", type=int, help="Pull request number")
     p_wut.add_argument("--force", action="store_true")
     p_wut.set_defaults(func=cmd_wu_transition)

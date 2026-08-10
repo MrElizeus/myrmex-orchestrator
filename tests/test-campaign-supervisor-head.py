@@ -60,7 +60,7 @@ def test_supervisor_once_flow() -> None:
             "--verify-cmd", f"{sys.executable} -c \"from pathlib import Path; assert Path('task2.txt').exists()\"",
         ], td)
 
-        proc_head1 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
+        proc_head1 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", "camp-head-test"], td)
         assert proc_head1.returncode == 0, f"head1 failed: {proc_head1.stderr}"
         assert "Work unit WU-001 COMPLETED" in proc_head1.stdout, f"proc_head1 output: stdout={proc_head1.stdout}, stderr={proc_head1.stderr}"
 
@@ -72,12 +72,12 @@ def test_supervisor_once_flow() -> None:
         assert wu1["evidence"] is not None
         assert wu1["evidence"]["objective"] == "First task"
 
-        proc_head2 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
+        proc_head2 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", "camp-head-test"], td)
         assert proc_head2.returncode == 0, f"head2 failed: {proc_head2.stderr}"
         assert "Work unit WU-002 COMPLETED" in proc_head2.stdout, f"proc_head2 output: stdout={proc_head2.stdout}, stderr={proc_head2.stderr}"
 
         # Step 3: Run head --once -> all done, should mark campaign complete
-        proc_head3 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", "camp-head-test"], td)
+        proc_head3 = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", "camp-head-test"], td)
         assert proc_head3.returncode == 0
 
         proc_show_final = run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", "camp-head-test", "--json"], td)
@@ -120,6 +120,13 @@ def test_lease_exclusivity_and_expiry() -> None:
         # Run reconcile -> should reclaim lease
         proc_rec = run_cmd([sys.executable, str(BIN_CAMPAIGN), "reconcile", "camp-lease-test"], td)
         assert proc_rec.returncode == 0
+
+        reconciled = json.loads(cfile.read_text(encoding="utf-8"))
+        assert reconciled["lease"]["holder"] is None
+        assert reconciled["lease"]["acquired_at"] is None
+        assert reconciled["lease"]["expires_at"] is None
+        assert reconciled["lease"]["heartbeat_at"] is None
+        assert reconciled["supervisor_pid"] is None
 
         # Now Holder B should be able to acquire lease
         proc_lb2 = run_cmd([

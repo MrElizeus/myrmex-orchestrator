@@ -483,3 +483,7 @@ immediately after creation and can use the issue-label REST fallback when
 ## Updating
 
 Re-run `install.sh` from a newer package. Existing Myrmex files and the state binary are timestamped into backups before replacement. Unrelated files remain untouched.
+
+## Structured planner recovery and replay
+
+Planner requests and responses are addressed by the SHA-256 of their request ID. The request binds one authoritative normalized-backlog snapshot and the context resolves that snapshot and each item directly from artifacts, never from the projection. Repeating an identical request or result reuses the durable bytes; a changed payload is rejected as a conflict. The response is persisted before its embedded proposed plan, so a lost acknowledgement or crash between those writes is recovered by replaying the same result. Missing or stale projections are rebuilt by the existing immutable stores; no planner operation activates a plan or creates execution work.

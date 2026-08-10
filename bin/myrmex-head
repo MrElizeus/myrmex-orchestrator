@@ -14,6 +14,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -1030,16 +1031,30 @@ class CampaignSupervisor:
         except Exception:
             pass
 
-    def complete_myrmex_state_run(self, run_id: str, wuid: str, evidence_file: str, message: str = "Completed by campaign supervisor") -> None:
-        """Marks the durable myrmex-state work unit and run as complete."""
+    def complete_myrmex_state_run(self, run_id: str, wuid: str, evidence_file: str, message: str = "Completed by campaign supervisor") -> bool:
+        """Idempotently close the durable state run with exact evidence."""
         try:
             self.sync_myrmex_state_phase(run_id, "reporting")
             cmd_show = [sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"]
             proc_show = subprocess.run(cmd_show, capture_output=True, text=True)
             if proc_show.returncode != 0:
                 sys.stderr.write(f"[myrmex-head] Failed to show myrmex-state run {run_id} before complete: {proc_show.stderr}\n")
-                return
+                return False
             state = json.loads(proc_show.stdout)
+            evidence = json.loads(Path(evidence_file).read_text(encoding="utf-8"))
+            if state.get("status") != "active":
+                completed_wu = state.get("work_units", {}).get(wuid, {})
+                if (
+                    state.get("status") == "dormant"
+                    and state.get("phase") == "dormant"
+                    and completed_wu.get("status") == "complete"
+                    and completed_wu.get("completion_evidence") == evidence
+                ):
+                    return True
+                sys.stderr.write(
+                    f"[myrmex-head] Terminal myrmex-state run {run_id} does not contain matching completion evidence for {wuid}\n"
+                )
+                return False
             rev = state.get("revision", 1)
 
             # Record parent gate to satisfy continuous scope completion blockers
@@ -1074,15 +1089,17 @@ class CampaignSupervisor:
                     rev = json.loads(proc_pg_result.stdout)["revision"]
                 else:
                     sys.stderr.write(f"[myrmex-head] Failed to record parent gate result: {proc_pg_result.stderr}\n")
+                    return False
             else:
                 sys.stderr.write(f"[myrmex-head] Failed to start parent gate: {proc_pg_start.stderr}\n")
+                return False
 
             # Complete work unit
             cmd_wu = [
                 sys.executable, str(ROOT / "bin/myrmex-state"),
                 "work-unit", run_id, "complete",
                 "--work-unit-id", wuid,
-                "--evidence-json", Path(evidence_file).read_text(encoding="utf-8"),
+                "--evidence-json", json.dumps(evidence, sort_keys=True),
                 "--expect-revision", str(rev),
             ]
             proc_wu = subprocess.run(cmd_wu, capture_output=True, text=True)
@@ -1090,6 +1107,7 @@ class CampaignSupervisor:
                 rev = json.loads(proc_wu.stdout)["revision"]
             else:
                 sys.stderr.write(f"[myrmex-head] Failed to complete work-unit {wuid}: {proc_wu.stderr}\n")
+                return False
 
             # Complete the run
             cmd_comp = [
@@ -1101,8 +1119,11 @@ class CampaignSupervisor:
             proc_comp = subprocess.run(cmd_comp, capture_output=True, text=True)
             if proc_comp.returncode != 0:
                 sys.stderr.write(f"[myrmex-head] Failed to complete myrmex-state run: {proc_comp.stderr}\n")
+                return False
+            return True
         except Exception as exc:
             sys.stderr.write(f"[myrmex-head] Exception in complete_myrmex_state_run: {exc}\n")
+            return False
 
     def resolve_execution_driver(self, data: dict[str, Any], wu: dict[str, Any]) -> WorkUnitExecutionDriver:
         """Selects the execution driver enforcing security and driver policies."""
@@ -1326,13 +1347,18 @@ class CampaignSupervisor:
             self._block_wu(cid, wuid, "driver_policy_violation", str(e))
             return False
 
-        # 4. Transition to collecting-context
-        self._transition_wu(cid, wuid, phase="collecting-context")
-        self.sync_myrmex_state_phase(run_id, "collecting-context")
+        # 4. A crash can leave the campaign ledger at delivering after the
+        # commit effect, but before evidence recording/completion.  Keep that
+        # persisted phase intact while resuming its validation path; the
+        # campaign transition policy does not permit delivering -> collecting-context.
+        recovering_delivering = wu.get("phase") == "delivering"
+        if not recovering_delivering:
+            self._transition_wu(cid, wuid, phase="collecting-context")
+            self.sync_myrmex_state_phase(run_id, "collecting-context")
 
         current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env).stdout.strip()
         last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root, env=agent_env).stdout.strip()
-        already_committed = (
+        already_committed = recovering_delivering or (
             last_commit_msg.lower().startswith(f"feat({wuid.lower()}):") or
             (wu.get("commit_sha") and wu.get("commit_sha") == current_head) or
             (wu.get("candidate_sha") and wu.get("candidate_sha") == current_head)
@@ -1350,23 +1376,8 @@ class CampaignSupervisor:
 
         if already_committed:
             sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} already committed at {current_head[:8]}; resuming recovery verification.\n")
-            candidate_sha = current_head
             tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=agent_env).stdout.strip()
             author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root, env=agent_env).stdout.strip()
-            writer_receipt = wu.get("writer_receipt")
-            diff_files = writer_receipt.get("files_modified", []) if writer_receipt else []
-            diff_digest = compute_candidate_diff_digest(repo_root, base_sha, diff_files)
-
-            commit_receipt = wu.get("commit_receipt") or {
-                "commit_sha": candidate_sha,
-                "tree_sha": tree_sha,
-                "author": author,
-                "message": last_commit_msg,
-                "diff_sha": diff_digest,
-                "timestamp": utcnow(),
-            }
-
-            # Check writer receipt from ledger
             writer_receipt = wu.get("writer_receipt")
             if not writer_receipt:
                 # If writer receipt is missing on an already committed work unit and not verifiable from state ledger
@@ -1377,6 +1388,29 @@ class CampaignSupervisor:
                     "Already-committed work unit lacks authoritative writer receipt in durable state ledger"
                 )
                 return False
+
+            # The pre-commit candidate digest is intentionally computed over
+            # staged tracked and untracked material.  Recomputing it after the
+            # commit can produce different bytes for formerly-untracked files,
+            # so recovery must validate the immutable commit receipt instead
+            # of manufacturing a new digest or receipt.
+            commit_receipt = wu.get("commit_receipt")
+            diff_digest = wu.get("diff_digest") or ""
+            if (
+                not isinstance(commit_receipt, dict)
+                or commit_receipt.get("commit_sha") != current_head
+                or commit_receipt.get("tree_sha") != tree_sha
+                or commit_receipt.get("author") != author
+                or commit_receipt.get("message") != last_commit_msg
+                or commit_receipt.get("diff_sha") != diff_digest
+                or not re.fullmatch(r"[0-9a-f]{64}", diff_digest)
+            ):
+                self._block_wu(
+                    cid, wuid, "ambiguous_missing_receipt",
+                    "Already-committed work unit lacks a matching immutable commit receipt",
+                )
+                return False
+            candidate_sha = commit_receipt["commit_sha"]
 
             # For verifier receipt: if missing, rerun verifier for real evidence
             verifier_receipt = wu.get("verifier_receipt")
@@ -1447,6 +1481,15 @@ class CampaignSupervisor:
                         wu, verifier_receipt.get("defects", []), corrections_used, repo_root, run_id, agent_env
                     )
                     correction_runs.append(corr_record)
+                    # Persist the remediation receipt before another verifier,
+                    # CI, or commit can advance.  Otherwise a crash after the
+                    # commit effect can recover a valid commit with incomplete
+                    # correction evidence.
+                    self._transition_wu(
+                        cid, wuid,
+                        correction_runs=correction_runs,
+                        corrections_used=corrections_used,
+                    )
                 except Exception as e:
                     self._block_wu(cid, wuid, "unknown", f"Remediation error: {e}")
                     return False
@@ -1488,19 +1531,23 @@ class CampaignSupervisor:
 
             candidate_sha = commit_receipt["commit_sha"]
 
-        # 10. Delivering Phase
-        self._transition_wu(
-            cid, wuid,
-            phase="delivering",
-            commit_sha=candidate_sha,
-            base_sha=base_sha,
-            candidate_sha=candidate_sha,
-            diff_digest=diff_digest,
-            writer_receipt=writer_receipt,
-            verifier_receipt=verifier_receipt,
-            ci_op=ci_operation,
-            commit_receipt=commit_receipt,
-        )
+        # 10. Delivering Phase.  Recovery is already persisted at this phase;
+        # repeating the transition is rejected by the campaign state machine.
+        if not recovering_delivering:
+            self._transition_wu(
+                cid, wuid,
+                phase="delivering",
+                commit_sha=candidate_sha,
+                base_sha=base_sha,
+                candidate_sha=candidate_sha,
+                diff_digest=diff_digest,
+                writer_receipt=writer_receipt,
+                verifier_receipt=verifier_receipt,
+                ci_op=ci_operation,
+                commit_receipt=commit_receipt,
+                correction_runs=correction_runs,
+                corrections_used=len(correction_runs),
+            )
 
         # 11. Strict Invariant Validation Gate (Rule 9)
         assert writer_receipt is not None and writer_receipt.get("status") == "SUCCESS", "Writer receipt missing or failed"
@@ -1544,6 +1591,29 @@ class CampaignSupervisor:
             "external_receipts": [],
             "completed_at": utcnow(),
         }
+        if recovering_delivering and isinstance(wu.get("evidence"), dict):
+            persisted_evidence = wu["evidence"]
+            required_identity = {
+                "campaign_id": cid,
+                "work_unit_id": wuid,
+                "run_id": run_id,
+                "base_sha": base_sha,
+                "candidate_sha": candidate_sha,
+                "diff_digest": diff_digest,
+                "commit_sha": candidate_sha,
+            }
+            mismatched_identity = [
+                key for key, value in required_identity.items()
+                if persisted_evidence.get(key) != value
+            ]
+            if mismatched_identity:
+                self._block_wu(
+                    cid, wuid, "ambiguous_missing_receipt",
+                    "Persisted recovery evidence does not match committed identity fields: "
+                    + ", ".join(mismatched_identity),
+                )
+                return False
+            evidence = persisted_evidence
 
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tf:
             json.dump(evidence, tf, indent=2)
@@ -1558,9 +1628,17 @@ class CampaignSupervisor:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
 
             # 13. Complete durable state run & transition work unit to completed
-            self.complete_myrmex_state_run(run_id, wuid, ev_path, f"Work unit {wuid} completed in campaign {cid}")
+            state_completed = self.complete_myrmex_state_run(
+                run_id, wuid, ev_path, f"Work unit {wuid} completed in campaign {cid}",
+            )
         finally:
             Path(ev_path).unlink(missing_ok=True)
+        if not state_completed:
+            self._block_wu(
+                cid, wuid, "ambiguous_missing_receipt",
+                "Campaign evidence is durable but the matching myrmex-state completion could not be confirmed",
+            )
+            return False
         self._transition_wu(cid, wuid, phase="completed", status="completed")
         sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} COMPLETED successfully with commit {candidate_sha[:8]}.\n")
         return True
@@ -1580,6 +1658,8 @@ class CampaignSupervisor:
         verifier_receipt: dict[str, Any] | None = None,
         ci_op: dict[str, Any] | None = None,
         commit_receipt: dict[str, Any] | None = None,
+        correction_runs: list[dict[str, Any]] | None = None,
+        corrections_used: int | None = None,
         pr_number: int | None = None,
     ) -> None:
         cmd = [sys.executable, str(ROOT / "bin/myrmex-campaign"), "wu-transition", cid, wuid]
@@ -1608,6 +1688,10 @@ class CampaignSupervisor:
             cmd.extend(["--ci-op", json.dumps(ci_op)])
         if commit_receipt is not None:
             cmd.extend(["--commit-receipt", json.dumps(commit_receipt)])
+        if correction_runs is not None:
+            cmd.extend(["--correction-runs", json.dumps(correction_runs)])
+        if corrections_used is not None:
+            cmd.extend(["--corrections-used", str(corrections_used)])
 
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)

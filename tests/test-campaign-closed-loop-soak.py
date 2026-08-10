@@ -140,7 +140,7 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
         # 4. Fault-Injection: Start continuous supervisor, let it run briefly, kill it with SIGTERM to test crash recovery
         env = dict(os.environ, XDG_STATE_HOME=state_dir, PYTHONDONTWRITEBYTECODE="1")
         proc_sup = subprocess.Popen(
-            [sys.executable, str(BIN_HEAD), "--campaign-id", cid, "--interval", "1"],
+            [sys.executable, str(BIN_HEAD), "--allow-fixture-driver", "--campaign-id", cid, "--interval", "1"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -151,22 +151,38 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
         proc_sup.send_signal(signal.SIGTERM)
         try:
             proc_sup.communicate(timeout=5)
-        except Exception:
+        except subprocess.TimeoutExpired:
             proc_sup.kill()
+            try:
+                proc_sup.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError("SIGKILL fallback did not reap the supervisor") from exc
+
+        assert proc_sup.poll() is not None, "Supervisor must be reaped before campaign reconcile"
 
         # Reconcile campaign after interruption
         proc_rec = run_cmd([sys.executable, str(BIN_CAMPAIGN), "reconcile", cid], state_dir)
         assert proc_rec.returncode == 0
+        reconciled = json.loads(run_cmd([
+            sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"
+        ], state_dir).stdout)
+        lease = reconciled["lease"]
+        for field in ("holder", "acquired_at", "expires_at", "heartbeat_at"):
+            assert lease[field] is None, f"Reconcile must clear lease {field}: {lease}"
+        assert reconciled["supervisor_pid"] is None, (
+            f"Reconcile must clear supervisor_pid: {reconciled}"
+        )
 
         # 5. Continue execution until campaign completes
         max_steps = 15
         steps = 0
         while steps < max_steps:
-            proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", cid], state_dir)
+            proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", cid], state_dir)
             print(f"STEP {steps} stdout: {proc_step.stdout.strip()}")
             if proc_step.stderr:
                 print(f"STEP {steps} stderr: {proc_step.stderr.strip()}")
             assert proc_step.returncode == 0, f"supervisor step error: {proc_step.stderr}"
+            assert "Failed to" not in proc_step.stderr, f"recovery emitted a failed durable-state effect: {proc_step.stderr}"
             data = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
             if data["status"] == "completed":
                 break
@@ -221,6 +237,11 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
             assert proc_st.returncode == 0, f"myrmex-state show failed for {wu['id']} (run_id={run_id}): stdout={proc_st.stdout}, stderr={proc_st.stderr}"
             st_data = json.loads(proc_st.stdout)
             assert st_data["status"] == "dormant", f"Expected dormant status for {run_id}, got {st_data.get('status')}"
+            state_wu = st_data["work_units"][wu["id"]]
+            assert state_wu["status"] == "complete"
+            assert state_wu["completion_evidence"] == wu["evidence"], (
+                f"Campaign/state evidence mismatch for {wu['id']}"
+            )
 
 
 def test_verifier_workspace_mutation_rejection() -> None:
@@ -257,7 +278,7 @@ def test_verifier_workspace_mutation_rejection() -> None:
         ], state_dir)
 
         # Run supervisor
-        proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", cid], state_dir)
+        proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", cid], state_dir)
         assert proc_step.returncode == 0
 
         data = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
@@ -301,7 +322,7 @@ def test_ci_failure_blocks_completion() -> None:
         ], state_dir)
 
         # Run supervisor
-        proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--campaign-id", cid], state_dir)
+        proc_step = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", cid], state_dir)
         assert proc_step.returncode == 0
 
         data = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)

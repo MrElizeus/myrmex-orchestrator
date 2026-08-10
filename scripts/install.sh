@@ -45,6 +45,7 @@ STATE_BIN="$BIN_DIR/myrmex-state"
 MEMORY_BIN="$BIN_DIR/myrmex-memory"
 CAMPAIGN_BIN="$BIN_DIR/myrmex-campaign"
 HEAD_BIN="$BIN_DIR/myrmex-head"
+CAMPAIGN_SUPPORT="$BIN_DIR/myrmex_campaign_intelligence.py"
 
 on_error() {
   local code=$?
@@ -80,6 +81,7 @@ Targets:
   $MEMORY_BIN
   $CAMPAIGN_BIN
   $HEAD_BIN
+  $CAMPAIGN_SUPPORT
   $META_DIR
 PLAN
   exit 0
@@ -111,6 +113,7 @@ backup_external_target "$STATE_BIN"
 backup_external_target "$MEMORY_BIN"
 backup_external_target "$CAMPAIGN_BIN"
 backup_external_target "$HEAD_BIN"
+backup_external_target "$CAMPAIGN_SUPPORT"
 
 for name in "${AGENTS[@]}"; do
   install -m 0644 "$ROOT/agents/$name" "$CONFIG_DIR/agents/$name"
@@ -129,6 +132,7 @@ install -m 0755 "$ROOT/bin/myrmex-state" "$STATE_BIN"
 install -m 0755 "$ROOT/bin/myrmex-memory" "$MEMORY_BIN"
 install -m 0755 "$ROOT/bin/myrmex-campaign" "$CAMPAIGN_BIN"
 install -m 0755 "$ROOT/bin/myrmex-head" "$HEAD_BIN"
+install -m 0644 "$ROOT/scripts/myrmex_campaign_intelligence.py" "$CAMPAIGN_SUPPORT"
 
 MYRMEX_CONFIG_CREATED=0
 if [[ ! -e "$MYRMEX_CONFIG" ]]; then
@@ -147,12 +151,13 @@ patch_args=(apply --config "$CONFIG_FILE" --record "$CONFIG_RECORD")
 ((NO_MCP)) && patch_args+=(--no-mcp)
 python3 "$ROOT/scripts/patch-opencode-config.py" "${patch_args[@]}" >/dev/null
 
-python3 - "$ROOT" "$CONFIG_DIR" "$BACKUP_DIR" "$INSTALL_RECORD" "$NO_MCP" "$STATE_BIN" "$MEMORY_BIN" "$CAMPAIGN_BIN" "$HEAD_BIN" "$MYRMEX_CONFIG" "$MYRMEX_CONFIG_CREATED" <<'PY'
+python3 - "$ROOT" "$CONFIG_DIR" "$BACKUP_DIR" "$INSTALL_RECORD" "$NO_MCP" "$STATE_BIN" "$MEMORY_BIN" "$CAMPAIGN_BIN" "$HEAD_BIN" "$MYRMEX_CONFIG" "$MYRMEX_CONFIG_CREATED" "$CAMPAIGN_SUPPORT" <<'PY'
 import datetime, hashlib, json, pathlib, sys
 root=pathlib.Path(sys.argv[1]); config=pathlib.Path(sys.argv[2]); backup=pathlib.Path(sys.argv[3]); record=pathlib.Path(sys.argv[4])
 no_mcp=bool(int(sys.argv[5])); state_bin=pathlib.Path(sys.argv[6]); memory_bin=pathlib.Path(sys.argv[7])
 campaign_bin=pathlib.Path(sys.argv[8]); head_bin=pathlib.Path(sys.argv[9])
 myrmex_config=pathlib.Path(sys.argv[10]); myrmex_config_created=bool(int(sys.argv[11]))
+campaign_support=pathlib.Path(sys.argv[12])
 paths=[]
 for n in ['myrmex-orchestrator.md','myrmex-worker.md','myrmex-verifier.md','myrmex-scout.md','myrmex-frontier.md']:
     paths.append(config/'agents'/n)
@@ -166,6 +171,7 @@ paths.append(state_bin)
 paths.append(memory_bin)
 paths.append(campaign_bin)
 paths.append(head_bin)
+paths.append(campaign_support)
 # Only remove myrmex.json on uninstall when this installation created it.
 if myrmex_config_created and myrmex_config.is_file():
     paths.append(myrmex_config)
@@ -182,6 +188,7 @@ data={
  'memory_binary':str(memory_bin),
  'campaign_binary':str(campaign_bin),
  'head_binary':str(head_bin),
+ 'campaign_support_module':str(campaign_support),
  'no_mcp':no_mcp,
  'files':files,
 }
