@@ -119,8 +119,13 @@ def _validate_request(request: Any) -> None:
         raise PlanningRequestInvalid("campaign_id invalid")
     if not isinstance(request["base_sha"], str) or not SHA1.fullmatch(request["base_sha"]):
         raise PlanningRequestInvalid("base_sha invalid")
-    if request["parent_revision"] is not None:
-        raise PlanningRequestInvalid("parent_revision must be null")
+    parent = request["parent_revision"]
+    if parent is not None and (
+        not isinstance(parent, dict) or set(parent) != {"artifact_id", "artifact_digest"}
+        or not isinstance(parent.get("artifact_id"), str) or not re.fullmatch(r"plan-revision/record/planrec_[0-9a-f]{64}", parent["artifact_id"])
+        or not isinstance(parent.get("artifact_digest"), str) or not SHA256.fullmatch(parent["artifact_digest"])
+    ):
+        raise PlanningRequestInvalid("parent_revision identity invalid")
     digs = request["input_digests"]
     if not isinstance(digs, list) or len(digs) != 2 or any(not isinstance(d, dict) or set(d) != {"kind", "identity", "sha256"} for d in digs):
         raise PlanningRequestInvalid("input_digests invalid")
@@ -175,7 +180,7 @@ def _validate_repository_context(context: Any, *, run_id: str, objective_id: str
         raise PlanningInputInvalid("repository context rejected by content policy") from error
 
 
-def create_planning_request(campaign_dir, campaign_id, observed_campaign_revision, request_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context_artifact_id, constraints, created_at=None):
+def create_planning_request(campaign_dir, campaign_id, observed_campaign_revision, request_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context_artifact_id, constraints, created_at=None, parent_revision=None):
     if not isinstance(observed_campaign_revision, int) or isinstance(observed_campaign_revision, bool) or observed_campaign_revision < 0:
         raise PlanningRequestInvalid("observed_campaign_revision invalid")
     snapshot_id = f"normalized-backlog/snapshot/{normalized_snapshot_record_id}"
@@ -186,7 +191,7 @@ def create_planning_request(campaign_dir, campaign_id, observed_campaign_revisio
         raise PlanningInputInvalid("normalized snapshot invalid") from error
     repo_envelope, repository_context = _load(pathlib.Path(campaign_dir), campaign_id, repository_context_artifact_id, "decision", PlanningInputInvalid)
     _validate_repository_context(repository_context, run_id=run_id, objective_id=objective_id, base_sha=base_sha)
-    request = {"schema": REQUEST_SCHEMA, "request_id": request_id, "run_id": run_id, "campaign_id": campaign_id, "objective_id": objective_id, "base_sha": base_sha, "parent_revision": None,
+    request = {"schema": REQUEST_SCHEMA, "request_id": request_id, "run_id": run_id, "campaign_id": campaign_id, "objective_id": objective_id, "base_sha": base_sha, "parent_revision": parent_revision,
                "input_digests": [{"kind": "normalized-backlog", "identity": snapshot_id, "sha256": envelope["payload_digest"]}, {"kind": "repository-context", "identity": repository_context_artifact_id, "sha256": repo_envelope["payload_digest"]}], "constraints": constraints,
                "required_output_schema": RESULT_SCHEMA, "effect_policy": dict(EFFECT_POLICY), "created_at": DEFAULT_CREATED_AT if created_at is None else created_at}
     try:
@@ -333,7 +338,7 @@ def validate_planning_result(request, result):
             plan_store.validate_plan_revision_record(revision)
         except Exception as error:
             raise PlanningResultInvalid("embedded plan is invalid") from error
-        if revision["lifecycle_status"] != "proposed" or revision["previous_record_id"] is not None or revision["parent_revision"] is not None:
+        if revision["lifecycle_status"] != "proposed" or revision["previous_record_id"] is not None or revision["parent_revision"] != request["parent_revision"]:
             raise PlanningResultInvalid("plan lifecycle is not a proposed root")
         if revision["planning_request_id"] != request["request_id"] or revision["campaign_id"] != request["campaign_id"] or revision["objective_id"] != request["objective_id"] or revision["base_sha"] != request["base_sha"] or revision["input_digests"] != request["input_digests"]:
             raise PlanningResultMismatch("embedded plan identity mismatch")

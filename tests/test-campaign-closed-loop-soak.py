@@ -145,16 +145,23 @@ def test_real_execution_closed_loop_and_chained_commits() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
 
         time.sleep(0.3)
-        proc_sup.send_signal(signal.SIGTERM)
+        try:
+            os.killpg(proc_sup.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             proc_sup.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            proc_sup.kill()
             try:
-                proc_sup.wait(timeout=5)
+                os.killpg(proc_sup.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc_sup.communicate(timeout=5)
             except subprocess.TimeoutExpired as exc:
                 raise AssertionError("SIGKILL fallback did not reap the supervisor") from exc
 

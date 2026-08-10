@@ -266,10 +266,12 @@ def _verify_current_inputs(campaign_dir, campaign_id, campaign, reviewed) -> str
     return _sha(sorted(bound))
 
 
-def _work_order_set_digest(campaign: dict[str, Any]) -> str:
+def _work_order_set_digest(campaign: dict[str, Any], plan_revision_id: str | None = None) -> str:
     rows = []
     for wu in campaign["work_units"]:
         order = wu.get("work_order") if isinstance(wu, dict) else None
+        if plan_revision_id is not None and (not isinstance(order, dict) or order.get("plan_provenance", {}).get("plan_revision_id") != plan_revision_id):
+            continue
         try:
             compiler.validate_work_order(order)
         except Exception as error:
@@ -468,7 +470,7 @@ def activate_plan(
             authority_digest = _validate_authority(activation_authority, plan_revision_id, activated_at)
             decisions_digest = _validate_decisions(human_decisions, reviewed, activated_at)
             input_set_digest = _verify_current_inputs(campaign_dir, campaign_id, campaign, reviewed)
-            work_order_set_digest = _work_order_set_digest(campaign)
+            work_order_set_digest = _work_order_set_digest(campaign, plan_revision_id)
             active_heads = _active_heads(campaign_dir, campaign_id)
             if active_heads:
                 raise PlanActivationConflict("another plan is already active")
@@ -511,7 +513,7 @@ def activate_plan(
                 raise PlanActivationStale("campaign changed after activation intent/preconditions")
             if _verify_current_inputs(campaign_dir, campaign_id, current_campaign, reviewed) != precondition["input_set_digest"]:
                 raise PlanActivationStale("planning inputs changed after activation preconditions")
-            if _work_order_set_digest(current_campaign) != precondition["work_order_set_digest"]:
+            if _work_order_set_digest(current_campaign, plan_revision_id) != precondition["work_order_set_digest"]:
                 raise PlanActivationStale("compiled work orders changed after activation preconditions")
             _validate_authority(activation_authority, plan_revision_id, activated_at)
             _validate_decisions(human_decisions, reviewed, activated_at)

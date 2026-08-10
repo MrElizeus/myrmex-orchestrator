@@ -52,6 +52,7 @@ REQUIRED_CONTRACTS = {
     "dag-validation-result-v1.schema.json",
     "plan-activation-v1.schema.json",
     "replan-trigger-v1.schema.json",
+    "replan-decision-v1.schema.json",
     "work-result-v1.schema.json",
     "verification-request-v1.schema.json",
     "verification-result-v1.schema.json",

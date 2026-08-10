@@ -168,7 +168,24 @@ def validate_semantic_dag(
         defect("DAG-004", "provenance", f"reviewed plan inputs are unavailable or invalid: {type(error).__name__}", evidence=[plan_revision_id])
 
     campaign_wus = campaign.get("work_units", []) if isinstance(campaign, dict) else []
+    all_campaign_wus = campaign_wus if isinstance(campaign_wus, list) else []
+    target_plan_bound = False
+    if isinstance(campaign_wus, list):
+        plan_bound = [wu for wu in campaign_wus if isinstance(wu, dict) and isinstance(wu.get("work_order"), dict) and wu["work_order"].get("plan_provenance", {}).get("plan_revision_id") == plan_revision_id]
+        if plan_bound:
+            campaign_wus = plan_bound
+            target_plan_bound = True
     campaign_edges_raw = campaign.get("dag", {}).get("edges", []) if isinstance(campaign, dict) and isinstance(campaign.get("dag"), dict) else []
+    if isinstance(campaign_edges_raw, list) and campaign_wus and target_plan_bound:
+        all_ids = {wu.get("id") for wu in all_campaign_wus if isinstance(wu, dict) and isinstance(wu.get("id"), str)}
+        bound_ids = {wu.get("id") for wu in campaign_wus if isinstance(wu, dict) and isinstance(wu.get("id"), str)}
+        campaign_edges_raw = [
+            edge for edge in campaign_edges_raw
+            if not (
+                isinstance(edge, list) and len(edge) == 2 and all(isinstance(item, str) for item in edge)
+                and set(edge).issubset(all_ids) and set(edge).isdisjoint(bound_ids)
+            )
+        ]
     wu_by_id: dict[str, dict[str, Any]] = {}
     duplicate_ids = set()
     if not isinstance(campaign_wus, list):

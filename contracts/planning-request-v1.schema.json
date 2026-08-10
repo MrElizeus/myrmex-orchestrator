@@ -55,7 +55,8 @@
       "required": ["artifact_id", "artifact_digest"],
       "properties": {
         "artifact_id": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^plan-revision/record/planrec_[0-9a-f]{64}$"
         },
         "artifact_digest": {
           "type": "string",

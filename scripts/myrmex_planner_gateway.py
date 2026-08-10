@@ -71,14 +71,14 @@ def persist_repository_context(campaign_dir, campaign_id, observed_campaign_revi
     return {"artifact_id": artifact_id, "payload_digest": digest, "status": result["status"]}
 
 
-def prepare_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, created_at=None):
+def prepare_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, created_at=None, parent_revision=None):
     if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id) or task_id == request_id:
         raise PlannerTaskInvalid("task_id must be a distinct bounded task identity")
     repo = persist_repository_context(campaign_dir, campaign_id, observed_campaign_revision, run_id, objective_id, base_sha, repository_context)
     request = planner.create_planning_request(
         campaign_dir, campaign_id, observed_campaign_revision, request_id, run_id,
         objective_id, base_sha, normalized_snapshot_record_id, repo["artifact_id"],
-        constraints, created_at,
+        constraints, created_at, parent_revision,
     )
     context = planner.build_planning_context(campaign_dir, campaign_id, request_id)
     prompt = planner.render_planning_prompt(context)
@@ -166,8 +166,8 @@ def _reused_task_receipt(campaign_dir, campaign_id, request_id, task_id):
     }
 
 
-def execute_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, executor: Callable[..., Any], created_at=None):
-    prepared = prepare_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, created_at)
+def execute_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, executor: Callable[..., Any], created_at=None, parent_revision=None):
+    prepared = prepare_planner_task(campaign_dir, campaign_id, observed_campaign_revision, request_id, task_id, run_id, objective_id, base_sha, normalized_snapshot_record_id, repository_context, constraints, created_at, parent_revision)
     existing_receipt = _reused_task_receipt(campaign_dir, campaign_id, request_id, task_id)
     if existing_receipt is not None:
         return {**prepared, "receipt": existing_receipt}

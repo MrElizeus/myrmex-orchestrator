@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:replan-decision:v1",
+  "title": "Myrmex Governed Replan Decision v1",
+  "description": "An immutable, digest-addressed decision that classifies every WorkUnit from one active plan before that plan is superseded. It records no repository, activation, commit, or push authority; the candidate remains proposed and must pass critic, semantic DAG validation, and governed activation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "decision_id", "decision_digest", "campaign_id",
+    "expected_campaign_revision", "active_plan_revision_id", "active_record_id",
+    "activation_id", "trigger_references", "trigger_set_digest",
+    "candidate_plan_revision_id", "candidate_record_id", "candidate_plan_digest",
+    "planning_request_id", "planning_input_set_digest", "planning_result_digest",
+    "planner_task_receipt_digest", "parent_revision", "semantic_plan_diff",
+    "wu_dispositions", "campaign_state_digest_before", "campaign_state_digest_after",
+    "decided_at", "required_next_gates", "authority"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.replan-decision/v1"},
+    "decision_id": {"type": "string", "pattern": "^replandec_[0-9a-f]{64}$"},
+    "decision_digest": {"$ref": "#/$defs/digest"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "expected_campaign_revision": {"type": "integer", "minimum": 1},
+    "active_plan_revision_id": {"$ref": "#/$defs/planId"},
+    "active_record_id": {"$ref": "#/$defs/recordId"},
+    "activation_id": {"type": "string", "pattern": "^activation_[0-9a-f]{64}$"},
+    "trigger_references": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trigger_id", "trigger_digest"],
+        "properties": {
+          "trigger_id": {"type": "string", "pattern": "^replantrg_[0-9a-f]{64}$"},
+          "trigger_digest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    "trigger_set_digest": {"$ref": "#/$defs/digest"},
+    "candidate_plan_revision_id": {"$ref": "#/$defs/planId"},
+    "candidate_record_id": {"$ref": "#/$defs/recordId"},
+    "candidate_plan_digest": {"$ref": "#/$defs/digest"},
+    "planning_request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "planning_input_set_digest": {"$ref": "#/$defs/digest"},
+    "planning_result_digest": {"$ref": "#/$defs/digest"},
+    "planner_task_receipt_digest": {"$ref": "#/$defs/digest"},
+    "parent_revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "artifact_digest"],
+      "properties": {
+        "artifact_id": {"type": "string", "pattern": "^plan-revision/record/planrec_[0-9a-f]{64}$"},
+        "artifact_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "semantic_plan_diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["added_work_unit_ids", "removed_work_unit_ids", "changed_work_unit_ids", "added_edges", "removed_edges", "assumptions_changed"],
+      "properties": {
+        "added_work_unit_ids": {"$ref": "#/$defs/workUnitIds"},
+        "removed_work_unit_ids": {"$ref": "#/$defs/workUnitIds"},
+        "changed_work_unit_ids": {"$ref": "#/$defs/workUnitIds"},
+        "added_edges": {"$ref": "#/$defs/edges"},
+        "removed_edges": {"$ref": "#/$defs/edges"},
+        "assumptions_changed": {"type": "boolean"}
+      }
+    },
+    "wu_dispositions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["work_unit_id", "disposition", "replacement_work_unit_ids", "reason", "interruption"],
+        "properties": {
+          "work_unit_id": {"$ref": "#/$defs/workUnitId"},
+          "disposition": {"enum": ["preserve", "replace", "supersede", "cancel", "defer"]},
+          "replacement_work_unit_ids": {"$ref": "#/$defs/workUnitIds"},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "interruption": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["transition", "from_status", "from_phase", "evidence_trigger_id"],
+                "properties": {
+                  "transition": {"const": "interrupted_for_replan"},
+                  "from_status": {"enum": ["active", "verifying", "remediating", "ci", "delivering"]},
+                  "from_phase": {"type": "string", "minLength": 1},
+                  "evidence_trigger_id": {"type": "string", "pattern": "^replantrg_[0-9a-f]{64}$"}
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "campaign_state_digest_before": {"$ref": "#/$defs/digest"},
+    "campaign_state_digest_after": {"$ref": "#/$defs/digest"},
+    "decided_at": {"type": "string", "format": "date-time"},
+    "required_next_gates": {"const": ["critic", "semantic_dag_validation", "plan_activation"]},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "activate_candidate", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "replan_decision_only"},
+        "activate_candidate": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "planId": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"},
+    "recordId": {"type": "string", "pattern": "^planrec_[0-9a-f]{64}$"},
+    "workUnitId": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"},
+    "workUnitIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/workUnitId"}
+    },
+    "edges": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {"$ref": "#/$defs/workUnitId"},
+          {"$ref": "#/$defs/workUnitId"}
+        ],
+        "items": false
+      }
+    }
+  }
+}

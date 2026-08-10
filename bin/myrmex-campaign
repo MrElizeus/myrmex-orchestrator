@@ -146,7 +146,7 @@ def _replanning_runtime():
     support = _bundled_scripts_dir((
         "myrmex_campaign_intelligence.py", "myrmex_plan_store.py",
         "myrmex_plan_revision.py", "myrmex_replanning.py",
-        "myrmex_backlog_normalizer.py", "myrmex_planner.py",
+        "myrmex_backlog_normalizer.py", "myrmex_planner.py", "myrmex_planner_gateway.py",
         "myrmex_work_unit_compiler.py", "myrmex_dag_validate.py",
     ))
     if str(support) not in sys.path:
@@ -1627,6 +1627,37 @@ def cmd_replan_trigger_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replan_preview(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        dispositions = _read_activation_json(args.dispositions_json, "replan WU dispositions")
+        result = _replanning_runtime().preview_replan(
+            campaign_dir(cid), cid, args.expect_revision, args.candidate_plan_revision_id,
+            args.trigger_id, dispositions, args.decided_at,
+        )
+    except Exception as exc:
+        _intel_emit_error("replan_preview_failed", str(exc))
+        return 1
+    print(json.dumps({"status": result["status"], "decision": result["decision"]}, indent=2))
+    return 0
+
+
+def cmd_replan_apply(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        decision = _read_activation_json(args.decision_json, "governed replan decision")
+        result = _replanning_runtime().apply_replan(campaign_dir(cid), cid, decision)
+    except Exception as exc:
+        _intel_emit_error("replan_apply_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1739,6 +1770,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_trigger_list = sub.add_parser("replan-trigger-list", help="Reconstruct the immutable replan-trigger ledger")
     p_trigger_list.add_argument("id", help="Campaign ID")
     p_trigger_list.set_defaults(func=cmd_replan_trigger_list)
+
+    p_replan_preview = sub.add_parser(
+        "replan-preview", help="Preview one immutable governed replan decision without mutation",
+    )
+    p_replan_preview.add_argument("id", help="Campaign ID")
+    p_replan_preview.add_argument("--candidate-plan-revision-id", required=True)
+    p_replan_preview.add_argument("--trigger-id", required=True, action="append")
+    p_replan_preview.add_argument("--dispositions-json", required=True)
+    p_replan_preview.add_argument("--decided-at", required=True)
+    p_replan_preview.add_argument("--expect-revision", required=True, type=int)
+    p_replan_preview.set_defaults(func=cmd_replan_preview)
+
+    p_replan_apply = sub.add_parser(
+        "replan-apply", help="Apply one exact governed replan decision with crash-safe replay",
+    )
+    p_replan_apply.add_argument("id", help="Campaign ID")
+    p_replan_apply.add_argument("--decision-json", required=True)
+    p_replan_apply.set_defaults(func=cmd_replan_apply)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")
