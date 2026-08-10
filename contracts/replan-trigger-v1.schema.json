@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:replan-trigger:v1",
+  "title": "Myrmex Replan Trigger v1",
+  "description": "Immutable evidence signal that an active plan may need reconsideration. A trigger never mutates, supersedes, or replaces the active plan and grants no repository authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "trigger_id", "trigger_digest", "campaign_id", "observed_campaign_revision", "active_plan_revision_id", "active_record_id", "activation_id", "activation_receipt_digest", "trigger_type", "summary", "evidence_references", "evidence_set_digest", "detected_at", "source", "authority"],
+  "properties": {
+    "schema": {"const": "myrmex.replan-trigger/v1"},
+    "trigger_id": {"type": "string", "pattern": "^replantrg_[0-9a-f]{64}$"},
+    "trigger_digest": {"$ref": "#/$defs/digest"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "observed_campaign_revision": {"type": "integer", "minimum": 1},
+    "active_plan_revision_id": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"},
+    "active_record_id": {"type": "string", "pattern": "^planrec_[0-9a-f]{64}$"},
+    "activation_id": {"type": "string", "pattern": "^activation_[0-9a-f]{64}$"},
+    "activation_receipt_digest": {"$ref": "#/$defs/digest"},
+    "trigger_type": {"enum": ["source_change", "repository_drift", "blocker", "failure", "defect", "budget", "provider", "memory_refutation", "human_decision"]},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "evidence_references": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence"}},
+    "evidence_set_digest": {"$ref": "#/$defs/digest"},
+    "detected_at": {"type": "string", "format": "date-time"},
+    "source": {"type": "object", "additionalProperties": false, "required": ["producer", "event_id"], "properties": {"producer": {"type": "string", "minLength": 1}, "event_id": {"type": "string", "minLength": 1}}},
+    "authority": {"type": "object", "additionalProperties": false, "required": ["scope", "mutate_active_plan", "create_plan_revision", "create_work_units", "repository_write", "commit", "push"], "properties": {"scope": {"const": "replan_signal_only"}, "mutate_active_plan": {"const": false}, "create_plan_revision": {"const": false}, "create_work_units": {"const": false}, "repository_write": {"const": false}, "commit": {"const": false}, "push": {"const": false}}}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["campaign_id", "artifact_id", "kind", "artifact_digest", "payload_digest", "observed_campaign_revision", "created_at"],
+      "properties": {
+        "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"}, "artifact_id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["backlog", "plan", "review", "decision"]},
+        "artifact_digest": {"$ref": "#/$defs/digest"}, "payload_digest": {"$ref": "#/$defs/digest"},
+        "observed_campaign_revision": {"type": "integer", "minimum": 0}, "created_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

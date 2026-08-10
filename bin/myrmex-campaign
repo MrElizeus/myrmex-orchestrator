@@ -138,6 +138,21 @@ def _plan_revision_runtime():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_plan_revision")
 
+
+def _replanning_runtime():
+    """Load the immutable P1 replan-trigger ledger."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_plan_store.py",
+        "myrmex_plan_revision.py", "myrmex_replanning.py",
+        "myrmex_backlog_normalizer.py", "myrmex_planner.py",
+        "myrmex_work_unit_compiler.py", "myrmex_dag_validate.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_replanning")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -1582,6 +1597,36 @@ def cmd_plan_activate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replan_trigger_record(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        evidence = _read_activation_json(args.evidence_json, "replan trigger evidence")
+        result = _replanning_runtime().record_trigger(
+            campaign_dir(cid), cid, args.expect_revision, args.trigger_type, args.summary,
+            evidence, args.detected_at, {"producer": args.source_producer, "event_id": args.source_event_id},
+        )
+    except Exception as exc:
+        _intel_emit_error("replan_trigger_record_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_replan_trigger_list(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        result = _replanning_runtime().list_triggers(campaign_dir(cid), cid)
+    except Exception as exc:
+        _intel_emit_error("replan_trigger_list_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1679,6 +1724,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_activate.add_argument("--activated-at", required=True)
     p_activate.add_argument("--expect-revision", required=True, type=int)
     p_activate.set_defaults(func=cmd_plan_activate)
+
+    p_trigger = sub.add_parser("replan-trigger-record", help="Record immutable evidence that may require replanning")
+    p_trigger.add_argument("id", help="Campaign ID")
+    p_trigger.add_argument("--trigger-type", required=True, choices=["source_change", "repository_drift", "blocker", "failure", "defect", "budget", "provider", "memory_refutation", "human_decision"])
+    p_trigger.add_argument("--summary", required=True)
+    p_trigger.add_argument("--evidence-json", required=True)
+    p_trigger.add_argument("--detected-at", required=True)
+    p_trigger.add_argument("--source-producer", required=True)
+    p_trigger.add_argument("--source-event-id", required=True)
+    p_trigger.add_argument("--expect-revision", required=True, type=int)
+    p_trigger.set_defaults(func=cmd_replan_trigger_record)
+
+    p_trigger_list = sub.add_parser("replan-trigger-list", help="Reconstruct the immutable replan-trigger ledger")
+    p_trigger_list.add_argument("id", help="Campaign ID")
+    p_trigger_list.set_defaults(func=cmd_replan_trigger_list)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")
