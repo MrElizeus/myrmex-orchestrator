@@ -124,6 +124,20 @@ def _dag_validator():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_dag_validate")
 
+
+def _plan_revision_runtime():
+    """Load governed P1 plan activation without broadening P0 authority."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_backlog_normalizer.py",
+        "myrmex_plan_store.py", "myrmex_planner.py", "myrmex_work_unit_compiler.py",
+        "myrmex_dag_validate.py", "myrmex_plan_revision.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_plan_revision")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -1437,8 +1451,8 @@ def cmd_backlog_show(args: argparse.Namespace) -> int:
     return 0
 
 
-# Immutable plan-store reads (WU-P1-007). Activation intentionally remains
-# absent here; only P1-012 may cross PlanActivationAuthorityRequired.
+# Immutable P1-007 plan-store reads remain non-authorizing. Only the dedicated
+# P1-012 command below may satisfy PlanActivationAuthorityRequired.
 def cmd_plan_list(args: argparse.Namespace) -> int:
     cid = args.id
     try:
@@ -1537,6 +1551,37 @@ def cmd_plan_compile_apply(args: argparse.Namespace) -> int:
     return _compile_plan(args, True)
 
 
+def _read_activation_json(path_value: str, label: str) -> Any:
+    path = Path(path_value)
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise ValueError(f"{label} must be a regular JSON file no larger than 1 MiB")
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"cannot read valid {label}: {exc}") from exc
+
+
+def cmd_plan_activate(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        runtime = _plan_revision_runtime()
+        dag_receipt = _read_activation_json(args.dag_validation_json, "DAG validation receipt")
+        authority = _read_activation_json(args.authority_json, "activation authority")
+        decisions = _read_activation_json(args.human_decisions_json, "human decisions") if args.human_decisions_json else []
+        receipt = runtime.activate_plan(
+            campaign_dir(cid), cid, args.expect_revision, args.request_id,
+            args.plan_revision_id, args.reviewed_record_id, args.review_digest,
+            dag_receipt, authority, decisions, args.activated_at,
+        )
+    except Exception as exc:
+        _intel_emit_error("plan_activation_failed", str(exc))
+        return 1
+    print(json.dumps(receipt, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1619,6 +1664,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_compile_apply.add_argument("--expect-revision", required=True, type=int)
     p_compile_apply.add_argument("--protected-dirty-path", action="append", default=[])
     p_compile_apply.set_defaults(func=cmd_plan_compile_apply)
+
+    p_activate = sub.add_parser(
+        "plan-activate", help="Activate one exact reviewed, semantically validated, authorized plan",
+    )
+    p_activate.add_argument("id", help="Campaign ID")
+    p_activate.add_argument("--request-id", required=True)
+    p_activate.add_argument("--plan-revision-id", required=True)
+    p_activate.add_argument("--reviewed-record-id", required=True)
+    p_activate.add_argument("--review-digest", required=True)
+    p_activate.add_argument("--dag-validation-json", required=True)
+    p_activate.add_argument("--authority-json", required=True)
+    p_activate.add_argument("--human-decisions-json")
+    p_activate.add_argument("--activated-at", required=True)
+    p_activate.add_argument("--expect-revision", required=True, type=int)
+    p_activate.set_defaults(func=cmd_plan_activate)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")

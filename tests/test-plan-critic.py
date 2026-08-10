@@ -37,7 +37,7 @@ def raises(exc, fn, message):
         failures.append(f"{message}: no failure")
 
 
-def fixture(suffix="main", *, cycle=False, hidden_decision=False):
+def fixture(suffix="main", *, cycle=False, hidden_decision=False, base_sha=None, repository_root="/repo", human_gates=None):
     root = pathlib.Path(tempfile.mkdtemp(prefix=f"myrmex-plan-critic-{suffix}-"))
     campaign_id = f"camp-p1009-{suffix}"
     identity = {"kind": "local-roadmap", "canonical_id": f"{suffix}.md"}
@@ -76,8 +76,8 @@ def fixture(suffix="main", *, cycle=False, hidden_decision=False):
     objective_id = f"obj-p1009-{suffix}"
     repository_context = {
         "schema": "myrmex.repository-context/v1", "run_id": run_id,
-        "objective_id": objective_id, "repository_root": "/repo", "branch": "feat/p1",
-        "base_sha": "1" * 40, "git_status": ["clean"], "objective": "Review a bounded plan",
+        "objective_id": objective_id, "repository_root": repository_root, "branch": "feat/p1",
+        "base_sha": base_sha or "1" * 40, "git_status": ["clean"], "objective": "Review a bounded plan",
         "relevant_files": ["scripts/myrmex_plan_critic.py"], "relevant_symbols": ["validate_review"],
         "architecture": ["independent critic"], "current_behavior": ["proposed plan exists"],
         "tests": ["tests/test-plan-critic.py"], "data_contracts": ["myrmex.plan-review/v1"],
@@ -93,7 +93,7 @@ def fixture(suffix="main", *, cycle=False, hidden_decision=False):
     planner_task_id = f"task-planner-{suffix}"
     prepared = gateway.prepare_planner_task(
         root, campaign_id, 1, planning_request_id, planner_task_id, run_id,
-        objective_id, "1" * 40, snapshot["snapshot_record_id"], repository_context,
+        objective_id, base_sha or "1" * 40, snapshot["snapshot_record_id"], repository_context,
         constraints, "2026-08-10T00:00:00+00:00",
     )
     request = prepared["request"]
@@ -103,7 +103,7 @@ def fixture(suffix="main", *, cycle=False, hidden_decision=False):
         "scope": {"allowed_paths": ["scripts/"], "forbidden_paths": [".env"]},
         "acceptance_criteria": ["critic identity differs from planner"],
         "verification": {"commands": ["python3 tests/test-plan-critic.py"], "manual_checks": [], "discover_when_missing": False},
-        "risk_class": "bounded", "required_route": "direct-only", "human_gates": [],
+        "risk_class": "bounded", "required_route": "direct-only", "human_gates": copy.deepcopy(human_gates or []),
         "required_evidence": ["critic receipt"], "terminal_gate": "G2-PLAN-CRITIC",
     }
     work_units = [work_unit]
@@ -118,7 +118,7 @@ def fixture(suffix="main", *, cycle=False, hidden_decision=False):
     record = {
         "schema": plan_store.PLAN_SCHEMA, "record_id": "", "plan_revision_id": "",
         "campaign_id": campaign_id, "objective_id": objective_id,
-        "planning_request_id": planning_request_id, "base_sha": "1" * 40,
+        "planning_request_id": planning_request_id, "base_sha": base_sha or "1" * 40,
         "parent_revision": None, "input_digests": request["input_digests"],
         "assumptions": [], "work_units": work_units, "edges": edges,
         "lifecycle_status": "proposed", "previous_record_id": None,
@@ -131,7 +131,7 @@ def fixture(suffix="main", *, cycle=False, hidden_decision=False):
     result = {
         "schema": planner.RESULT_SCHEMA, "request_id": planning_request_id,
         "run_id": run_id, "campaign_id": campaign_id, "objective_id": objective_id,
-        "base_sha": "1" * 40, "response_type": "plan", "plan_revision": record,
+        "base_sha": base_sha or "1" * 40, "response_type": "plan", "plan_revision": record,
         "analysis": {"facts": ["exact plan input"], "assumptions": [], "uncertainties": []},
         "coverage_matrix": [{"backlog_item_id": item["backlog_item_id"], "work_unit_ids": ["WU-P1-009"]}],
         "clarification": None, "completion_evidence": [], "authority": dict(planner.AUTHORITY),

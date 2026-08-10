@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:plan-activation:v1",
+  "title": "Myrmex Governed Plan Activation Receipt v1",
+  "description": "Immutable receipt proving that one exact reviewed plan passed critic, semantic DAG, source/repository freshness, compiled-work-order, campaign-revision, human-decision, and activation-authority preconditions. It activates only the plan lifecycle and grants no repository or delivery authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "status", "activation_id", "request_id", "campaign_id", "campaign_revision",
+    "plan_revision_id", "reviewed_record_id", "validated_record_id", "active_record_id",
+    "plan_digest", "review_digest", "dag_validation_id", "dag_validation_digest", "graph_digest",
+    "work_order_set_digest", "input_set_digest", "human_decisions_digest", "activation_authority_digest",
+    "intent_artifact_id", "intent_digest", "precondition_artifact_id", "precondition_digest",
+    "active_projection_artifact_id", "active_projection_digest", "repository_base_sha", "activated_at",
+    "authority", "receipt_digest"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.plan-activation/v1"},
+    "status": {"const": "ACTIVE"},
+    "activation_id": {"type": "string", "pattern": "^activation_[0-9a-f]{64}$"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,255}$"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "campaign_revision": {"type": "integer", "minimum": 1},
+    "plan_revision_id": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"},
+    "reviewed_record_id": {"$ref": "#/$defs/record_id"},
+    "validated_record_id": {"$ref": "#/$defs/record_id"},
+    "active_record_id": {"$ref": "#/$defs/record_id"},
+    "plan_digest": {"$ref": "#/$defs/digest"},
+    "review_digest": {"$ref": "#/$defs/digest"},
+    "dag_validation_id": {"type": "string", "pattern": "^dagval_[0-9a-f]{64}$"},
+    "dag_validation_digest": {"$ref": "#/$defs/digest"},
+    "graph_digest": {"$ref": "#/$defs/digest"},
+    "work_order_set_digest": {"$ref": "#/$defs/digest"},
+    "input_set_digest": {"$ref": "#/$defs/digest"},
+    "human_decisions_digest": {"$ref": "#/$defs/digest"},
+    "activation_authority_digest": {"$ref": "#/$defs/digest"},
+    "intent_artifact_id": {"type": "string", "pattern": "^plan-activation/intent/[0-9a-f]{64}$"},
+    "intent_digest": {"$ref": "#/$defs/digest"},
+    "precondition_artifact_id": {"type": "string", "pattern": "^plan-activation/precondition/activation_[0-9a-f]{64}$"},
+    "precondition_digest": {"$ref": "#/$defs/digest"},
+    "active_projection_artifact_id": {"type": "string", "pattern": "^plan-activation/projection/activation_[0-9a-f]{64}$"},
+    "active_projection_digest": {"$ref": "#/$defs/digest"},
+    "repository_base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "activated_at": {"type": "string", "format": "date-time"},
+    "authority": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scope", "repository_write", "commit", "push", "merge", "release", "deploy"],
+      "properties": {
+        "scope": {"const": "plan_activation_only"},
+        "repository_write": {"const": false}, "commit": {"const": false}, "push": {"const": false},
+        "merge": {"const": false}, "release": {"const": false}, "deploy": {"const": false}
+      }
+    },
+    "receipt_digest": {"$ref": "#/$defs/digest"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "record_id": {"type": "string", "pattern": "^planrec_[0-9a-f]{64}$"}
+  }
+}

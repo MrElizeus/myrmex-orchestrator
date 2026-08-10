@@ -14,15 +14,16 @@ Design:
   * lifecycle recognizes all seven P1-001 states with the exact transition
     table; every successor links the current head; forks and disconnected
     records are rejected;
-  * a previously absent ``active`` record is refused with
-    PlanActivationAuthorityRequired (P1-012 owns governed activation); exact
-    replay/read of an already-durable active record is allowed passively;
+  * generic creation of a previously absent ``active`` record is refused with
+    PlanActivationAuthorityRequired; P1-012's dedicated path must present an
+    exact durable PASS precondition report, while replay/read of an already-
+    durable active record remains passive;
   * structural validation runs BEFORE any digest recomputation so malformed
     input raises typed failures, never incidental KeyError/TypeError;
   * a dedicated per-campaign ``intelligence/plan-store.lock`` serializes the
     read/check/write transaction without nesting P1-002's internal lock;
-  * no WU, DAG, plan activation, commit, push, merge, deployment, campaign
-    mutation, or repository effect capability is introduced.
+  * no WU, DAG, ungoverned activation, commit, push, merge, deployment,
+    campaign mutation, or repository effect capability is introduced.
 """
 from __future__ import annotations
 
@@ -414,10 +415,12 @@ def validate_plan_revision_record(record: Any) -> None:
 # Lifecycle builder
 
 
-def build_lifecycle_record(
+def _build_lifecycle_record(
     previous_record: dict[str, Any],
     lifecycle_status: str,
     created_at: str,
+    *,
+    governed_activation: bool = False,
 ) -> dict[str, Any]:
     """Build the next immutable lifecycle record from a previous record."""
     validate_plan_revision_record(previous_record)
@@ -425,7 +428,7 @@ def build_lifecycle_record(
         raise PlanLifecycleInvalid(
             f"illegal lifecycle transition {previous_record['lifecycle_status']} -> {lifecycle_status}"
         )
-    if lifecycle_status == "active":
+    if lifecycle_status == "active" and not governed_activation:
         raise PlanActivationAuthorityRequired(
             "creating a previously absent active record requires governed activation authority (P1-012)"
         )
@@ -445,6 +448,86 @@ def build_lifecycle_record(
     record["record_id"] = derive_record_id(record["record_digest"])
     validate_plan_revision_record(record)
     return record
+
+
+def build_lifecycle_record(
+    previous_record: dict[str, Any],
+    lifecycle_status: str,
+    created_at: str,
+) -> dict[str, Any]:
+    """Build a non-active successor; active remains behind P1-012 authority."""
+    return _build_lifecycle_record(previous_record, lifecycle_status, created_at)
+
+
+def _validate_activation_authority(
+    authority: Any,
+    previous_record: dict[str, Any],
+    campaign_dir: pathlib.Path | None = None,
+) -> None:
+    fields = {
+        "schema", "status", "activation_id", "precondition_digest", "campaign_id",
+        "plan_revision_id", "validated_record_id", "activate_plan", "repository_write",
+        "commit", "push", "authority_digest",
+    }
+    if not isinstance(authority, dict) or set(authority) != fields:
+        raise PlanActivationAuthorityRequired("governed activation authority fields are invalid")
+    if authority.get("schema") != "myrmex.plan-activation-authority/v1" or authority.get("status") != "PRECONDITIONS_PASSED":
+        raise PlanActivationAuthorityRequired("governed activation authority status is invalid")
+    if authority.get("activate_plan") is not True or any(authority.get(key) is not False for key in ("repository_write", "commit", "push")):
+        raise PlanActivationAuthorityRequired("governed activation authority exceeds plan activation")
+    if (
+        authority.get("campaign_id") != previous_record.get("campaign_id")
+        or authority.get("plan_revision_id") != previous_record.get("plan_revision_id")
+        or authority.get("validated_record_id") != previous_record.get("record_id")
+        or previous_record.get("lifecycle_status") != "validated"
+    ):
+        raise PlanActivationAuthorityRequired("governed activation authority is bound to a different validated plan")
+    if not isinstance(authority.get("activation_id"), str) or not authority["activation_id"].startswith("activation_"):
+        raise PlanActivationAuthorityRequired("governed activation identity is invalid")
+    if not isinstance(authority.get("precondition_digest"), str) or not SHA256_RE.fullmatch(authority["precondition_digest"]):
+        raise PlanActivationAuthorityRequired("governed activation precondition digest is invalid")
+    digest = hashlib.sha256(canonical_json_bytes({key: value for key, value in authority.items() if key != "authority_digest"})).hexdigest()
+    if authority.get("authority_digest") != digest:
+        raise PlanActivationAuthorityRequired("governed activation authority digest is invalid")
+    if campaign_dir is not None:
+        artifact_id = "plan-activation/precondition/" + authority["activation_id"]
+        try:
+            artifact = intel.get_artifact(pathlib.Path(campaign_dir), previous_record["campaign_id"], artifact_id)["artifact"]
+            report = artifact["payload"]
+        except Exception as exc:
+            raise PlanActivationAuthorityRequired("durable activation precondition report is unavailable") from exc
+        expected_checks = {
+            "campaign_revision", "critic", "dag", "work_orders", "inputs",
+            "repository_head", "human_decisions", "activation_authority", "single_active_plan",
+        }
+        checks = report.get("checks") if isinstance(report, dict) else None
+        if (
+            artifact.get("kind") != "decision"
+            or not isinstance(report, dict)
+            or report.get("schema") != "myrmex.plan-activation-precondition/v1"
+            or report.get("status") != "PASS"
+            or report.get("activation_id") != authority["activation_id"]
+            or report.get("precondition_digest") != authority["precondition_digest"]
+            or report.get("campaign_id") != previous_record["campaign_id"]
+            or report.get("plan_revision_id") != previous_record["plan_revision_id"]
+            or report.get("reviewed_record_id") != previous_record["previous_record_id"]
+            or not isinstance(checks, dict)
+            or set(checks) != expected_checks
+            or any(value != "PASS" for value in checks.values())
+            or hashlib.sha256(canonical_json_bytes({key: value for key, value in report.items() if key != "precondition_digest"})).hexdigest() != report["precondition_digest"]
+        ):
+            raise PlanActivationAuthorityRequired("durable activation precondition report is invalid or mismatched")
+
+
+def build_activated_plan_record(
+    previous_record: dict[str, Any],
+    created_at: str,
+    activation_authority: dict[str, Any],
+) -> dict[str, Any]:
+    """Satisfy—not bypass—the active-record gate with exact P1-012 evidence."""
+    validate_plan_revision_record(previous_record)
+    _validate_activation_authority(activation_authority, previous_record)
+    return _build_lifecycle_record(previous_record, "active", created_at, governed_activation=True)
 
 
 # ---------------------------------------------------------------------------
@@ -699,7 +782,10 @@ def _policy_reject(record: dict[str, Any]) -> None:
         ) from exc
 
 
-def store_plan_record(campaign_dir, campaign_id, campaign_revision: int, record: dict[str, Any]) -> dict[str, Any]:
+def _store_plan_record_core(
+    campaign_dir, campaign_id, campaign_revision: int, record: dict[str, Any],
+    activation_authority: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Persist one immutable plan lifecycle record with linear-chain enforcement."""
     if isinstance(campaign_revision, bool) or not isinstance(campaign_revision, int) or campaign_revision < 0:
         raise PlanRecordInvalid("campaign_revision must be a non-negative integer")
@@ -722,9 +808,9 @@ def store_plan_record(campaign_dir, campaign_id, campaign_revision: int, record:
 
         # Activation authority gate for previously absent active records.
         if record["lifecycle_status"] == "active":
-            raise PlanActivationAuthorityRequired(
-                "creating a previously absent active record requires governed activation authority (P1-012)"
-            )
+            if not chain:
+                raise PlanActivationAuthorityRequired("active record cannot be a lifecycle root")
+            _validate_activation_authority(activation_authority, chain[-1], pathlib.Path(campaign_dir))
 
         if not chain:
             # First record for this revision.
@@ -765,6 +851,21 @@ def store_plan_record(campaign_dir, campaign_id, campaign_revision: int, record:
         if len(new_chain) > 1 and new_chain[-1]["record_id"] != record["record_id"]:
             raise PlanStoreConflict("new record is not the deterministic lifecycle head")
         return _result(fetched, status, new_chain)
+
+
+def store_plan_record(campaign_dir, campaign_id, campaign_revision: int, record: dict[str, Any]) -> dict[str, Any]:
+    """Persist ordinary lifecycle records; absent active records remain denied."""
+    return _store_plan_record_core(campaign_dir, campaign_id, campaign_revision, record)
+
+
+def store_activated_plan_record(
+    campaign_dir, campaign_id, campaign_revision: int, record: dict[str, Any],
+    activation_authority: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist an active successor only with exact digest-bound P1-012 authority."""
+    if not isinstance(record, dict) or record.get("lifecycle_status") != "active":
+        raise PlanActivationAuthorityRequired("governed active store accepts only active lifecycle records")
+    return _store_plan_record_core(campaign_dir, campaign_id, campaign_revision, record, activation_authority)
 
 
 def _result(record: dict[str, Any], status: str, chain: list[dict[str, Any]]) -> dict[str, Any]:

@@ -176,6 +176,25 @@ def main() -> None:
         except store.PlanActivationAuthorityRequired:
             check(True, "builder refuses active")
 
+        # P1-012's dedicated API also requires a durable, exact PASS
+        # precondition report; a self-authenticated fabricated grant is not
+        # sufficient to satisfy PlanActivationAuthorityRequired.
+        fake_authority_body = {
+            "schema": "myrmex.plan-activation-authority/v1", "status": "PRECONDITIONS_PASSED",
+            "activation_id": "activation_" + "a" * 64, "precondition_digest": "b" * 64,
+            "campaign_id": campaign_id, "plan_revision_id": validated["plan_revision_id"],
+            "validated_record_id": validated["record_id"], "activate_plan": True,
+            "repository_write": False, "commit": False, "push": False,
+        }
+        fake_authority = {**fake_authority_body, "authority_digest": store.hashlib.sha256(store.canonical_json_bytes(fake_authority_body)).hexdigest()}
+        governed_active = store.build_activated_plan_record(validated, "2026-08-07T03:00:00+00:00", fake_authority)
+        try:
+            store.store_activated_plan_record(campaign_dir, campaign_id, 1, governed_active, fake_authority)
+            check(False, "fabricated activation authority should not persist active")
+        except store.PlanActivationAuthorityRequired:
+            check(True, "durable activation precondition required")
+        check(count_plan_artifacts(campaign_dir) == active_before, "fabricated governed active not persisted")
+
         # Seven-state transition matrix at pure level
         matrix = {
             "proposed": {"reviewed": True, "validated": False, "rejected": True, "superseded": True, "withdrawn": True},
@@ -386,7 +405,9 @@ def main() -> None:
         help_text = subprocess.run([
             str(ROOT / "bin" / "myrmex-campaign"), "--help",
         ], capture_output=True, text=True).stdout
-        check("plan-activate" not in help_text, "P1-007 CLI has no activation command")
+        # P1-012 now exposes the governed activation command; P1-007's generic
+        # builder/store authority barrier above must remain intact.
+        check("plan-activate" in help_text, "P1-012 governed activation command is installed")
 
         # Campaign immutability + no WU/DAG
         camp_file = next(campaign_dir.glob("campaign.json"))
