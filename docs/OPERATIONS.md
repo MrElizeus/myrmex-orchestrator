@@ -486,7 +486,9 @@ Re-run `install.sh` from a newer package. Existing Myrmex files and the state bi
 
 ## Structured planner recovery and replay
 
-Planner requests and responses are addressed by the SHA-256 of their request ID. The request binds one authoritative normalized-backlog snapshot and the context resolves that snapshot and each item directly from artifacts, never from the projection. Repeating an identical request or result reuses the durable bytes; a changed payload is rejected as a conflict. The response is persisted before its embedded proposed plan, so a lost acknowledgement or crash between those writes is recovered by replaying the same result. Missing or stale projections are rebuilt by the existing immutable stores; no planner operation activates a plan or creates execution work.
+Planner requests and responses are addressed by the SHA-256 of their request ID. The request binds exactly one authoritative normalized-backlog snapshot and one immutable repository-context snapshot. The context resolves both inputs and each backlog item directly from artifacts, never from the projection.
+
+`myrmex_planner_gateway.prepare_planner_task` persists the repository context, planning request, and dedicated `myrmex-planner` task intent before transport. The supplied task ID must differ from the request ID and cannot change on replay. `record_planner_task_result` validates the exact task intent, planning-only authority, and an exact coverage matrix mapping every normalized backlog item to proposed WUs; it persists the response before its embedded proposed plan, then records an immutable task receipt bound to the result digest. A confirmed task receipt is returned without reinvoking transport. A crash before transport or between response/plan/receipt writes is recovered from the same task identity and any already-persisted response; changed payloads fail as conflicts. Missing or stale projections are rebuilt by the immutable stores. No planner operation activates a plan or creates execution work.
 
 ## Durable backlog commands
 

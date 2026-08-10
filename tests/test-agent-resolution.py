@@ -14,6 +14,7 @@ STEPS = {
     "myrmex-scout": 80,
     "myrmex-worker": 110,
     "myrmex-verifier": 90,
+    "myrmex-planner": 90,
     "myrmex-frontier": None,
 }
 

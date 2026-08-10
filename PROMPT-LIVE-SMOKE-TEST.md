@@ -26,7 +26,7 @@ You are validating the installed **Myrmex Orchestrator** frontier path end to en
 1. Confirm the active primary agent is `myrmex-orchestrator`.
 2. Run `/myrmex-doctor` behavior read-only and record PASS/WARN/FAIL for agents, skills, `myrmex-state`, memory, browser transport, and Git safety.
 3. Inspect branch, HEAD, status, and protected dirty paths without mutation.
-4. Confirm `myrmex-scout`, `myrmex-worker`, `myrmex-verifier`, and `myrmex-frontier` are available to `Task`; do not invoke the writer or verifier.
+4. Confirm `myrmex-scout`, `myrmex-worker`, `myrmex-verifier`, `myrmex-planner`, and `myrmex-frontier` are available to `Task`; do not invoke the writer, planner, or verifier.
 5. Confirm `myrmex-frontier-delegation` is available to this primary.
 6. Initialize an **interactive, narrow, push-denied** local run with `myrmex-state`. Acquire its lock with a unique owner.
 7. Build a minimal sanitized `myrmex.repository-context/v1` containing only evidence that `README.md` exists (or an equivalent harmless repository fact), the current Git identity, and protected dirty paths.

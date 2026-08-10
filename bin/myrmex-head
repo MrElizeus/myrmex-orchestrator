@@ -1294,23 +1294,128 @@ class CampaignSupervisor:
         if proc_commit.returncode != 0:
             raise RuntimeError(f"governed git commit failed (code {proc_commit.returncode}): {proc_commit.stderr}")
 
+        try:
+            committed_state = json.loads(proc_commit.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("governed git commit returned an invalid durable state receipt") from exc
+
         # Synchronize repository index to new HEAD
         run_argv(["git", "read-tree", "HEAD"], cwd=repo_root, env=env)
 
         new_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=env).stdout.strip()
-        tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=env).stdout.strip()
-        author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root, env=env).stdout.strip()
-        receipt = {
-            "commit_sha": new_head,
-            "tree_sha": tree_sha,
-            "author": author,
-            "message": commit_msg,
-            "diff_sha": diff_digest,
-            "authorization_id": auth_id,
-            "timestamp": utcnow(),
-        }
+        return self._extract_local_commit_receipt(
+            committed_state,
+            authorization_id=auth_id,
+            wuid=wuid,
+            diff_digest=diff_digest,
+            current_head=new_head,
+        )
 
-        return receipt
+    @staticmethod
+    def _extract_local_commit_receipt(
+        state: dict[str, Any], *, authorization_id: str, wuid: str,
+        diff_digest: str, current_head: str,
+    ) -> dict[str, Any]:
+        """Return only a confirmed receipt already persisted by myrmex-git-local."""
+        matches = [
+            operation for operation in state.get("pending_operations", [])
+            if isinstance(operation, dict)
+            and operation.get("kind") == "local_commit"
+            and isinstance(operation.get("intent"), dict)
+            and operation["intent"].get("authorization_id") == authorization_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("durable local_commit operation identity is missing or ambiguous")
+        operation = matches[0]
+        effect = operation.get("effect")
+        receipt = operation.get("receipt")
+        if operation.get("status") != "confirmed" or not isinstance(effect, dict) or not isinstance(receipt, dict):
+            raise RuntimeError("durable local_commit operation is not confirmed with effect and receipt")
+        if (
+            receipt.get("status") not in {"SUCCESS", "CONFIRMED"}
+            or receipt.get("authorization_id") != authorization_id
+            or receipt.get("work_unit_id") != wuid
+            or receipt.get("candidate_diff_sha") != diff_digest
+            or receipt.get("commit_sha") != current_head
+            or effect.get("authorization_id") != authorization_id
+            or effect.get("work_unit_id") != wuid
+            or effect.get("candidate_diff_sha") != diff_digest
+            or effect.get("commit_sha") != current_head
+            or effect.get("tree_sha") != receipt.get("tree_sha")
+            or effect.get("branch") != receipt.get("branch")
+            or effect.get("paths") != receipt.get("paths")
+        ):
+            raise RuntimeError("durable local_commit effect and receipt identity mismatch")
+        return {"operation_id": operation["operation_id"], "parent_sha": effect.get("parent_sha"), **receipt}
+
+    def recover_governed_commit_receipt(
+        self, *, run_id: str, repo_root: Path, wuid: str, base_sha: str,
+        branch: str, diff_digest: str, current_head: str, commit_message: str,
+    ) -> dict[str, Any]:
+        """Replay the local-commit helper to validate and recover its durable receipt."""
+        env = os.environ.copy()
+        proc_show = subprocess.run(
+            [sys.executable, str(ROOT / "bin/myrmex-state"), "show", run_id, "--json"],
+            capture_output=True, text=True, env=env,
+        )
+        if proc_show.returncode != 0:
+            raise RuntimeError(f"failed to read myrmex-state run {run_id}: {proc_show.stderr}")
+        state = json.loads(proc_show.stdout)
+        operations = [
+            operation for operation in state.get("pending_operations", [])
+            if isinstance(operation, dict)
+            and operation.get("kind") == "local_commit"
+            and isinstance(operation.get("intent"), dict)
+            and operation["intent"].get("work_unit_id") == wuid
+            and operation["intent"].get("repository_root") == str(repo_root)
+            and operation["intent"].get("branch") == branch
+            and operation["intent"].get("expected_head") == base_sha
+            and operation["intent"].get("candidate_diff_sha") == diff_digest
+            and operation["intent"].get("commit_message") == commit_message
+        ]
+        if len(operations) != 1:
+            raise RuntimeError("matching durable local_commit operation is missing or ambiguous")
+        authorization_id = operations[0]["intent"].get("authorization_id")
+        if not isinstance(authorization_id, str) or not authorization_id:
+            raise RuntimeError("matching durable local_commit authorization identity is missing")
+        if state.get("status") == "dormant":
+            # The parent run can legitimately close after campaign evidence is
+            # durable but before the campaign ledger reaches completed.  The
+            # confirmed operation remains the authority; do not reopen or
+            # mutate a terminal run merely to replay its helper.
+            return self._extract_local_commit_receipt(
+                state,
+                authorization_id=authorization_id,
+                wuid=wuid,
+                diff_digest=diff_digest,
+                current_head=current_head,
+            )
+        if state.get("status") != "active":
+            raise RuntimeError(f"local_commit parent run has non-recoverable status {state.get('status')!r}")
+        replay = subprocess.run(
+            [
+                sys.executable, str(ROOT / "scripts/myrmex-git-local.py"), "commit",
+                "--run-id", run_id,
+                "--authorization-id", authorization_id,
+                "--repository-root", str(repo_root),
+                "--message", commit_message,
+                "--candidate-diff-sha", diff_digest,
+            ],
+            cwd=str(repo_root), capture_output=True, text=True, env=env,
+        )
+        if replay.returncode != 0:
+            raise RuntimeError(f"durable local_commit replay failed: {replay.stderr}")
+        try:
+            replayed_state = json.loads(replay.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("durable local_commit replay returned invalid state") from exc
+        return self._extract_local_commit_receipt(
+            replayed_state,
+            authorization_id=authorization_id,
+            wuid=wuid,
+            diff_digest=diff_digest,
+            current_head=current_head,
+        )
 
     def run_work_unit(self, cid: str, data: dict[str, Any], wu: dict[str, Any]) -> bool:
         """Executes the closed-loop autonomous cycle for one work unit with production drivers."""
@@ -1347,18 +1452,33 @@ class CampaignSupervisor:
             self._block_wu(cid, wuid, "driver_policy_violation", str(e))
             return False
 
-        # 4. A crash can leave the campaign ledger at delivering after the
+        current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env).stdout.strip()
+        last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root, env=agent_env).stdout.strip()
+
+        # 4. A crash can leave the campaign ledger at committing before any
+        # commit effect, or at delivering after the effect. A pre-commit state
+        # with complete receipts resumes from those receipts; legacy/incomplete
+        # state rewinds only after proving that the expected commit is absent.
+        # A matching commit is reconciled exclusively through the durable
+        # local_commit operation, never by manufacturing a campaign receipt.
+        recovering_committing = wu.get("phase") == "committing"
+        expected_commit_present = (
+            last_commit_msg.lower().startswith(f"feat({wuid.lower()}):")
+            or (wu.get("commit_sha") and wu.get("commit_sha") == current_head)
+            or (wu.get("candidate_sha") and wu.get("candidate_sha") == current_head)
+        )
+        recovering_pre_commit = recovering_committing and not expected_commit_present
+
+        # A crash can leave the campaign ledger at delivering after the
         # commit effect, but before evidence recording/completion.  Keep that
         # persisted phase intact while resuming its validation path; the
         # campaign transition policy does not permit delivering -> collecting-context.
         recovering_delivering = wu.get("phase") == "delivering"
-        if not recovering_delivering:
+        if not recovering_delivering and not recovering_committing:
             self._transition_wu(cid, wuid, phase="collecting-context")
             self.sync_myrmex_state_phase(run_id, "collecting-context")
 
-        current_head = run_argv(["git", "rev-parse", "HEAD"], cwd=repo_root, env=agent_env).stdout.strip()
-        last_commit_msg = run_argv(["git", "log", "-1", "--format=%s"], cwd=repo_root, env=agent_env).stdout.strip()
-        already_committed = recovering_delivering or (
+        already_committed = recovering_delivering or (recovering_committing and expected_commit_present) or (
             last_commit_msg.lower().startswith(f"feat({wuid.lower()}):") or
             (wu.get("commit_sha") and wu.get("commit_sha") == current_head) or
             (wu.get("candidate_sha") and wu.get("candidate_sha") == current_head)
@@ -1366,18 +1486,57 @@ class CampaignSupervisor:
 
         vcmds = wu.get("verification_commands", [])
         no_op_allowed = wu.get("no_op_allowed", False)
-        writer_receipt: dict[str, Any] | None = None
-        verifier_receipt: dict[str, Any] | None = None
-        ci_operation: dict[str, Any] | None = None
+        writer_receipt: dict[str, Any] | None = wu.get("writer_receipt") if recovering_pre_commit else None
+        verifier_receipt: dict[str, Any] | None = wu.get("verifier_receipt") if recovering_pre_commit else None
+        ci_operation: dict[str, Any] | None = wu.get("ci_operation") if recovering_pre_commit else None
         commit_receipt: dict[str, Any] | None = None
         correction_runs: list[dict[str, Any]] = list(wu.get("correction_runs", []))
         candidate_sha: str = current_head
-        diff_digest: str = ""
+        diff_digest: str = (wu.get("diff_digest") or "") if recovering_pre_commit else ""
+
+        if recovering_pre_commit:
+            modified_files = writer_receipt.get("files_modified", []) if isinstance(writer_receipt, dict) else []
+            complete_pre_commit_receipts = (
+                isinstance(writer_receipt, dict) and writer_receipt.get("status") == "SUCCESS"
+                and isinstance(verifier_receipt, dict) and verifier_receipt.get("status") == "PASS"
+                and isinstance(ci_operation, dict) and ci_operation.get("status") == "pass"
+                and isinstance(modified_files, list) and bool(modified_files)
+                and re.fullmatch(r"[0-9a-f]{64}", diff_digest) is not None
+            )
+            if complete_pre_commit_receipts:
+                try:
+                    complete_pre_commit_receipts = (
+                        compute_candidate_diff_digest(repo_root, base_sha, modified_files) == diff_digest
+                    )
+                except Exception:
+                    complete_pre_commit_receipts = False
+            if not complete_pre_commit_receipts:
+                current_campaign = self.get_campaign_data(cid)
+                recover_cmd = [
+                    sys.executable, str(ROOT / "bin/myrmex-campaign"),
+                    "wu-recover", cid, wuid,
+                    "--from-phase", "committing",
+                    "--resume-phase", "collecting-context",
+                    "--reason", "no matching commit effect or complete pre-commit receipt set exists; safe replay",
+                    "--pre-commit-absence-proven",
+                    "--expect-revision", str(current_campaign["revision"]),
+                ]
+                recovered = subprocess.run(recover_cmd, capture_output=True, text=True)
+                if recovered.returncode != 0:
+                    self._block_wu(cid, wuid, "ambiguous_missing_receipt", f"pre-commit recovery failed: {recovered.stderr}")
+                    return False
+                data = self.get_campaign_data(cid)
+                wu = next(item for item in data["work_units"] if item["id"] == wuid)
+                recovering_pre_commit = False
+                writer_receipt = None
+                verifier_receipt = None
+                ci_operation = None
+                correction_runs = list(wu.get("correction_runs", []))
+                diff_digest = ""
 
         if already_committed:
             sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} already committed at {current_head[:8]}; resuming recovery verification.\n")
             tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=agent_env).stdout.strip()
-            author = run_argv(["git", "log", "-1", "--format=%an <%ae>"], cwd=repo_root, env=agent_env).stdout.strip()
             writer_receipt = wu.get("writer_receipt")
             if not writer_receipt:
                 # If writer receipt is missing on an already committed work unit and not verifiable from state ledger
@@ -1394,15 +1553,39 @@ class CampaignSupervisor:
             # commit can produce different bytes for formerly-untracked files,
             # so recovery must validate the immutable commit receipt instead
             # of manufacturing a new digest or receipt.
-            commit_receipt = wu.get("commit_receipt")
             diff_digest = wu.get("diff_digest") or ""
+            persisted_commit_receipt = wu.get("commit_receipt")
+            try:
+                commit_receipt = self.recover_governed_commit_receipt(
+                    run_id=run_id,
+                    repo_root=repo_root,
+                    wuid=wuid,
+                    base_sha=base_sha,
+                    branch=branch,
+                    diff_digest=diff_digest,
+                    current_head=current_head,
+                    commit_message=last_commit_msg,
+                )
+            except Exception as exc:
+                self._block_wu(
+                    cid, wuid, "ambiguous_missing_receipt",
+                    f"Already-committed work unit has no replayable immutable local_commit receipt: {exc}",
+                )
+                return False
+            if persisted_commit_receipt is not None and persisted_commit_receipt != commit_receipt:
+                self._block_wu(
+                    cid, wuid, "ambiguous_missing_receipt",
+                    "Persisted campaign commit receipt differs from the immutable local_commit receipt",
+                )
+                return False
             if (
-                not isinstance(commit_receipt, dict)
-                or commit_receipt.get("commit_sha") != current_head
+                commit_receipt.get("commit_sha") != current_head
                 or commit_receipt.get("tree_sha") != tree_sha
-                or commit_receipt.get("author") != author
                 or commit_receipt.get("message") != last_commit_msg
-                or commit_receipt.get("diff_sha") != diff_digest
+                or commit_receipt.get("candidate_diff_sha") != diff_digest
+                or commit_receipt.get("work_unit_id") != wuid
+                or commit_receipt.get("branch") != branch
+                or sorted(commit_receipt.get("paths", [])) != sorted(writer_receipt.get("files_modified", []))
                 or not re.fullmatch(r"[0-9a-f]{64}", diff_digest)
             ):
                 self._block_wu(
@@ -1425,6 +1608,23 @@ class CampaignSupervisor:
             ci_operation = wu.get("ci_operation")
             if not ci_operation:
                 ci_operation = driver.execute_ci(wu, repo_root, run_id, agent_env)
+
+        elif recovering_pre_commit:
+            try:
+                commit_receipt = self.produce_governed_commit(
+                    run_id=run_id,
+                    repo_root=repo_root,
+                    wuid=wuid,
+                    objective=wu["objective"],
+                    base_sha=base_sha,
+                    modified_files=writer_receipt.get("files_modified", []),
+                    diff_digest=diff_digest,
+                    cid=cid,
+                )
+            except Exception as e:
+                self._block_wu(cid, wuid, "unknown", f"Governed git commit recovery failed: {e}")
+                return False
+            candidate_sha = commit_receipt["commit_sha"]
 
         else:
             # 5. Transition to implementing
@@ -1504,15 +1704,27 @@ class CampaignSupervisor:
                 )
                 return False
 
-            # 9. Committing Phase: Produce Governed Commit via myrmex-git-local.py
-            self._transition_wu(cid, wuid, phase="committing")
-            self.sync_myrmex_state_phase(run_id, "committing")
-
             modified_files = writer_receipt.get("files_modified", [])
             if not no_op_allowed and not modified_files:
                 self._block_wu(cid, wuid, "unknown", "Diff against base SHA is empty and no-op is not allowed")
                 return False
             diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+
+            # 9. Persist every pre-commit receipt before entering the effect
+            # boundary.  Recovery can then resume or validate the governed
+            # commit without repeating writer/verifier/CI effects.
+            self._transition_wu(
+                cid, wuid,
+                phase="committing",
+                base_sha=base_sha,
+                diff_digest=diff_digest,
+                writer_receipt=writer_receipt,
+                verifier_receipt=verifier_receipt,
+                ci_op=ci_operation,
+                correction_runs=correction_runs,
+                corrections_used=len(correction_runs),
+            )
+            self.sync_myrmex_state_phase(run_id, "committing")
 
             try:
                 commit_receipt = self.produce_governed_commit(

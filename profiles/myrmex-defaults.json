@@ -52,7 +52,8 @@
     "max_steps": {
       "myrmex-scout": 80,
       "myrmex-worker": 110,
-      "myrmex-verifier": 90
+      "myrmex-verifier": 90,
+      "myrmex-planner": 90
     }
   }
 }

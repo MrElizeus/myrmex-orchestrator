@@ -848,13 +848,16 @@ def cmd_wu_recover(args: argparse.Namespace) -> int:
         "verifying": {"verifying", "remediating", "running-ci"},
         "remediating": {"remediating", "verifying"},
         "running-ci": {"running-ci", "committing", "remediating"},
-        "committing": {"committing", "delivering"},
+        "committing": {"collecting-context", "committing", "delivering"},
         "delivering": {"delivering", "completed"},
     }
 
     allowed_targets = valid_resume_targets.get(from_phase, set())
     if resume_phase not in allowed_targets:
         sys.stderr.write(f"error: cannot recover from {from_phase!r} to resume phase {resume_phase!r}; allowed: {sorted(allowed_targets)}\n")
+        return 1
+    if from_phase == "committing" and resume_phase == "collecting-context" and not args.pre_commit_absence_proven:
+        sys.stderr.write("error: committing -> collecting-context requires --pre-commit-absence-proven\n")
         return 1
 
     evidence_data = None
@@ -891,6 +894,7 @@ def cmd_wu_recover(args: argparse.Namespace) -> int:
         "resume_phase": resume_phase,
         "reason": reason,
         "evidence_attached": bool(evidence_data),
+        "pre_commit_absence_proven": bool(args.pre_commit_absence_proven),
     }
     wu.setdefault("recovery_events", []).append(recovery_event)
 
@@ -1517,6 +1521,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_wurec.add_argument("--reason", required=True, help="Auditable justification for recovery")
     p_wurec.add_argument("--evidence-file", help="Path to evidence JSON file to attach")
     p_wurec.add_argument("--expect-revision", type=int, help="Expected revision for CAS check")
+    p_wurec.add_argument(
+        "--pre-commit-absence-proven", action="store_true",
+        help="Assert that no matching commit effect exists before rewinding committing",
+    )
     p_wurec.set_defaults(func=cmd_wu_recover)
 
     # lease

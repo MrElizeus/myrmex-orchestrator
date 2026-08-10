@@ -29,12 +29,16 @@ def fixture():
     snap = {"schema": backlog.NORMALIZED_SNAPSHOT_SCHEMA, "snapshot_record_id": "", "snapshot_record_digest": "", "snapshot_digest": "", "source_count": 1, "sources": [source], "item_count": 1, "items":[{"backlog_item_id":item["backlog_item_id"],"item_digest":item["item_digest"],"artifact_id":item_id}]}
     snap["snapshot_digest"] = backlog.compute_snapshot_digest_from_snapshot(snap); snap["snapshot_record_digest"] = backlog.compute_snapshot_record_digest(snap); snap["snapshot_record_id"] = "blsnaprec_" + snap["snapshot_record_digest"]
     intel.put_artifact(root, cid, 1, "backlog", "normalized-backlog/snapshot/" + snap["snapshot_record_id"], snap)
+    repository_context = {"schema":"myrmex.repository-context/v1", "run_id":"run-p1008", "objective_id":"obj-p1008", "repository_root":"/repo", "branch":"main", "base_sha":"0" * 40, "git_status":[], "objective":"plan this", "relevant_files":["roadmap.md"], "relevant_symbols":[], "architecture":[], "current_behavior":[], "tests":[], "data_contracts":["myrmex.backlog-snapshot/v1"], "observed_conventions":[], "implementation_constraints":["planning-only"], "unresolved_decisions":[], "protected_dirty_paths":[], "excluded_sensitive_paths":[".env"], "evidence":["snapshot"]}
+    repository_context_id = "repository-context/snapshot/" + intel.compute_payload_digest(repository_context)
+    intel.put_artifact(root, cid, 1, "decision", repository_context_id, repository_context)
     constraints = {"allowed_paths": ["src/"], "forbidden_paths": [".git"], "required_invariants": ["planning-only"], "required_sections": ["work_units"]}
-    req = planner.create_planning_request(root, cid, 1, "req-p1008", "run-p1008", "obj-p1008", "0" * 40, snap["snapshot_record_id"], constraints)
-    return root, cid, req, snap, item
+    req = planner.create_planning_request(root, cid, 1, "req-p1008", "run-p1008", "obj-p1008", "0" * 40, snap["snapshot_record_id"], repository_context_id, constraints)
+    return root, cid, req, snap, item, repository_context_id
 
-def make_result(req, kind="already_complete"):
-    result = {"schema": planner.RESULT_SCHEMA, "request_id": req["request_id"], "run_id": req["run_id"], "campaign_id": req["campaign_id"], "objective_id": req["objective_id"], "base_sha": req["base_sha"], "response_type": kind, "plan_revision": None, "clarification": None, "completion_evidence": ["evidence"] if kind == "already_complete" else [], "authority": dict(planner.AUTHORITY), "result_digest": "", "created_at": "2026-08-09T00:00:00+00:00"}
+def make_result(req, kind="already_complete", backlog_item_ids=None):
+    coverage = [{"backlog_item_id": item_id, "work_unit_ids": ["WU-P1-008"]} for item_id in (backlog_item_ids or ["backlog_" + "a" * 64])] if kind == "plan" else None
+    result = {"schema": planner.RESULT_SCHEMA, "request_id": req["request_id"], "run_id": req["run_id"], "campaign_id": req["campaign_id"], "objective_id": req["objective_id"], "base_sha": req["base_sha"], "response_type": kind, "plan_revision": None, "analysis": {"facts":["snapshot is durable"],"assumptions":[],"uncertainties":[]} if kind == "plan" else None, "coverage_matrix": coverage, "clarification": None, "completion_evidence": ["evidence"] if kind == "already_complete" else [], "authority": dict(planner.AUTHORITY), "result_digest": "", "created_at": "2026-08-09T00:00:00+00:00"}
     result["result_digest"] = planner._sha({k:v for k,v in result.items() if k != "result_digest"}); return result
 def refresh(result):
     result["result_digest"] = planner._sha({k:v for k,v in result.items() if k != "result_digest"}); return result
@@ -47,12 +51,12 @@ def make_plan(req):
     plan["plan_digest"] = store.compute_plan_digest(plan); plan["plan_revision_id"] = store.derive_plan_revision_id(plan["plan_digest"]); plan["record_digest"] = store.compute_record_digest(plan); plan["record_id"] = store.derive_record_id(plan["record_digest"])
     return plan
 
-root, cid, req, snap, item = fixture()
-replay = planner.create_planning_request(root, cid, 1, req["request_id"], req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], req["constraints"])
+root, cid, req, snap, item, repository_context_id = fixture()
+replay = planner.create_planning_request(root, cid, 1, req["request_id"], req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], repository_context_id, req["constraints"])
 check(replay == req and replay["created_at"] == planner.DEFAULT_CREATED_AT, "stable omitted timestamp replay")
-raises(planner.PlanningRequestConflict, lambda: planner.create_planning_request(root, cid, 1, req["request_id"], req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], req["constraints"], "2026-08-09T00:00:00+00:00"), "timestamp conflict")
-raises(planner.PlanningRequestInvalid, lambda: planner.create_planning_request(root, cid, 1, "request-invalid-time", req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], req["constraints"], "2026-08-09T00:00:00"), "request timezone required")
-raises(planner.PlanningRequestInvalid, lambda: planner.create_planning_request(root, cid, 1, "r" * 257, req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], req["constraints"]), "request ID bounded")
+raises(planner.PlanningRequestConflict, lambda: planner.create_planning_request(root, cid, 1, req["request_id"], req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], repository_context_id, req["constraints"], "2026-08-09T00:00:00+00:00"), "timestamp conflict")
+raises(planner.PlanningRequestInvalid, lambda: planner.create_planning_request(root, cid, 1, "request-invalid-time", req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], repository_context_id, req["constraints"], "2026-08-09T00:00:00"), "request timezone required")
+raises(planner.PlanningRequestInvalid, lambda: planner.create_planning_request(root, cid, 1, "r" * 257, req["run_id"], req["objective_id"], req["base_sha"], snap["snapshot_record_id"], repository_context_id, req["constraints"]), "request ID bounded")
 context = planner.build_planning_context(root, cid, req["request_id"]); prompt = planner.render_planning_prompt(context)
 check(prompt == planner.render_planning_prompt(copy.deepcopy(context)), "deterministic prompt")
 mutations = [(lambda c: c.update(extra=1), "context extra"), (lambda c: c["normalized_backlog"]["items"][0].update(secret="x"), "context secret"), (lambda c: c["normalized_backlog"]["items"][0].update(item_digest="0"*64), "context digest"), (lambda c: c["normalized_backlog"]["snapshot"].update(snapshot_digest="0"*64), "context snapshot")]
@@ -72,15 +76,15 @@ missing = fixture(); raises(planner.PlanningInputInvalid, lambda: planner.build_
 source = pathlib.Path(planner.__file__).read_text(encoding="utf-8")
 for forbidden in ("import requests", "import urllib", "import subprocess", "import socket", "import httpx", "import aiohttp"): check(forbidden not in source, forbidden)
 check(not (root / "campaign.json").exists(), "campaign unchanged")
-root_corrupt, cid_corrupt, req_corrupt, snap_corrupt, _ = fixture()
+root_corrupt, cid_corrupt, req_corrupt, snap_corrupt, _, repo_corrupt_id = fixture()
 request_path = root_corrupt / "intelligence" / "artifacts" / (intel.artifact_storage_key("planning-request/request/" + planner._text_sha(req_corrupt["request_id"])) + ".json")
 request_envelope = json.loads(request_path.read_text(encoding="utf-8")); request_envelope["payload"]["unexpected"] = True; request_path.write_text(json.dumps(request_envelope), encoding="utf-8")
 raises(planner.PlanningInputInvalid, lambda: planner.build_planning_context(root_corrupt,cid_corrupt,req_corrupt["request_id"]), "corrupt authoritative request")
-raises(planner.PlanningRequestConflict, lambda: planner.create_planning_request(root_corrupt, cid_corrupt, 1, req_corrupt["request_id"], req_corrupt["run_id"], req_corrupt["objective_id"], req_corrupt["base_sha"], snap_corrupt["snapshot_record_id"], req_corrupt["constraints"]), "corrupt request replay fails closed")
+raises(planner.PlanningRequestConflict, lambda: planner.create_planning_request(root_corrupt, cid_corrupt, 1, req_corrupt["request_id"], req_corrupt["run_id"], req_corrupt["objective_id"], req_corrupt["base_sha"], snap_corrupt["snapshot_record_id"], repo_corrupt_id, req_corrupt["constraints"]), "corrupt request replay fails closed")
 
 # A valid plan persists response first, then exactly one proposed P1-007 root.
-root_plan, cid_plan, req_plan, _, _ = fixture()
-plan_result = make_result(req_plan, "plan"); plan_result["plan_revision"] = make_plan(req_plan); plan_result["result_digest"] = planner._sha({k:v for k,v in plan_result.items() if k != "result_digest"})
+root_plan, cid_plan, req_plan, _, item_plan, _ = fixture()
+plan_result = make_result(req_plan, "plan", [item_plan["backlog_item_id"]]); plan_result["plan_revision"] = make_plan(req_plan); plan_result["result_digest"] = planner._sha({k:v for k,v in plan_result.items() if k != "result_digest"})
 receipt = planner.record_planning_result(root_plan, cid_plan, 1, req_plan["request_id"], plan_result)
 check(receipt["lifecycle_status"] == "proposed", "proposed plan persisted")
 response_id = "planning-result/response/" + planner._text_sha(req_plan["request_id"])
@@ -95,7 +99,7 @@ response_envelope = json.loads(response_path.read_text(encoding="utf-8")); respo
 raises(planner.PlanningResultConflict, lambda: planner.record_planning_result(root_plan, cid_plan, 1, req_plan["request_id"], plan_result), "corrupt response fail closed")
 
 # Fault injection proves response-before-plan ordering and recovery.
-root2, cid2, req2, snap2, _ = fixture(); plan_result2 = make_result(req2, "plan"); plan_result2["plan_revision"] = make_plan(req2); plan_result2["result_digest"] = planner._sha({k:v for k,v in plan_result2.items() if k != "result_digest"})
+root2, cid2, req2, snap2, item2, _ = fixture(); plan_result2 = make_result(req2, "plan", [item2["backlog_item_id"]]); plan_result2["plan_revision"] = make_plan(req2); plan_result2["result_digest"] = planner._sha({k:v for k,v in plan_result2.items() if k != "result_digest"})
 original_store = planner.plan_store.store_plan_record
 planner.plan_store.store_plan_record = lambda *args: (_ for _ in ()).throw(RuntimeError("injected plan-store crash"))
 raises(planner.PlanningResultConflict, lambda: planner.record_planning_result(root2, cid2, 1, req2["request_id"], plan_result2), "response-before-plan crash")
@@ -114,9 +118,9 @@ bad = make_result(req,"blocking_clarification"); bad["clarification"]={"question
 bad = make_result(req,"already_complete"); bad["plan_revision"]={}; refresh(bad); raises(planner.PlanningResultInvalid, lambda: planner.validate_planning_result(req,bad), "completion plan")
 
 # Authoritative missing artifacts fail closed; projection repair remains safe.
-root3, cid3, req3, snap3, item3 = fixture(); item_path = root3 / "intelligence" / "artifacts" / (intel.artifact_storage_key(f"normalized-backlog/item/{item3['backlog_item_id']}/{item3['item_digest']}") + ".json"); item_path.unlink()
+root3, cid3, req3, snap3, item3, _ = fixture(); item_path = root3 / "intelligence" / "artifacts" / (intel.artifact_storage_key(f"normalized-backlog/item/{item3['backlog_item_id']}/{item3['item_digest']}") + ".json"); item_path.unlink()
 raises(planner.PlanningInputInvalid, lambda: planner.build_planning_context(root3,cid3,req3["request_id"]), "missing authoritative item")
-root4, cid4, req4, snap4, _ = fixture(); (root4 / "intelligence" / "artifacts" / (intel.artifact_storage_key("normalized-backlog/snapshot/"+snap4["snapshot_record_id"])+".json")).unlink()
+root4, cid4, req4, snap4, _, _ = fixture(); (root4 / "intelligence" / "artifacts" / (intel.artifact_storage_key("normalized-backlog/snapshot/"+snap4["snapshot_record_id"])+".json")).unlink()
 raises(planner.PlanningInputInvalid, lambda: planner.build_planning_context(root4,cid4,req4["request_id"]), "missing authoritative snapshot")
 if failures: raise SystemExit("planner orchestration failures: " + "; ".join(failures))
 print("planner orchestration: expanded integrity/replay/recovery assertions passed")

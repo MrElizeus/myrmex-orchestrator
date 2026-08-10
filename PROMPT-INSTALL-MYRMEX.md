@@ -21,7 +21,7 @@ You are installing the supplied **Myrmex Orchestrator** package into the user's 
 Install and verify:
 
 - primary agent `myrmex-orchestrator`;
-- subagents `myrmex-scout`, `myrmex-worker`, `myrmex-verifier`, and `myrmex-frontier`;
+- subagents `myrmex-scout`, `myrmex-worker`, `myrmex-verifier`, `myrmex-planner`, and `myrmex-frontier`;
 - skills `myrmex-delegation`, `myrmex-frontier-delegation`, `myrmex-memory`, and `myrmex-git-delivery`;
 - all seven `myrmex-*` commands;
 - executables `myrmex-state` and `myrmex-memory` in the selected user bin directory;

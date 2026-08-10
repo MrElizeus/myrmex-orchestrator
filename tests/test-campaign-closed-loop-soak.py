@@ -331,13 +331,45 @@ def test_ci_failure_blocks_completion() -> None:
         assert wu["blocker"]["type"] == "ci_failed"
 
 
+def test_pre_commit_absence_rewinds_committing_safely() -> None:
+    """A crash before the commit effect may replay; an unproven rewind is denied."""
+    with tempfile.TemporaryDirectory(prefix="myrmex-precommit-repo-") as repo_dir, \
+         tempfile.TemporaryDirectory(prefix="myrmex-precommit-state-") as state_dir:
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "tester@test.local"], cwd=repo_dir, check=True)
+        Path(repo_dir, "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=repo_dir, check=True, capture_output=True)
+        cid = "camp-precommit-recovery"
+        assert run_cmd([sys.executable, str(BIN_CAMPAIGN), "init", "--id", cid, "--title", "precommit", "--objective", "recover", "--repo-root", repo_dir], state_dir).returncode == 0
+        impl = f"{sys.executable} -c \"from pathlib import Path; Path('done.txt').write_text('done')\""
+        verify = f"{sys.executable} -c \"from pathlib import Path; assert Path('done.txt').read_text() == 'done'\""
+        assert run_cmd([sys.executable, str(BIN_CAMPAIGN), "wu-add", cid, "--wu-id", "WU-PRECOMMIT", "--objective", "precommit recovery", "--impl-cmd", impl, "--verify-cmd", verify], state_dir).returncode == 0
+        for phase in ("collecting-context", "implementing", "verifying", "running-ci", "committing"):
+            transitioned = run_cmd([sys.executable, str(BIN_CAMPAIGN), "wu-transition", cid, "WU-PRECOMMIT", "--phase", phase], state_dir)
+            assert transitioned.returncode == 0, transitioned.stderr
+        denied = run_cmd([sys.executable, str(BIN_CAMPAIGN), "wu-recover", cid, "WU-PRECOMMIT", "--from-phase", "committing", "--resume-phase", "collecting-context", "--reason", "test"], state_dir)
+        assert denied.returncode != 0 and "pre-commit-absence-proven" in denied.stderr
+        executed = run_cmd([sys.executable, str(BIN_HEAD), "--once", "--allow-fixture-driver", "--campaign-id", cid], state_dir)
+        assert executed.returncode == 0, executed.stderr
+        data = json.loads(run_cmd([sys.executable, str(BIN_CAMPAIGN), "show", cid, "--json"], state_dir).stdout)
+        wu = data["work_units"][0]
+        assert wu["status"] == "completed", wu
+        assert any(event["from_phase"] == "committing" and event["pre_commit_absence_proven"] for event in wu["recovery_events"])
+        log = subprocess.run(["git", "log", "--format=%s"], cwd=repo_dir, capture_output=True, text=True, check=True).stdout
+        assert log.count("feat(wu-precommit):") == 1, log
+
+
 def main() -> int:
-    print("[1/3] Running real execution closed loop & 3 chained commits soak test...")
+    print("[1/4] Running real execution closed loop & 3 chained commits soak test...")
     test_real_execution_closed_loop_and_chained_commits()
-    print("[2/3] Running verifier workspace mutation rejection test...")
+    print("[2/4] Running verifier workspace mutation rejection test...")
     test_verifier_workspace_mutation_rejection()
-    print("[3/3] Running CI failure block test...")
+    print("[3/4] Running CI failure block test...")
     test_ci_failure_blocks_completion()
+    print("[4/4] Running proven pre-commit rewind test...")
+    test_pre_commit_absence_rewinds_committing_safely()
     print("ALL real execution soak tests PASSED successfully!")
     return 0
 

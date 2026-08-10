@@ -201,6 +201,12 @@ def validate_result_envelope(result: dict) -> list[str]:
     rtype = result.get("response_type")
     plan_rev = result.get("plan_revision")
     if rtype == "plan":
+        analysis = result.get("analysis")
+        if not isinstance(analysis, dict) or set(analysis) != {"facts", "assumptions", "uncertainties"}:
+            errors.append("plan responses must separate facts, assumptions, and uncertainties")
+        coverage = result.get("coverage_matrix")
+        if not isinstance(coverage, list) or not coverage:
+            errors.append("plan responses must include a non-empty coverage matrix")
         if not isinstance(plan_rev, dict):
             errors.append("plan responses must embed a plan_revision object")
         else:
@@ -219,6 +225,10 @@ def validate_result_envelope(result: dict) -> list[str]:
         if result.get("completion_evidence"):
             errors.append("plan responses must have empty completion_evidence")
     elif rtype == "blocking_clarification":
+        if result.get("analysis") is not None:
+            errors.append("blocking_clarification responses must have null analysis")
+        if result.get("coverage_matrix") is not None:
+            errors.append("blocking_clarification responses must have null coverage_matrix")
         if not isinstance(result.get("clarification"), dict):
             errors.append("blocking_clarification responses must include a clarification object")
         if plan_rev is not None:
@@ -226,6 +236,10 @@ def validate_result_envelope(result: dict) -> list[str]:
         if result.get("completion_evidence"):
             errors.append("blocking_clarification responses must have empty completion_evidence")
     elif rtype == "already_complete":
+        if result.get("analysis") is not None:
+            errors.append("already_complete responses must have null analysis")
+        if result.get("coverage_matrix") is not None:
+            errors.append("already_complete responses must have null coverage_matrix")
         if plan_rev is not None:
             errors.append("already_complete responses must not embed a plan_revision")
         if result.get("clarification") is not None:
@@ -276,7 +290,8 @@ def make_plan_revision(**overrides: object) -> dict:
         "base_sha": BASE_SHA,
         "parent_revision": None,
         "input_digests": [
-            {"kind": "repository-context", "identity": BASE_SHA, "sha256": HEX64_C}
+            {"kind": "normalized-backlog", "identity": "normalized-backlog/snapshot/blsnaprec_" + HEX64_A, "sha256": HEX64_C},
+            {"kind": "repository-context", "identity": "repository-context/snapshot/" + HEX64_B, "sha256": HEX64_D}
         ],
         "assumptions": [
             {
@@ -346,7 +361,8 @@ def make_planning_request(**overrides: object) -> dict:
         "base_sha": BASE_SHA,
         "parent_revision": None,
         "input_digests": [
-            {"kind": "repository-context", "identity": BASE_SHA, "sha256": HEX64_C}
+            {"kind": "normalized-backlog", "identity": "normalized-backlog/snapshot/blsnaprec_" + HEX64_A, "sha256": HEX64_C},
+            {"kind": "repository-context", "identity": "repository-context/snapshot/" + HEX64_B, "sha256": HEX64_D}
         ],
         "constraints": {
             "allowed_paths": ["contracts/", "scripts/check-package.py", "tests/test-plan-contracts.py", "docs/ARCHITECTURE.md"],
@@ -387,6 +403,8 @@ def make_planning_result(
         "base_sha": BASE_SHA,
         "response_type": response_type,
         "plan_revision": plan_revision,
+        "analysis": {"facts": ["repository base is exact"], "assumptions": [], "uncertainties": []} if response_type == "plan" else None,
+        "coverage_matrix": [{"backlog_item_id": "backlog_" + HEX64_A, "work_unit_ids": ["WU-P1-001"]}] if response_type == "plan" else None,
         "clarification": clarification,
         "completion_evidence": completion_evidence if completion_evidence is not None else [],
         "authority": {

@@ -52,6 +52,7 @@ assert (config.parent/'bin/myrmex-state').is_file()
 assert (config.parent/'bin/myrmex-memory').is_file()
 assert (config.parent/'bin/myrmex-campaign').is_file()
 assert (config.parent/'bin/myrmex-head').is_file()
+assert (config/'agents/myrmex-planner.md').is_file()
 assert (config.parent/'bin/myrmex_campaign_intelligence.py').is_file()
 record=json.loads((config/'myrmex-orchestrator/install-record.json').read_text())
 recorded={item['path'] for item in record['files']}
@@ -105,6 +106,7 @@ assert not (config.parent/'bin/myrmex-state').exists()
 assert not (config.parent/'bin/myrmex-memory').exists()
 assert not (config.parent/'bin/myrmex-campaign').exists()
 assert not (config.parent/'bin/myrmex-head').exists()
+assert not (config/'agents/myrmex-planner.md').exists()
 assert not (config.parent/'bin/myrmex_campaign_intelligence.py').exists()
 PY
 

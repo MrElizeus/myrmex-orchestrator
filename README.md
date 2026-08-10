@@ -20,7 +20,7 @@ smoke test has been run.
 ## What it installs
 
 - Primary agent: myrmex-orchestrator, with an explicit per-run execution policy.
-- Subagents: myrmex-scout, myrmex-worker, myrmex-verifier, and myrmex-frontier.
+- Subagents: myrmex-scout, myrmex-worker, myrmex-verifier, myrmex-planner, and myrmex-frontier.
 - Skills: local delegation, frontier delegation, governed project-memory policy,
   and separate Git delivery gates.
 - myrmex-state: dependency-free atomic state for phases, locks, request/task

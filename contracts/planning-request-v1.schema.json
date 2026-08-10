@@ -66,26 +66,33 @@
     },
     "input_digests": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 2,
+      "maxItems": 2,
       "uniqueItems": true,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "identity", "sha256"],
-        "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "identity": {
-            "type": "string"
-          },
-          "sha256": {
-            "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+      "items": false,
+      "description": "Exactly two ordered inputs: normalized-backlog followed by repository-context.",
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "identity", "sha256"],
+          "properties": {
+            "kind": {"const": "normalized-backlog"},
+            "identity": {"type": "string", "pattern": "^normalized-backlog/snapshot/blsnaprec_[0-9a-f]{64}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "identity", "sha256"],
+          "properties": {
+            "kind": {"const": "repository-context"},
+            "identity": {"type": "string", "pattern": "^repository-context/snapshot/[0-9a-f]{64}$"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
           }
         }
-      },
-      "description": "Non-empty, unique set of exact input digests the planning request binds to."
+      ]
     },
     "constraints": {
       "type": "object",

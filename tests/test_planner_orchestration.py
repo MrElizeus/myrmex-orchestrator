@@ -56,19 +56,31 @@ def _fixture(create_request=True):
     snapshot["snapshot_record_digest"] = backlog.compute_snapshot_record_digest(snapshot)
     snapshot["snapshot_record_id"] = "blsnaprec_" + snapshot["snapshot_record_digest"]
     intel.put_artifact(root, campaign_id, 1, "backlog", "normalized-backlog/snapshot/" + snapshot["snapshot_record_id"], snapshot)
+    repository_context = {
+        "schema": "myrmex.repository-context/v1", "run_id": "run-process",
+        "objective_id": "obj-process", "repository_root": "/repo", "branch": "main",
+        "base_sha": "0" * 40, "git_status": [], "objective": "process replay",
+        "relevant_files": ["roadmap.md"], "relevant_symbols": [], "architecture": [],
+        "current_behavior": [], "tests": [], "data_contracts": ["myrmex.backlog-snapshot/v1"],
+        "observed_conventions": [], "implementation_constraints": ["planning-only"],
+        "unresolved_decisions": [], "protected_dirty_paths": [],
+        "excluded_sensitive_paths": [".env"], "evidence": ["snapshot"],
+    }
+    repository_context_id = "repository-context/snapshot/" + intel.compute_payload_digest(repository_context)
+    intel.put_artifact(root, campaign_id, 1, "decision", repository_context_id, repository_context)
     constraints = {"allowed_paths": ["src/"], "forbidden_paths": [".git"], "required_invariants": ["planning-only"], "required_sections": ["work_units"]}
     request = None
     if create_request:
-        request = planner.create_planning_request(root, campaign_id, 1, "req-process", "run-process", "obj-process", "0" * 40, snapshot["snapshot_record_id"], constraints)
-    return root, campaign_id, request, snapshot, constraints
+        request = planner.create_planning_request(root, campaign_id, 1, "req-process", "run-process", "obj-process", "0" * 40, snapshot["snapshot_record_id"], repository_context_id, constraints)
+    return root, campaign_id, request, snapshot, constraints, repository_context_id
 
 
-def _request_worker(root, campaign_id, snapshot, constraints, start, output):
+def _request_worker(root, campaign_id, snapshot, repository_context_id, constraints, start, output):
     start.wait()
     try:
         request = planner.create_planning_request(
             root, campaign_id, 1, "req-process", "run-process", "obj-process",
-            "0" * 40, snapshot["snapshot_record_id"], constraints,
+            "0" * 40, snapshot["snapshot_record_id"], repository_context_id, constraints,
         )
         output.put(("ok", request))
     except Exception as error:  # pragma: no cover - asserted by parent
@@ -82,6 +94,8 @@ def _record_worker(root, campaign_id, request, start, output):
         "run_id": request["run_id"], "campaign_id": campaign_id,
         "objective_id": request["objective_id"], "base_sha": request["base_sha"],
         "response_type": "already_complete", "plan_revision": None,
+        "analysis": None,
+        "coverage_matrix": None,
         "clarification": None, "completion_evidence": ["process"],
         "authority": dict(planner.AUTHORITY), "result_digest": "",
         "created_at": "2026-08-09T00:00:00+00:00",
@@ -100,7 +114,7 @@ class PlannerOrchestrationDiscovery(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_process_duplicate_recording_is_canonical(self):
-        root, campaign_id, request, _, _ = _fixture()
+        root, campaign_id, request, _, _, _ = _fixture()
         start = multiprocessing.Event()
         output = multiprocessing.Queue()
         workers = [multiprocessing.Process(target=_record_worker, args=(root, campaign_id, request, start, output)) for _ in range(2)]
@@ -119,13 +133,13 @@ class PlannerOrchestrationDiscovery(unittest.TestCase):
         self.assertEqual(intel.get_artifact(root, campaign_id, response_id)["artifact"]["payload"]["request_id"], request["request_id"])
 
     def test_process_duplicate_request_creation_is_canonical(self):
-        root, campaign_id, _, snapshot, constraints = _fixture(create_request=False)
+        root, campaign_id, _, snapshot, constraints, repository_context_id = _fixture(create_request=False)
         start = multiprocessing.Event()
         output = multiprocessing.Queue()
         workers = [
             multiprocessing.Process(
                 target=_request_worker,
-                args=(root, campaign_id, snapshot, constraints, start, output),
+                args=(root, campaign_id, snapshot, repository_context_id, constraints, start, output),
             )
             for _ in range(2)
         ]
