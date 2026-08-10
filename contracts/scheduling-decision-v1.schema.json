@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:scheduling-decision:v1",
+  "title": "Myrmex Deterministic Scheduling Decision v1",
+  "description": "A read-only, digest-addressed preview that applies hard eligibility constraints before versioned deterministic scoring. It grants no dispatch or run-start authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "decision_id", "decision_digest", "campaign_id", "campaign_revision", "campaign_state_digest", "observed_campaign_updated_at", "policy", "considered_candidates", "eligible_work_unit_ids", "selected_work_unit_id", "selection_reason", "authority"],
+  "properties": {
+    "schema": {"const": "myrmex.scheduling-decision/v1"},
+    "decision_id": {"type": "string", "pattern": "^schedule_[0-9a-f]{64}$"},
+    "decision_digest": {"$ref": "#/$defs/digest"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "campaign_revision": {"type": "integer", "minimum": 1},
+    "campaign_state_digest": {"$ref": "#/$defs/digest"},
+    "observed_campaign_updated_at": {"type": "string", "format": "date-time"},
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "hard_constraints", "weights", "tie_breakers", "policy_digest"],
+      "properties": {
+        "schema": {"const": "myrmex.priority-policy/v1"},
+        "version": {"const": "1.0.0"},
+        "hard_constraints": {"const": ["campaign_active", "schedulable_status", "dependencies_completed", "human_gates_cleared", "work_unit_unblocked", "work_unit_budget_available", "campaign_budget_available", "route_budget_available", "cost_budget_available", "failure_limit_available", "concurrency_available"]},
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical_path_length", "downstream_unlock_count", "age_minutes"],
+          "properties": {
+            "critical_path_length": {"const": 1000},
+            "downstream_unlock_count": {"const": 100},
+            "age_minutes": {"const": 1}
+          }
+        },
+        "tie_breakers": {"const": ["score_desc", "work_unit_id_asc"]},
+        "policy_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "considered_candidates": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["work_unit_id", "status", "source_index", "eligible", "exclusion_reasons", "features", "score", "rank"],
+        "properties": {
+          "work_unit_id": {"$ref": "#/$defs/workUnitId"},
+          "status": {"enum": ["pending", "ready", "active", "verifying", "remediating", "ci", "delivering", "completed", "blocked", "failed", "cancelled", "superseded"]},
+          "source_index": {"type": "integer", "minimum": 0},
+          "eligible": {"type": "boolean"},
+          "exclusion_reasons": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "features": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["age_minutes", "critical_path_length", "downstream_unlock_count", "dependency_count", "completed_dependency_count"],
+            "properties": {
+              "age_minutes": {"type": "integer", "minimum": 0},
+              "critical_path_length": {"type": "integer", "minimum": 1},
+              "downstream_unlock_count": {"type": "integer", "minimum": 0},
+              "dependency_count": {"type": "integer", "minimum": 0},
+              "completed_dependency_count": {"type": "integer", "minimum": 0}
+            }
+          },
+          "score": {"type": ["integer", "null"]},
+          "rank": {"type": ["integer", "null"], "minimum": 1}
+        }
+      }
+    },
+    "eligible_work_unit_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/workUnitId"}},
+    "selected_work_unit_id": {"oneOf": [{"$ref": "#/$defs/workUnitId"}, {"type": "null"}]},
+    "selection_reason": {"enum": ["highest_score_then_stable_id", "no_eligible_work_unit"]},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "dispatch", "start_run", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "schedule_preview_only"},
+        "dispatch": {"const": false},
+        "start_run": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "workUnitId": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"}
+  }
+}

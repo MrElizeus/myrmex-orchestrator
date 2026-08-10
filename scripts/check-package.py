@@ -53,6 +53,7 @@ REQUIRED_CONTRACTS = {
     "plan-activation-v1.schema.json",
     "replan-trigger-v1.schema.json",
     "replan-decision-v1.schema.json",
+    "scheduling-decision-v1.schema.json",
     "work-result-v1.schema.json",
     "verification-request-v1.schema.json",
     "verification-result-v1.schema.json",

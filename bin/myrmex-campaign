@@ -153,6 +153,18 @@ def _replanning_runtime():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_replanning")
 
+
+def _priority_policy_runtime():
+    """Load the read-only deterministic P1 scheduling policy."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_priority_policy.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_priority_policy")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -486,6 +498,7 @@ def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
 
     wu: dict[str, Any] = {
         "id": wuid,
+        "created_at": wu_spec.get("created_at") or data.get("updated_at") or data.get("created_at"),
         "status": "pending",
         "phase": "ready",
         "objective": wu_spec.get("objective", f"Execute {wuid}"),
@@ -563,6 +576,7 @@ def cmd_wu_add(args: argparse.Namespace) -> int:
         "required_route": args.required_route or "delegated",
         "issue": args.issue,
         "corrections_budget": args.corrections_budget or data["budgets"]["corrections_per_wu"],
+        "created_at": utcnow(),
         "implementation_command": args.impl_cmd,
         "remediation_command": args.remed_cmd,
         "ci_command": args.ci_cmd,
@@ -1658,6 +1672,21 @@ def cmd_replan_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_schedule_preview(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        result = _priority_policy_runtime().preview_schedule(
+            campaign_dir(cid), cid, args.expect_revision,
+        )
+    except Exception as exc:
+        _intel_emit_error("schedule_preview_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1788,6 +1817,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_replan_apply.add_argument("id", help="Campaign ID")
     p_replan_apply.add_argument("--decision-json", required=True)
     p_replan_apply.set_defaults(func=cmd_replan_apply)
+
+    p_schedule = sub.add_parser(
+        "schedule-preview", help="Select the next eligible WU through the versioned deterministic policy without dispatch",
+    )
+    p_schedule.add_argument("id", help="Campaign ID")
+    p_schedule.add_argument("--expect-revision", required=True, type=int)
+    p_schedule.set_defaults(func=cmd_schedule_preview)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")
