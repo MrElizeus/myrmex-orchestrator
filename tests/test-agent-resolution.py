@@ -80,7 +80,9 @@ with tempfile.TemporaryDirectory(prefix="myrmex-resolution-") as td:
     no_credential_env.pop("OPENAI_API_KEY", None)
     no_credential = invoke(workspace, config, enforce=True, env=no_credential_env)
     assert no_credential.returncode == 0, no_credential.stdout
-    assert "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR is informational" in json.loads(no_credential.stdout)["credential_visibility"]
+    no_credential_result = json.loads(no_credential.stdout)
+    assert "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR is informational" in no_credential_result["credential_visibility"]
+    assert no_credential_result["provider_model_availability"].startswith("NOT_PROBED")
 
     (local / "myrmex-worker.md").write_text(agent("myrmex-worker", 110, "openai/frontmatter-worker"))
     proc = invoke(workspace, config)

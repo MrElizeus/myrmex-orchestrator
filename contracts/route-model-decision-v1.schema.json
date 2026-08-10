@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:route-model-decision:v1",
+  "title": "Myrmex Deterministic Route and Model Decision v1",
+  "description": "A read-only, digest-addressed route, agent, provider, and model decision bound to one WorkUnit and plan revision. Availability is explicit, alternatives are policy ordered, credentials are neither inspected nor requested, and the artifact grants no invocation authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "decision_id", "decision_digest", "request", "effective_policy", "availability", "considered_options", "selected", "status", "blocker", "credential_handling", "authority"],
+  "properties": {
+    "schema": {"const": "myrmex.route-model-decision/v1"},
+    "decision_id": {"type": "string", "pattern": "^routemodel_[0-9a-f]{64}$"},
+    "decision_digest": {"$ref": "#/$defs/digest"},
+    "request": {"$ref": "#/$defs/request"},
+    "effective_policy": {"$ref": "#/$defs/policy"},
+    "availability": {"$ref": "#/$defs/availability"},
+    "considered_options": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/consideredOption"}
+    },
+    "selected": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/option"}
+      ]
+    },
+    "status": {"enum": ["SELECTED", "BLOCKED"]},
+    "blocker": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "rejection_reasons"],
+          "properties": {
+            "code": {
+              "enum": [
+                "AGENT_MODEL_UNRESOLVED",
+                "AGENT_NOT_INSTALLED",
+                "BLOCKED_NON_ALLOWED_PROVIDER",
+                "BLOCKED_NON_ALLOWED_MODEL",
+                "BLOCKED_ROLE_INCOMPATIBLE",
+                "BLOCKED_ROUTE_INCOMPATIBLE",
+                "PROVIDER_UNAVAILABLE",
+                "MODEL_UNAVAILABLE",
+                "BLOCKED_INSUFFICIENT_BUDGET",
+                "NO_ELIGIBLE_ROUTE_MODEL_OPTION"
+              ]
+            },
+            "rejection_reasons": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
+    },
+    "credential_handling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inspection", "request", "reason"],
+      "properties": {
+        "inspection": {"const": "not_performed"},
+        "request": {"const": "not_performed"},
+        "reason": {"const": "provider credentials are owned by the transport and are not route/model policy inputs"}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "dispatch", "invoke_agent", "invoke_provider", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "route_model_decision_only"},
+        "dispatch": {"const": false},
+        "invoke_agent": {"const": false},
+        "invoke_provider": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "workUnitId": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"},
+    "planId": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"},
+    "route": {"enum": ["direct", "delegated", "frontier"]},
+    "requiredRoute": {"enum": ["auto", "direct-only", "delegated", "frontier", "frontier-gated"]},
+    "identifier": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "agent": {"type": "string", "pattern": "^myrmex-[a-z0-9][a-z0-9-]{0,62}$"},
+    "model": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$"},
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "work_unit_id", "plan_revision_id", "plan_revision_digest", "required_route", "required_role", "budget_headroom_usd", "request_digest"],
+      "properties": {
+        "schema": {"const": "myrmex.route-model-request/v1"},
+        "work_unit_id": {"$ref": "#/$defs/workUnitId"},
+        "plan_revision_id": {"$ref": "#/$defs/planId"},
+        "plan_revision_digest": {"$ref": "#/$defs/digest"},
+        "required_route": {"$ref": "#/$defs/requiredRoute"},
+        "required_role": {"$ref": "#/$defs/identifier"},
+        "budget_headroom_usd": {"type": "number", "minimum": 0},
+        "request_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "roleCompatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "agents", "routes"],
+      "properties": {
+        "role": {"$ref": "#/$defs/identifier"},
+        "agents": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/agent"}},
+        "routes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/route"}}
+      }
+    },
+    "option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option_id", "priority", "route", "agent", "role", "provider", "model", "max_estimated_cost_usd"],
+      "properties": {
+        "option_id": {"$ref": "#/$defs/identifier"},
+        "priority": {"type": "integer", "minimum": 0},
+        "route": {"$ref": "#/$defs/route"},
+        "agent": {"$ref": "#/$defs/agent"},
+        "role": {"$ref": "#/$defs/identifier"},
+        "provider": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/identifier"}]},
+        "model": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/model"}]},
+        "max_estimated_cost_usd": {"type": "number", "minimum": 0}
+      }
+    },
+    "consideredOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option_id", "priority", "route", "agent", "role", "provider", "model", "max_estimated_cost_usd", "eligible", "rejection_reasons"],
+      "properties": {
+        "option_id": {"$ref": "#/$defs/identifier"},
+        "priority": {"type": "integer", "minimum": 0},
+        "route": {"$ref": "#/$defs/route"},
+        "agent": {"$ref": "#/$defs/agent"},
+        "role": {"$ref": "#/$defs/identifier"},
+        "provider": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/identifier"}]},
+        "model": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/model"}]},
+        "max_estimated_cost_usd": {"type": "number", "minimum": 0},
+        "eligible": {"type": "boolean"},
+        "rejection_reasons": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "adaptive_scoring", "allowed_routes", "allowed_provider_prefixes", "allowed_models", "role_compatibility", "selection_order", "options", "policy_digest"],
+      "properties": {
+        "schema": {"const": "myrmex.route-model-policy/v1"},
+        "version": {"const": "1.0.0"},
+        "adaptive_scoring": {"const": false},
+        "allowed_routes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/route"}},
+        "allowed_provider_prefixes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*/$"}},
+        "allowed_models": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/model"}},
+        "role_compatibility": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/roleCompatibility"}},
+        "selection_order": {"const": ["priority_asc", "option_id_asc"]},
+        "options": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/option"}},
+        "policy_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "agents", "providers", "models", "availability_digest"],
+      "properties": {
+        "schema": {"const": "myrmex.route-model-availability/v1"},
+        "agents": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "providers": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "models": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "availability_digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

@@ -214,6 +214,7 @@ def main() -> int:
         "warnings": warnings,
         "errors": failures,
         "credential_visibility": "CREDENTIAL_NOT_VISIBLE_TO_ORCHESTRATOR is informational; environment credentials are not inspected for delegation readiness",
+        "provider_model_availability": "NOT_PROBED; supply explicit availability to myrmex_route_model_policy.py before invocation",
     }
     print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
     return 0 if not failures else 1

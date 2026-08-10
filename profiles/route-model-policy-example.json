@@ -1,0 +1,52 @@
+{
+  "schema": "myrmex.route-model-policy/v1",
+  "version": "1.0.0",
+  "adaptive_scoring": false,
+  "allowed_routes": [
+    "delegated"
+  ],
+  "allowed_provider_prefixes": [
+    "openai/"
+  ],
+  "allowed_models": [
+    "openai/example-primary",
+    "openai/example-secondary"
+  ],
+  "role_compatibility": [
+    {
+      "role": "worker",
+      "agents": [
+        "myrmex-worker"
+      ],
+      "routes": [
+        "delegated"
+      ]
+    }
+  ],
+  "selection_order": [
+    "priority_asc",
+    "option_id_asc"
+  ],
+  "options": [
+    {
+      "option_id": "worker-primary",
+      "priority": 10,
+      "route": "delegated",
+      "agent": "myrmex-worker",
+      "role": "worker",
+      "provider": "openai",
+      "model": "openai/example-primary",
+      "max_estimated_cost_usd": 1.0
+    },
+    {
+      "option_id": "worker-secondary",
+      "priority": 20,
+      "route": "delegated",
+      "agent": "myrmex-worker",
+      "role": "worker",
+      "provider": "openai",
+      "model": "openai/example-secondary",
+      "max_estimated_cost_usd": 0.5
+    }
+  ]
+}
