@@ -97,6 +97,19 @@ def _plan_store():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_plan_store")
 
+
+def _work_unit_compiler():
+    """Load the reviewed-plan compiler only for P1 compile commands."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_backlog_normalizer.py",
+        "myrmex_plan_store.py", "myrmex_planner.py", "myrmex_work_unit_compiler.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_work_unit_compiler")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -472,6 +485,8 @@ def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
         "execution_driver": wu_spec.get("execution_driver"),
         "recovery_events": wu_spec.get("recovery_events", []),
     }
+    if wu_spec.get("work_order") is not None:
+        wu["work_order"] = copy.deepcopy(wu_spec["work_order"])
     data["work_units"].append(wu)
 
 
@@ -1426,6 +1441,68 @@ def cmd_plan_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compile_plan(args: argparse.Namespace, apply: bool) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        data = read_campaign(cid)
+        compiler = _work_unit_compiler()
+        preview = compiler.compile_reviewed_plan(
+            campaign_dir(cid), data, args.expect_revision, args.plan_revision_id,
+            protected_dirty_paths=args.protected_dirty_path or [],
+        )
+        if not apply:
+            print(json.dumps(preview, indent=2))
+            return 0
+        if data["status"] != "active":
+            raise ValueError("plan compilation apply requires an active campaign")
+        existing = {work_unit["id"]: work_unit for work_unit in data["work_units"]}
+        added = []
+        reused = []
+        for spec in preview["campaign_work_units"]:
+            prior = existing.get(spec["id"])
+            if prior is not None:
+                if prior.get("work_order") != spec["work_order"]:
+                    raise ValueError(f"compiled WU ID conflicts with existing campaign WU: {spec['id']}")
+                reused.append(spec["id"])
+                continue
+            add_wu_to_data(data, spec)
+            existing[spec["id"]] = data["work_units"][-1]
+            added.append(spec["id"])
+        compute_dag_order(data["work_units"], data["dag"]["edges"])
+        before_revision = data["revision"]
+        if added:
+            write_campaign(data, expected_revision=args.expect_revision)
+            append_event(cid, "PLAN_WORK_UNITS_COMPILED", f"Compiled reviewed plan {args.plan_revision_id}", {
+                "plan_revision_id": args.plan_revision_id, "compilation_digest": preview["compilation_digest"],
+                "added_work_units": added, "reused_work_units": reused,
+            })
+            after_revision = before_revision + 1
+            status = "APPLIED"
+        else:
+            after_revision = before_revision
+            status = "REUSED"
+        receipt = {
+            **preview, "status": status, "campaign_revision_before": before_revision,
+            "campaign_revision_after": after_revision, "added_work_units": added,
+            "reused_work_units": reused,
+        }
+        print(json.dumps(receipt, indent=2))
+        return 0
+    except Exception as exc:
+        code = "plan_compile_apply_failed" if apply else "plan_compile_preview_failed"
+        _intel_emit_error(code, str(exc))
+        return 1
+
+
+def cmd_plan_compile_preview(args: argparse.Namespace) -> int:
+    return _compile_plan(args, False)
+
+
+def cmd_plan_compile_apply(args: argparse.Namespace) -> int:
+    return _compile_plan(args, True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1488,6 +1565,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_wu_add.add_argument("--issue", type=int, help="Linked GitHub issue number")
     p_wu_add.add_argument("--corrections-budget", type=int)
     p_wu_add.set_defaults(func=cmd_wu_add)
+
+    p_compile_preview = sub.add_parser(
+        "plan-compile-preview", help="Preview deterministic WorkUnits from a reviewed plan without mutation",
+    )
+    p_compile_preview.add_argument("id", help="Campaign ID")
+    p_compile_preview.add_argument("--plan-revision-id", required=True)
+    p_compile_preview.add_argument("--expect-revision", required=True, type=int)
+    p_compile_preview.add_argument("--protected-dirty-path", action="append", default=[])
+    p_compile_preview.set_defaults(func=cmd_plan_compile_preview)
+
+    p_compile_apply = sub.add_parser(
+        "plan-compile-apply", help="Apply deterministic WorkUnits from a reviewed plan with campaign CAS",
+    )
+    p_compile_apply.add_argument("id", help="Campaign ID")
+    p_compile_apply.add_argument("--plan-revision-id", required=True)
+    p_compile_apply.add_argument("--expect-revision", required=True, type=int)
+    p_compile_apply.add_argument("--protected-dirty-path", action="append", default=[])
+    p_compile_apply.set_defaults(func=cmd_plan_compile_apply)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")

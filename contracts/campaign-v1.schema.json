@@ -297,6 +297,10 @@
         "recovery_events": {
           "type": "array",
           "items": {"type": "object"}
+        },
+        "work_order": {
+          "description": "Optional myrmex.work-order/v2 provenance and execution contract for plan-compiled WUs. Legacy campaign-v1 WUs may omit it.",
+          "type": "object"
         }
       }
     },
