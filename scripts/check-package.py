@@ -17,6 +17,7 @@ REQUIRED_AGENTS = {
     "myrmex-worker.md": "subagent",
     "myrmex-verifier.md": "subagent",
     "myrmex-planner.md": "subagent",
+    "myrmex-plan-critic.md": "subagent",
     "myrmex-frontier.md": "subagent",
 }
 EXPECTED_AGENT_STEPS = {
@@ -26,6 +27,7 @@ EXPECTED_AGENT_STEPS = {
     "myrmex-worker.md": "110",
     "myrmex-verifier.md": "90",
     "myrmex-planner.md": "90",
+    "myrmex-plan-critic.md": "90",
 }
 REQUIRED_SKILLS = {
     "myrmex-delegation",
@@ -58,6 +60,7 @@ REQUIRED_CONTRACTS = {
     "plan-revision-v1.schema.json",
     "planning-request-v1.schema.json",
     "planning-result-v1.schema.json",
+    "plan-review-v1.schema.json",
     "source-observation-v1.schema.json",
     "import-operation-v1.schema.json",
     "backlog-item-v1.schema.json",
@@ -216,6 +219,10 @@ def main() -> int:
     require_text(agent_dir / "myrmex-planner.md", [
         "edit: deny", "task: deny", '"mem_*": deny', '"playwright_*": deny',
         '"*": deny', '"git status*": allow', "planning-only", "myrmex.planning-result/v1",
+    ], errors)
+    require_text(agent_dir / "myrmex-plan-critic.md", [
+        "edit: deny", "task: deny", '"mem_*": deny', '"playwright_*": deny',
+        '"*": deny', '"git status*": allow', "review-only", "myrmex.plan-review/v1",
     ], errors)
     require_text(agent_dir / "myrmex-frontier.md", [
         '"*": deny', "edit: deny", "bash: deny", "task: deny",

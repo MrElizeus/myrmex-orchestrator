@@ -104,6 +104,7 @@ def main() -> int:
         "myrmex-worker.md": "subagent",
         "myrmex-verifier.md": "subagent",
         "myrmex-planner.md": "subagent",
+        "myrmex-plan-critic.md": "subagent",
         "myrmex-scout.md": "subagent",
         "myrmex-frontier.md": "subagent",
     }
@@ -140,6 +141,11 @@ def main() -> int:
         )
         require_text(
             agent_paths["myrmex-planner.md"],
+            ["edit: deny", "task: deny", '"mem_*": deny', '"git commit*": deny', '"git push*": deny', '"*": deny'],
+            errors,
+        )
+        require_text(
+            agent_paths["myrmex-plan-critic.md"],
             ["edit: deny", "task: deny", '"mem_*": deny', '"git commit*": deny', '"git push*": deny', '"*": deny'],
             errors,
         )

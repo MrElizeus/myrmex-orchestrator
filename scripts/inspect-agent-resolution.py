@@ -15,6 +15,7 @@ AGENTS = {
     "myrmex-worker": 110,
     "myrmex-verifier": 90,
     "myrmex-planner": 90,
+    "myrmex-plan-critic": 90,
     "myrmex-frontier": None,
 }
 DEFAULT_POLICY = {

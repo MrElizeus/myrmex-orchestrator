@@ -106,6 +106,7 @@ for target in \
   "$CONFIG_DIR/agents/myrmex-worker.md" \
   "$CONFIG_DIR/agents/myrmex-verifier.md" \
   "$CONFIG_DIR/agents/myrmex-planner.md" \
+  "$CONFIG_DIR/agents/myrmex-plan-critic.md" \
   "$CONFIG_DIR/agents/myrmex-frontier.md" \
   "$CONFIG_DIR/skills/myrmex-frontier-delegation" \
   "$BIN_DIR/myrmex-state" \

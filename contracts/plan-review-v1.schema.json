@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:plan-review:v1",
+  "title": "Myrmex Independent Plan Review v1",
+  "description": "A structured review produced by a critic task whose identity is distinct from the planner task. The review can advance a proposed plan to reviewed through the orchestrator when verdict is PASS, but it never activates a plan or authorizes repository effects. review_digest is SHA-256 over the canonical review envelope excluding review_digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "review_request_id", "run_id", "campaign_id", "objective_id",
+    "critic_task_id", "planner_task_id", "plan_revision_id", "plan_record_id",
+    "plan_digest", "plan_record_digest", "verdict", "checks", "defects",
+    "summary", "authority", "review_digest", "created_at"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.plan-review/v1"},
+    "review_request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "objective_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "critic_task_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,255}$"},
+    "planner_task_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,255}$"},
+    "plan_revision_id": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"},
+    "plan_record_id": {"type": "string", "pattern": "^planrec_[0-9a-f]{64}$"},
+    "plan_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "plan_record_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "verdict": {"enum": ["PASS", "REVISE", "BLOCKED", "INVALID"]},
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coverage", "scope", "verification", "dependencies", "risk", "unsupported_assumptions", "human_gates"],
+      "properties": {
+        "coverage": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "scope": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "verification": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "dependencies": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "risk": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "unsupported_assumptions": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+        "human_gates": {"enum": ["PASS", "FAIL", "BLOCKED"]}
+      }
+    },
+    "defects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["defect_id", "category", "severity", "message", "work_unit_ids", "evidence_references"],
+        "properties": {
+          "defect_id": {"type": "string", "pattern": "^PRD-[0-9]{3,6}$"},
+          "category": {"enum": ["coverage", "scope", "verification", "dependencies", "risk", "unsupported_assumptions", "human_gates", "identity", "structure"]},
+          "severity": {"enum": ["BLOCKING", "MAJOR", "MINOR"]},
+          "message": {"type": "string", "minLength": 1},
+          "work_unit_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"}},
+          "evidence_references": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "summary": {"type": "string", "minLength": 1},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "repository_write", "activate_plan", "create_work_units", "memory_write", "commit", "push", "merge", "release", "deploy"],
+      "properties": {
+        "scope": {"const": "review_only"},
+        "repository_write": {"const": false},
+        "activate_plan": {"const": false},
+        "create_work_units": {"const": false},
+        "memory_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false},
+        "merge": {"const": false},
+        "release": {"const": false},
+        "deploy": {"const": false}
+      }
+    },
+    "review_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

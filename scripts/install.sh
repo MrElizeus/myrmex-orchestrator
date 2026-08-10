@@ -60,7 +60,7 @@ check_args=(check --config "$CONFIG_FILE")
 ((SET_DEFAULT)) && check_args+=(--set-default)
 python3 "$ROOT/scripts/patch-opencode-config.py" "${check_args[@]}" >/dev/null
 
-AGENTS=(myrmex-orchestrator.md myrmex-worker.md myrmex-verifier.md myrmex-planner.md myrmex-scout.md myrmex-frontier.md)
+AGENTS=(myrmex-orchestrator.md myrmex-worker.md myrmex-verifier.md myrmex-planner.md myrmex-plan-critic.md myrmex-scout.md myrmex-frontier.md)
 SKILLS=(myrmex-delegation myrmex-frontier-delegation myrmex-memory myrmex-git-delivery)
 COMMANDS=(myrmex-doctor.md myrmex-frontier.md myrmex-frontier-interactive.md myrmex-direct.md myrmex-delegate.md myrmex-resume.md myrmex-status.md)
 
@@ -159,7 +159,7 @@ campaign_bin=pathlib.Path(sys.argv[8]); head_bin=pathlib.Path(sys.argv[9])
 myrmex_config=pathlib.Path(sys.argv[10]); myrmex_config_created=bool(int(sys.argv[11]))
 campaign_support=pathlib.Path(sys.argv[12])
 paths=[]
-for n in ['myrmex-orchestrator.md','myrmex-worker.md','myrmex-verifier.md','myrmex-planner.md','myrmex-scout.md','myrmex-frontier.md']:
+for n in ['myrmex-orchestrator.md','myrmex-worker.md','myrmex-verifier.md','myrmex-planner.md','myrmex-plan-critic.md','myrmex-scout.md','myrmex-frontier.md']:
     paths.append(config/'agents'/n)
 for skill in ['myrmex-delegation','myrmex-frontier-delegation','myrmex-memory','myrmex-git-delivery']:
     paths.extend(p for p in (config/'skills'/skill).rglob('*') if p.is_file())
