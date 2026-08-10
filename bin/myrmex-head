@@ -29,14 +29,24 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 import scripts.opencode_transport as opencode_transport
 import scripts.myrmex_worktree as myrmex_worktree
 import scripts.myrmex_task_operation as myrmex_task_operation
+import myrmex_campaign_intelligence as campaign_intel
+import myrmex_priority_policy as priority_policy
+import myrmex_replanning as replanning
+import myrmex_route_model_policy as route_model_policy
 
 
 def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def canonical_sha(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def run_argv(
@@ -192,6 +202,14 @@ class InvalidVerifierReceiptError(ExecutionDriverError):
 
 
 class InvalidProductionContractError(ExecutionDriverError):
+    pass
+
+
+class SequentialSchedulerError(ExecutionDriverError):
+    pass
+
+
+class SequentialSchedulerStale(SequentialSchedulerError):
     pass
 
 
@@ -871,11 +889,15 @@ class CampaignSupervisor:
         once: bool = False,
         state_home: str | None = None,
         allow_fixture_driver: bool = False,
+        route_model_policy_path: str | None = None,
+        route_model_availability_path: str | None = None,
     ) -> None:
         self.target_campaign_id = campaign_id
         self.poll_interval = max(1, poll_interval)
         self.once = once
         self.allow_fixture_driver = allow_fixture_driver
+        self.route_model_policy_path = route_model_policy_path
+        self.route_model_availability_path = route_model_availability_path
         self.running = True
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
@@ -958,7 +980,7 @@ class CampaignSupervisor:
             raise RuntimeError(f"failed to read campaign {cid}: {proc.stderr}")
         return json.loads(proc.stdout)
 
-    def ensure_myrmex_state_run(self, cid: str, data: dict[str, Any], wu: dict[str, Any], repo_root: str, branch: str, base_sha: str) -> str:
+    def ensure_myrmex_state_run(self, cid: str, data: dict[str, Any], wu: dict[str, Any], repo_root: str, branch: str, base_sha: str, execution_policy: str = "auto") -> str:
         """Ensures a durable myrmex-state run exists for this work unit with authorized commit policy."""
         run_id = wu.get("run_id")
         if run_id:
@@ -977,7 +999,7 @@ class CampaignSupervisor:
             "--scope", "continuous",
             "--commit-policy", "authorized",
             "--push-policy", "deny",
-            "--execution-policy", "auto",
+            "--execution-policy", execution_policy,
             "--objective", wu["objective"],
             "--parent-objective", f"Campaign {cid}",
         ]
@@ -1143,6 +1165,250 @@ class CampaignSupervisor:
             return FixtureCommandDriver(allowed=True)
 
         return OpenCodeTaskDriver()
+
+    def _campaign_dir(self, cid: str) -> Path:
+        base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))
+        return base / "myrmex" / "campaigns" / cid
+
+    def _p1_plan_id(self, data: dict[str, Any]) -> str | None:
+        plan_bound = []
+        for wu in data.get("work_units", []):
+            order = wu.get("work_order") if isinstance(wu, dict) else None
+            provenance = order.get("plan_provenance") if isinstance(order, dict) else None
+            plan_id = provenance.get("plan_revision_id") if isinstance(provenance, dict) else None
+            if isinstance(order, dict) and order.get("schema") == "myrmex.work-order/v2" and isinstance(plan_id, str):
+                plan_bound.append((wu, plan_id))
+        if not plan_bound:
+            return None
+        plan_ids = {plan_id for _, plan_id in plan_bound}
+        if len(plan_ids) != 1:
+            raise SequentialSchedulerError("P1 intelligence has work units from multiple plan revisions")
+        plan_id = next(iter(plan_ids))
+        for wu in data.get("work_units", []):
+            if wu.get("status") not in {"completed", "cancelled", "superseded"}:
+                order = wu.get("work_order") if isinstance(wu, dict) else None
+                provenance = order.get("plan_provenance") if isinstance(order, dict) else None
+                if not isinstance(provenance, dict) or provenance.get("plan_revision_id") != plan_id:
+                    raise SequentialSchedulerError("P1 intelligence cannot fall back to a legacy non-plan-bound work unit")
+        return plan_id
+
+    def _active_plan(self, cid: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            return replanning._active_activation(self._campaign_dir(cid), cid)
+        except Exception as exc:
+            raise SequentialSchedulerError(f"active plan/activation receipt unavailable: {exc}") from exc
+
+    @staticmethod
+    def _read_policy_file(path_value: str | None, label: str) -> dict[str, Any]:
+        if not path_value:
+            raise SequentialSchedulerError(f"P1 scheduling requires explicit {label}")
+        path = Path(path_value).expanduser()
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise SequentialSchedulerError(f"{label} path unavailable or unsafe")
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, SequentialSchedulerError):
+                raise
+            raise SequentialSchedulerError(f"{label} is unreadable") from exc
+        if not isinstance(value, dict):
+            raise SequentialSchedulerError(f"{label} must be a JSON object")
+        return value
+
+    def _route_inputs(self, data: dict[str, Any], wu: dict[str, Any], head: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        policy_source = self._read_policy_file(self.route_model_policy_path, "route/model policy")
+        availability_source = self._read_policy_file(self.route_model_availability_path, "route/model availability")
+        policy = route_model_policy.compile_policy(policy_source)
+        budgets = data.get("budgets", {})
+        cost_limit = budgets.get("cost_limit_usd")
+        estimated = budgets.get("estimated_cost_usd")
+        if cost_limit is None:
+            headroom = max(option["max_estimated_cost_usd"] for option in policy["options"])
+        elif estimated is None:
+            raise SequentialSchedulerError("campaign cost limit is set but current estimated cost is unknown")
+        elif isinstance(cost_limit, bool) or isinstance(estimated, bool) or not isinstance(cost_limit, (int, float)) or not isinstance(estimated, (int, float)):
+            raise SequentialSchedulerError("campaign cost budget is invalid")
+        else:
+            headroom = max(0, cost_limit - estimated)
+        request = {
+            "schema": route_model_policy.REQUEST_SCHEMA, "work_unit_id": wu["id"],
+            "plan_revision_id": head["plan_revision_id"], "plan_revision_digest": head["plan_digest"],
+            "required_route": wu["required_route"], "required_role": "worker",
+            "budget_headroom_usd": headroom,
+        }
+        return request, policy_source, availability_source
+
+    def _check_driver_decision(self, data: dict[str, Any], wu: dict[str, Any], route_decision: dict[str, Any]) -> WorkUnitExecutionDriver:
+        selected = route_decision.get("selected")
+        if route_decision.get("status") != "SELECTED" or not isinstance(selected, dict):
+            blocker = route_decision.get("blocker", {}).get("code", "NO_ELIGIBLE_ROUTE_MODEL_OPTION")
+            raise SequentialSchedulerError(f"route/model selection blocked: {blocker}")
+        driver = self.resolve_execution_driver(data, wu)
+        if isinstance(driver, FixtureCommandDriver):
+            if not self.allow_fixture_driver or selected.get("provider") != "fixture":
+                raise SequentialSchedulerError("fixture driver requires explicit fixture provider policy and --allow-fixture-driver")
+        elif (
+            selected.get("route") != "delegated"
+            or selected.get("agent") != "myrmex-worker"
+            or selected.get("provider") == "fixture"
+        ):
+            raise SequentialSchedulerError("production OpenCode driver requires a delegated myrmex-worker non-fixture decision")
+        return driver
+
+    @staticmethod
+    def _put_decision(campaign_dir: Path, data: dict[str, Any], artifact_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return campaign_intel.put_artifact(
+            campaign_dir, data["id"], data["revision"], "decision", artifact_id, payload,
+        )
+
+    def _dispatch_intent(
+        self,
+        data: dict[str, Any], wu: dict[str, Any], head: dict[str, Any], activation_receipt: dict[str, Any],
+        schedule: dict[str, Any], route_decision: dict[str, Any], driver: WorkUnitExecutionDriver,
+    ) -> dict[str, Any]:
+        order = wu["work_order"]
+        body = {
+            "schema": "myrmex.sequential-dispatch-intent/v1", "status": "READY",
+            "campaign_id": data["id"], "campaign_revision": data["revision"],
+            "campaign_state_digest": canonical_sha(data), "observed_campaign_updated_at": data["updated_at"],
+            "work_unit_id": wu["id"], "work_order_id": order["work_order_id"],
+            "work_order_digest": order["work_order_digest"], "plan_revision_id": head["plan_revision_id"],
+            "plan_digest": head["plan_digest"], "active_record_id": head["record_id"],
+            "activation_id": activation_receipt["activation_id"],
+            "scheduling_artifact_id": "scheduling-decision/" + schedule["decision_id"],
+            "scheduling_decision_digest": schedule["decision_digest"],
+            "route_model_artifact_id": "route-model-decision/" + route_decision["decision_id"],
+            "route_model_decision_digest": route_decision["decision_digest"],
+            "selected_route": route_decision["selected"]["route"],
+            "selected_agent": route_decision["selected"]["agent"],
+            "selected_provider": route_decision["selected"]["provider"],
+            "selected_model": route_decision["selected"]["model"],
+            "execution_driver": driver.driver_name, "created_at": data["updated_at"],
+            "authority": {
+                "scope": "sequential_dispatch_intent", "dispatch_one_work_unit": True,
+                "activate_plan": False, "create_work_units": False,
+                "repository_write": False, "commit": False, "push": False,
+            },
+        }
+        digest = canonical_sha(body)
+        return {**body, "dispatch_id": "dispatch_" + digest, "dispatch_digest": digest}
+
+    @staticmethod
+    def _validate_dispatch_intent(intent: Any) -> None:
+        if not isinstance(intent, dict) or intent.get("schema") != "myrmex.sequential-dispatch-intent/v1" or intent.get("status") != "READY":
+            raise SequentialSchedulerError("sequential dispatch intent schema/status invalid")
+        body = {key: value for key, value in intent.items() if key not in {"dispatch_id", "dispatch_digest"}}
+        digest = canonical_sha(body)
+        if intent.get("dispatch_digest") != digest or intent.get("dispatch_id") != "dispatch_" + digest:
+            raise SequentialSchedulerError("sequential dispatch intent digest invalid")
+        authority = intent.get("authority")
+        if not isinstance(authority, dict) or authority.get("scope") != "sequential_dispatch_intent" or authority.get("dispatch_one_work_unit") is not True or any(authority.get(key) is not False for key in ("activate_plan", "create_work_units", "repository_write", "commit", "push")):
+            raise SequentialSchedulerError("sequential dispatch intent authority invalid")
+
+    def _revalidate_p1_dispatch(self, cid: str, context: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_campaign_data(cid)
+        intent = context["intent"]
+        if current["revision"] != intent["campaign_revision"] or canonical_sha(current) != intent["campaign_state_digest"]:
+            raise SequentialSchedulerStale("campaign or ready set changed after scheduling decision")
+        if current.get("active_work_unit") is not None or any(wu.get("status") == "active" for wu in current["work_units"]):
+            raise SequentialSchedulerStale("a work unit was already dispatched")
+        head, receipt = self._active_plan(cid)
+        if head["record_id"] != intent["active_record_id"] or head["plan_revision_id"] != intent["plan_revision_id"] or head["plan_digest"] != intent["plan_digest"] or receipt["activation_id"] != intent["activation_id"]:
+            raise SequentialSchedulerStale("active plan changed after scheduling decision")
+        schedule = priority_policy.preview_schedule(self._campaign_dir(cid), cid, current["revision"])
+        if schedule != context["schedule"] or schedule["selected_work_unit_id"] != intent["work_unit_id"]:
+            raise SequentialSchedulerStale("scheduling decision is stale")
+        wu = next((item for item in current["work_units"] if item["id"] == intent["work_unit_id"]), None)
+        if wu is None:
+            raise SequentialSchedulerStale("selected work unit disappeared")
+        request, policy, availability = self._route_inputs(current, wu, head)
+        route_decision = route_model_policy.decide(request, policy, availability)
+        if route_decision != context["route_decision"]:
+            raise SequentialSchedulerStale("route/model decision inputs changed")
+        driver = self._check_driver_decision(current, wu, route_decision)
+        if driver.driver_name != intent["execution_driver"]:
+            raise SequentialSchedulerStale("execution driver changed after dispatch intent")
+        return {**context, "data": current, "wu": wu, "driver": driver}
+
+    def _prepare_p1_dispatch(self, cid: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        plan_id = self._p1_plan_id(data)
+        if plan_id is None:
+            return None
+        head, activation_receipt = self._active_plan(cid)
+        if head["plan_revision_id"] != plan_id:
+            raise SequentialSchedulerError("campaign work units do not match the exact active plan revision")
+        schedule = priority_policy.preview_schedule(self._campaign_dir(cid), cid, data["revision"])
+        selected_id = schedule["selected_work_unit_id"]
+        if selected_id is None:
+            return {"no_eligible": True, "schedule": schedule}
+        wu = next((item for item in data["work_units"] if item["id"] == selected_id), None)
+        if wu is None:
+            raise SequentialSchedulerError("priority policy selected an unavailable work unit")
+        request, policy, availability = self._route_inputs(data, wu, head)
+        route_decision = route_model_policy.decide(request, policy, availability)
+        campaign_dir = self._campaign_dir(cid)
+        self._put_decision(campaign_dir, data, "scheduling-decision/" + schedule["decision_id"], schedule)
+        self._put_decision(campaign_dir, data, "route-model-decision/" + route_decision["decision_id"], route_decision)
+        driver = self._check_driver_decision(data, wu, route_decision)
+        intent = self._dispatch_intent(data, wu, head, activation_receipt, schedule, route_decision, driver)
+        self._validate_dispatch_intent(intent)
+        self._put_decision(campaign_dir, data, "sequential-dispatch/intent/" + intent["dispatch_id"], intent)
+        return self._revalidate_p1_dispatch(cid, {
+            "schedule": schedule, "route_decision": route_decision, "intent": intent,
+            "data": data, "wu": wu, "driver": driver,
+        })
+
+    def _resume_p1_dispatch(self, cid: str, data: dict[str, Any], wu: dict[str, Any]) -> dict[str, Any]:
+        plan_id = self._p1_plan_id(data)
+        if plan_id is None:
+            raise SequentialSchedulerError("legacy active work unit has no P1 dispatch context")
+        head, receipt = self._active_plan(cid)
+        if head["plan_revision_id"] != plan_id:
+            raise SequentialSchedulerStale("active plan changed while work unit was dispatched")
+        listing = campaign_intel.list_artifacts(self._campaign_dir(cid), cid, kind="decision")
+        if listing.get("status") != "healthy":
+            raise SequentialSchedulerError("decision projection unavailable for dispatch recovery")
+        candidates = []
+        for descriptor in listing["artifacts"]["decision"]:
+            artifact_id = descriptor["artifact_id"]
+            if not artifact_id.startswith("sequential-dispatch/intent/"):
+                continue
+            intent = campaign_intel.get_artifact(self._campaign_dir(cid), cid, artifact_id)["artifact"]["payload"]
+            self._validate_dispatch_intent(intent)
+            if intent["work_unit_id"] == wu["id"] and intent["plan_revision_id"] == plan_id and intent["active_record_id"] == head["record_id"]:
+                candidates.append(intent)
+        if not candidates:
+            raise SequentialSchedulerError("active P1 work unit lacks a persisted dispatch intent")
+        latest_revision = max(item["campaign_revision"] for item in candidates)
+        latest = [item for item in candidates if item["campaign_revision"] == latest_revision]
+        if len(latest) != 1:
+            raise SequentialSchedulerError("active P1 work unit has ambiguous dispatch intents")
+        intent = latest[0]
+        schedule = campaign_intel.get_artifact(self._campaign_dir(cid), cid, intent["scheduling_artifact_id"])["artifact"]["payload"]
+        route_decision = campaign_intel.get_artifact(self._campaign_dir(cid), cid, intent["route_model_artifact_id"])["artifact"]["payload"]
+        priority_policy.validate_decision(schedule); route_model_policy.validate_decision(route_decision)
+        if schedule["selected_work_unit_id"] != wu["id"] or route_decision["request"]["work_unit_id"] != wu["id"] or route_decision["request"]["plan_revision_id"] != plan_id:
+            raise SequentialSchedulerError("recovered dispatch decision binding invalid")
+        driver = self._check_driver_decision(data, wu, route_decision)
+        if driver.driver_name != intent["execution_driver"] or receipt["activation_id"] != intent["activation_id"]:
+            raise SequentialSchedulerStale("recovered dispatch driver/activation changed")
+        return {"schedule": schedule, "route_decision": route_decision, "intent": intent, "data": data, "wu": wu, "driver": driver}
+
+    def _attach_dispatch_run(self, cid: str, dispatch: dict[str, Any], run_id: str) -> None:
+        intent = dispatch["intent"]
+        data = self.get_campaign_data(cid)
+        body = {
+            "schema": "myrmex.sequential-dispatch-run/v1", "dispatch_id": intent["dispatch_id"],
+            "dispatch_digest": intent["dispatch_digest"], "campaign_id": cid,
+            "campaign_revision": intent["campaign_revision"], "work_unit_id": intent["work_unit_id"],
+            "run_id": run_id, "scheduling_decision_digest": intent["scheduling_decision_digest"],
+            "route_model_decision_digest": intent["route_model_decision_digest"],
+            "execution_driver": intent["execution_driver"],
+            "authority": {"scope": "dispatch_run_binding", "dispatch": False, "repository_write": False, "commit": False, "push": False},
+        }
+        digest = canonical_sha(body)
+        record = {**body, "binding_id": "dispatchrun_" + digest, "binding_digest": digest}
+        self._put_decision(self._campaign_dir(cid), data, "sequential-dispatch/run/" + record["binding_id"], record)
 
     def produce_governed_commit(
         self,
@@ -1417,7 +1683,7 @@ class CampaignSupervisor:
             current_head=current_head,
         )
 
-    def run_work_unit(self, cid: str, data: dict[str, Any], wu: dict[str, Any]) -> bool:
+    def run_work_unit(self, cid: str, data: dict[str, Any], wu: dict[str, Any], dispatch: dict[str, Any] | None = None) -> bool:
         """Executes the closed-loop autonomous cycle for one work unit with production drivers."""
         wuid = wu["id"]
         repo_root = Path(data.get("repository_root") or os.getcwd()).resolve()
@@ -1443,7 +1709,13 @@ class CampaignSupervisor:
                 base_sha = "0" * 40
 
         # 2. Initialize or recover durable myrmex-state run
-        run_id = self.ensure_myrmex_state_run(cid, data, wu, str(repo_root), branch, base_sha)
+        execution_policy = "auto"
+        if dispatch is not None:
+            selected_route = dispatch["route_decision"]["selected"]["route"]
+            execution_policy = {"direct": "direct-only", "delegated": "delegated", "frontier": "frontier"}[selected_route]
+        run_id = self.ensure_myrmex_state_run(cid, data, wu, str(repo_root), branch, base_sha, execution_policy)
+        if dispatch is not None:
+            self._attach_dispatch_run(cid, dispatch, run_id)
 
         # 3. Select execution driver
         try:
@@ -1945,8 +2217,26 @@ class CampaignSupervisor:
             if active_wuid:
                 wu = next((w for w in data["work_units"] if w["id"] == active_wuid), None)
                 if wu and wu["status"] not in {"completed", "blocked", "failed", "cancelled"}:
+                    try:
+                        plan_id = self._p1_plan_id(data)
+                        dispatch = self._resume_p1_dispatch(cid, data, wu) if plan_id is not None else None
+                    except SequentialSchedulerError as exc:
+                        sys.stderr.write(f"[myrmex-head] [{cid}] P1 dispatch recovery blocked: {exc}\n")
+                        return False
                     self.heartbeat_lease(cid)
-                    return self.run_work_unit(cid, data, wu)
+                    return self.run_work_unit(cid, data, wu, dispatch)
+
+            try:
+                p1_dispatch = self._prepare_p1_dispatch(cid, data)
+            except SequentialSchedulerError as exc:
+                sys.stderr.write(f"[myrmex-head] [{cid}] P1 scheduling blocked without FIFO fallback: {exc}\n")
+                return False
+            if p1_dispatch is not None:
+                if p1_dispatch.get("no_eligible"):
+                    sys.stdout.write(f"[myrmex-head] [{cid}] P1 policy found no eligible work unit; FIFO fallback is disabled.\n")
+                    return False
+                self.heartbeat_lease(cid)
+                return self.run_work_unit(cid, p1_dispatch["data"], p1_dispatch["wu"], p1_dispatch)
 
             cmd_dag = [sys.executable, str(ROOT / "bin/myrmex-campaign"), "dag", cid]
             proc = subprocess.run(cmd_dag, capture_output=True, text=True)
@@ -2019,6 +2309,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=int, default=5, help="Polling interval in seconds (default: 5)")
     parser.add_argument("--state-home", help="Custom XDG_STATE_HOME path")
     parser.add_argument("--allow-fixture-driver", action="store_true", help="Allow FixtureCommandDriver execution for testing")
+    parser.add_argument("--route-model-policy", help="Explicit P1 route/model policy JSON (required for plan-bound campaigns)")
+    parser.add_argument("--route-model-availability", help="Explicit P1 agent/provider/model availability JSON (required for plan-bound campaigns)")
     args = parser.parse_args(argv)
 
     supervisor = CampaignSupervisor(
@@ -2027,6 +2319,8 @@ def main(argv: list[str] | None = None) -> int:
         once=args.once,
         state_home=args.state_home,
         allow_fixture_driver=args.allow_fixture_driver,
+        route_model_policy_path=args.route_model_policy,
+        route_model_availability_path=args.route_model_availability,
     )
     return supervisor.run()
 
