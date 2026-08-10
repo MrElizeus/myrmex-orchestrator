@@ -652,6 +652,44 @@ def get_plan_head(campaign_dir, campaign_id, plan_revision_id: str) -> dict[str,
     return chain[-1]
 
 
+def get_plan_chain(campaign_dir, campaign_id, plan_revision_id: str) -> list[dict[str, Any]]:
+    """Return one fully validated lifecycle chain in authoritative order."""
+    if not isinstance(plan_revision_id, str) or not PLAN_REVISION_ID_RE.fullmatch(plan_revision_id):
+        raise PlanRecordInvalid("plan_revision_id must match ^plan_[0-9a-f]{64}$")
+    chain = _load_plan_chain(campaign_dir, campaign_id, plan_revision_id)
+    if not chain:
+        raise PlanRecordNotFound(f"no records for plan revision {plan_revision_id}")
+    return chain
+
+
+def list_plan_records(campaign_dir, campaign_id) -> dict[str, Any]:
+    """Build a deterministic read-only projection from validated records."""
+    records = _list_plan_record_envelopes(campaign_dir, campaign_id)
+    revision_ids = sorted({record["plan_revision_id"] for record in records})
+    descriptors: list[dict[str, Any]] = []
+    for revision_id in revision_ids:
+        chain = _load_plan_chain(campaign_dir, campaign_id, revision_id)
+        for index, record in enumerate(chain):
+            descriptors.append({
+                "plan_revision_id": revision_id,
+                "plan_digest": record["plan_digest"],
+                "record_id": record["record_id"],
+                "record_digest": record["record_digest"],
+                "previous_record_id": record["previous_record_id"],
+                "lifecycle_status": record["lifecycle_status"],
+                "created_at": record["created_at"],
+                "chain_index": index,
+                "is_head": index == len(chain) - 1,
+            })
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "plan_revision_count": len(revision_ids),
+        "record_count": len(descriptors),
+        "records": descriptors,
+    }
+
+
 def _policy_reject(record: dict[str, Any]) -> None:
     try:
         intel.reject_secret_or_raw(record)

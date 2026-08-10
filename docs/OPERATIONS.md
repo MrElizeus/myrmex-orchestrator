@@ -493,3 +493,7 @@ Planner requests and responses are addressed by the SHA-256 of their request ID.
 `myrmex-campaign backlog-import <campaign> --sources-json <file|->` validates exact source-observation/neutral pairs and writes immutable `myrmex.backlog-item/v1` artifacts followed by one `myrmex.backlog-snapshot/v1` completion marker. The input object must contain exactly `sources`; use `--previous-snapshot-digest` to classify a semantic replay as unchanged. Invalid, unavailable, ambiguous, mismatched, or secret-bearing input fails before a snapshot is confirmed and never creates WUs.
 
 `myrmex-campaign backlog-show <campaign> --snapshot-record-id <blsnaprec_...>` loads the authoritative snapshot and every referenced item directly from immutable artifacts, validates runtime semantics, and rejects missing, corrupt, or mismatched descriptors. Neither command mutates `campaign.json`, the DAG, repository files, or plan activation state.
+
+## Immutable plan-store inspection
+
+`myrmex-campaign plan-list <campaign>` reconstructs every plan lifecycle from authoritative artifacts and returns deterministic record descriptors with exact head markers. `myrmex-campaign plan-show <campaign> --record-id <planrec_...>` returns one validated immutable record; `--plan-revision-id <plan_...>` returns the complete ordered chain and current head. Missing records use the stable not-found exit code 4. These P1-007 commands are read-only and intentionally provide no `plan-activate` surface; governed activation belongs to P1-012.

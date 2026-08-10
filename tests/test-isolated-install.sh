@@ -77,6 +77,14 @@ set -e
   echo "installed backlog CLI failed to load packaged support modules" >&2
   exit 1
 }
+INSTALLED_PLAN_OUTPUT="$(OPENCODE_CONFIG_DIR="$CONFIG" XDG_STATE_HOME="$INSTALL_STATE" \
+  "$BIN/myrmex-campaign" plan-list camp-installed-backlog)"
+python3 - "$INSTALLED_PLAN_OUTPUT" <<'PY'
+import json, sys
+payload=json.loads(sys.argv[1])
+assert payload['ok'] is True
+assert payload['record_count'] == 0
+PY
 
 "$ROOT/scripts/uninstall.sh" --config-dir "$CONFIG" >"$TMP/uninstall-1.log"
 echo "    uninstall and preservation: OK"

@@ -84,6 +84,19 @@ def _backlog_normalizer():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_backlog_normalizer")
 
+
+def _plan_store():
+    """Load the immutable plan store only for dedicated P1 plan commands."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py",
+        "myrmex_plan_store.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_plan_store")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -1371,6 +1384,44 @@ def cmd_backlog_show(args: argparse.Namespace) -> int:
     return 0
 
 
+# Immutable plan-store reads (WU-P1-007). Activation intentionally remains
+# absent here; only P1-012 may cross PlanActivationAuthorityRequired.
+def cmd_plan_list(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        plans = _plan_store()
+        result = plans.list_plan_records(campaign_dir(cid), cid)
+    except Exception as exc:
+        _intel_emit_error("plan_list_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_plan_show(args: argparse.Namespace) -> int:
+    cid = args.id
+    try:
+        validate_campaign_id(cid)
+        read_campaign(cid)
+        plans = _plan_store()
+        if args.record_id is not None:
+            record = plans.get_plan_record(campaign_dir(cid), cid, args.record_id)
+            result = {"ok": True, "mode": "record", "record": record}
+        else:
+            chain = plans.get_plan_chain(campaign_dir(cid), cid, args.plan_revision_id)
+            result = {"ok": True, "mode": "revision", "head": chain[-1], "chain": chain}
+    except Exception as exc:
+        if type(exc).__name__ == "PlanRecordNotFound":
+            _intel_emit_error("not_found", str(exc))
+            return 4
+        _intel_emit_error("plan_show_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1588,6 +1639,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_backlog_show.add_argument("id", help="Campaign ID")
     p_backlog_show.add_argument("--snapshot-record-id", required=True)
     p_backlog_show.set_defaults(func=cmd_backlog_show)
+
+    p_plan_list = sub.add_parser(
+        "plan-list",
+        help="List validated immutable plan lifecycle records without activation authority",
+    )
+    p_plan_list.add_argument("id", help="Campaign ID")
+    p_plan_list.set_defaults(func=cmd_plan_list)
+
+    p_plan_show = sub.add_parser(
+        "plan-show",
+        help="Show one immutable plan record or one complete revision lifecycle",
+    )
+    p_plan_show.add_argument("id", help="Campaign ID")
+    p_plan_show_identity = p_plan_show.add_mutually_exclusive_group(required=True)
+    p_plan_show_identity.add_argument("--record-id")
+    p_plan_show_identity.add_argument("--plan-revision-id")
+    p_plan_show.set_defaults(func=cmd_plan_show)
 
     return p
 

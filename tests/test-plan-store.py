@@ -351,6 +351,43 @@ def main() -> None:
         doc = intel.doctor(str(campaign_dir), campaign_id)
         check(doc.get("status") == "healthy", "doctor healthy after projection recovery")
 
+        # Dedicated read-only CLI exposes records and complete chains, never activation.
+        cli_env = dict(os.environ, XDG_STATE_HOME=str(tmp / "state"))
+        cli_list = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "plan-list", campaign_id,
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_list.returncode == 0, f"plan-list CLI succeeds: {cli_list.stderr} {cli_list.stdout}")
+        if cli_list.returncode == 0:
+            listed = json.loads(cli_list.stdout)
+            check(listed["record_count"] == count_plan_artifacts(campaign_dir), "plan-list validates every plan record")
+            check(any(d["record_id"] == r_crash["head_record_id"] and d["is_head"] for d in listed["records"]), "plan-list marks lifecycle head")
+        cli_record = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "plan-show", campaign_id,
+            "--record-id", proposed["record_id"],
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_record.returncode == 0, f"plan-show record succeeds: {cli_record.stderr} {cli_record.stdout}")
+        if cli_record.returncode == 0:
+            shown = json.loads(cli_record.stdout)
+            check(shown["record"] == proposed, "plan-show record returns exact immutable payload")
+        cli_revision = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "plan-show", campaign_id,
+            "--plan-revision-id", proposed["plan_revision_id"],
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_revision.returncode == 0, f"plan-show revision succeeds: {cli_revision.stderr} {cli_revision.stdout}")
+        if cli_revision.returncode == 0:
+            revision_view = json.loads(cli_revision.stdout)
+            check(revision_view["head"]["record_id"] == r_crash["head_record_id"], "plan-show revision returns exact head")
+            check([r["record_id"] for r in revision_view["chain"]] == [proposed["record_id"], reviewed["record_id"], validated["record_id"], r_crash["head_record_id"]], "plan-show revision preserves chain order")
+        cli_missing = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "plan-show", campaign_id,
+            "--record-id", "planrec_" + "0" * 64,
+        ], capture_output=True, text=True, env=cli_env)
+        check(cli_missing.returncode == 4, "plan-show missing record has stable not-found exit")
+        help_text = subprocess.run([
+            str(ROOT / "bin" / "myrmex-campaign"), "--help",
+        ], capture_output=True, text=True).stdout
+        check("plan-activate" not in help_text, "P1-007 CLI has no activation command")
+
         # Campaign immutability + no WU/DAG
         camp_file = next(campaign_dir.glob("campaign.json"))
         camp_before = camp_file.read_bytes()
