@@ -165,6 +165,18 @@ def _priority_policy_runtime():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_priority_policy")
 
+
+def _observability_runtime():
+    """Load reconstructible, non-authoritative P1 campaign observability."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_campaign_observability.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_campaign_observability")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -1238,6 +1250,19 @@ def cmd_blocker_add(args: argparse.Namespace) -> int:
 
 
 def cmd_timeline(args: argparse.Namespace) -> int:
+    if getattr(args, "observability", False):
+        try:
+            read_campaign(args.id)
+            events = _observability_runtime().timeline(campaign_dir(args.id), args.id)
+        except Exception as exc:
+            _intel_emit_error("observability_timeline_failed", str(exc))
+            return 1
+        if args.json:
+            print(json.dumps(events, indent=2))
+        else:
+            for event in events:
+                print(f"[{event['observed_at']}] {event['kind']:<10} {event['observation_id']}")
+        return 0
     cdir = campaign_dir(args.id)
     efile = cdir / "events.jsonl"
     if not efile.is_file():
@@ -1254,6 +1279,77 @@ def cmd_timeline(args: argparse.Namespace) -> int:
         for ev in events:
             print(f"[{ev['timestamp']}] {ev['event_type']:<24} {ev['message']}")
     return 0
+
+
+def cmd_observation_record(args: argparse.Namespace) -> int:
+    try:
+        data = read_campaign(args.id)
+        result = _observability_runtime().record_campaign_observation(
+            campaign_dir(args.id), data, args.observed_at,
+        )
+    except Exception as exc:
+        _intel_emit_error("campaign_observation_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_cost_observation_record(args: argparse.Namespace) -> int:
+    try:
+        data = read_campaign(args.id)
+        source = intel.read_input_json(args.input_json, data["repository_root"], campaign_dir(args.id))
+        result = _observability_runtime().record_cost_observation(
+            campaign_dir(args.id), args.id, data["revision"], source,
+        )
+    except Exception as exc:
+        _intel_emit_error("cost_observation_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        data = read_campaign(args.id)
+        result = _observability_runtime().status(campaign_dir(args.id), data)
+    except Exception as exc:
+        _intel_emit_error("observability_status_failed", str(exc))
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        projection = result["projection"]
+        progress = projection["progress"]
+        cost = projection["cost"]
+        print(f"Campaign:      {args.id}")
+        print(f"Consistency:   {result['consistency']['status']}")
+        print(f"Progress:      {progress['completed_work_units']}/{progress['total_work_units']}")
+        print(f"Critical Path: {' -> '.join(projection['critical_path']['work_unit_ids']) or '<none>'}")
+        print(f"Projected USD: {cost['projected_total_usd'] if cost['projected_total_usd'] is not None else '<unknown>'}")
+        print(f"Blockers:      {len(projection['blockers'])}")
+    return 0
+
+
+def cmd_observability_rebuild(args: argparse.Namespace) -> int:
+    try:
+        read_campaign(args.id)
+        result = _observability_runtime().rebuild_projection(campaign_dir(args.id), args.id)
+    except Exception as exc:
+        _intel_emit_error("observability_rebuild_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_observability_audit(args: argparse.Namespace) -> int:
+    try:
+        data = read_campaign(args.id)
+        result = _observability_runtime().consistency_audit(campaign_dir(args.id), data)
+    except Exception as exc:
+        _intel_emit_error("observability_audit_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] == "PASS" else 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1921,7 +2017,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_tl = sub.add_parser("timeline", help="Inspect campaign events timeline")
     p_tl.add_argument("id", help="Campaign ID")
     p_tl.add_argument("--json", action="store_true")
+    p_tl.add_argument("--observability", action="store_true", help="Show immutable campaign/cost observation timeline")
     p_tl.set_defaults(func=cmd_timeline)
+
+    p_obs = sub.add_parser("observation-record", help="Record an immutable campaign progress/source observation")
+    p_obs.add_argument("id", help="Campaign ID")
+    p_obs.add_argument("--observed-at", required=True, help="Explicit timezone-aware observation timestamp")
+    p_obs.set_defaults(func=cmd_observation_record)
+
+    p_cost = sub.add_parser("cost-observation-record", help="Record an immutable known-or-unknown cost observation")
+    p_cost.add_argument("id", help="Campaign ID")
+    p_cost.add_argument("--input-json", required=True, help="Cost observation JSON object outside the campaign repository")
+    p_cost.set_defaults(func=cmd_cost_observation_record)
+
+    p_status = sub.add_parser("status", help="Show the non-authoritative campaign observability projection")
+    p_status.add_argument("id", help="Campaign ID")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
+
+    p_obs_rebuild = sub.add_parser("observability-rebuild", help="Rebuild observability projection from immutable observations")
+    p_obs_rebuild.add_argument("id", help="Campaign ID")
+    p_obs_rebuild.set_defaults(func=cmd_observability_rebuild)
+
+    p_obs_audit = sub.add_parser("observability-audit", help="Audit projection, campaign, event, and artifact consistency")
+    p_obs_audit.add_argument("id", help="Campaign ID")
+    p_obs_audit.set_defaults(func=cmd_observability_audit)
 
     # campaign intelligence sidecar (WU-P1-002)
     p_ic_put = sub.add_parser(

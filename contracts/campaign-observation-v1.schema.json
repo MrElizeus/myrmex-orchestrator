@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:campaign-observation:v1",
+  "title": "Myrmex Campaign Observation v1",
+  "description": "An immutable, digest-addressed observation of campaign progress and source correlations. It indexes authoritative campaign state, append-only events, and immutable intelligence artifacts but grants no execution authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "observation_id", "observation_digest", "campaign_id", "campaign_revision", "observed_at", "source_index", "correlations", "progress", "critical_path", "blockers", "authority"],
+  "properties": {
+    "schema": {"const": "myrmex.campaign-observation/v1"},
+    "observation_id": {"type": "string", "pattern": "^campobs_[0-9a-f]{64}$"},
+    "observation_digest": {"$ref": "#/$defs/digest"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "campaign_revision": {"type": "integer", "minimum": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "source_index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_state_digest", "event_log_digest", "intelligence_artifact_digest", "events", "artifacts"],
+      "properties": {
+        "campaign_state_digest": {"$ref": "#/$defs/digest"},
+        "event_log_digest": {"$ref": "#/$defs/digest"},
+        "intelligence_artifact_digest": {"$ref": "#/$defs/digest"},
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sequence", "timestamp", "event_type", "event_digest"],
+            "properties": {
+              "sequence": {"type": "integer", "minimum": 0},
+              "timestamp": {"type": "string", "format": "date-time"},
+              "event_type": {"type": "string", "minLength": 1},
+              "event_digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifact_id", "kind", "artifact_digest", "payload_digest", "observed_campaign_revision", "created_at"],
+            "properties": {
+              "artifact_id": {"type": "string", "minLength": 1},
+              "kind": {"enum": ["backlog", "plan", "review", "decision"]},
+              "artifact_digest": {"$ref": "#/$defs/digest"},
+              "payload_digest": {"$ref": "#/$defs/digest"},
+              "observed_campaign_revision": {"type": "integer", "minimum": 0},
+              "created_at": {"type": "string", "format": "date-time"}
+            }
+          }
+        }
+      }
+    },
+    "correlations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backlog_record_ids", "plan_revision_ids", "work_units", "task_ids", "decision_ids"],
+      "properties": {
+        "backlog_record_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(?:blsnaprec_|backlog_)[0-9a-f]{64}$"}},
+        "plan_revision_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"}},
+        "work_units": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["work_unit_id", "status", "phase", "plan_revision_id", "backlog_record_ids", "task_ids"],
+            "properties": {
+              "work_unit_id": {"$ref": "#/$defs/workUnitId"},
+              "status": {"type": "string", "minLength": 1},
+              "phase": {"type": "string", "minLength": 1},
+              "plan_revision_id": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"}]},
+              "backlog_record_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(?:blsnaprec_|backlog_)[0-9a-f]{64}$"}},
+              "task_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        "task_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Campaign-wide task identities correlated through WUs and immutable artifacts."},
+        "decision_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(?:schedule_|routemodel_|replandec_)[0-9a-f]{64}$"}}
+      }
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_status", "total_work_units", "completed_work_units", "completion_basis_points", "status_counts"],
+      "properties": {
+        "campaign_status": {"enum": ["active", "paused", "completed", "failed", "cancelled"]},
+        "total_work_units": {"type": "integer", "minimum": 0},
+        "completed_work_units": {"type": "integer", "minimum": 0},
+        "completion_basis_points": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "status_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "critical_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["length", "work_unit_ids"],
+      "properties": {
+        "length": {"type": "integer", "minimum": 0},
+        "work_unit_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/workUnitId"}}
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["blocker_type", "work_unit_id", "created_at", "age_seconds", "message_digest"],
+        "properties": {
+          "blocker_type": {"type": "string", "minLength": 1},
+          "work_unit_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/workUnitId"}]},
+          "created_at": {"type": "string", "format": "date-time"},
+          "age_seconds": {"type": "integer", "minimum": 0},
+          "message_digest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    "authority": {"$ref": "#/$defs/authority"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "workUnitId": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "dispatch", "activate_plan", "create_work_units", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "campaign_observation_only"},
+        "dispatch": {"const": false},
+        "activate_plan": {"const": false},
+        "create_work_units": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  }
+}

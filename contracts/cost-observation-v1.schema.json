@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:cost-observation:v1",
+  "title": "Myrmex Cost Observation v1",
+  "description": "An immutable campaign cost observation. Unknown incurred or remaining cost is represented by null plus a typed reason and is never coerced to zero.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "observation_id", "observation_digest", "campaign_id", "campaign_revision", "observed_at", "correlation", "source_kind", "source_digest", "incurred_usd", "incurred_unknown_reason", "projected_remaining_usd", "remaining_unknown_reason", "authority"],
+  "properties": {
+    "schema": {"const": "myrmex.cost-observation/v1"},
+    "observation_id": {"type": "string", "pattern": "^costobs_[0-9a-f]{64}$"},
+    "observation_digest": {"$ref": "#/$defs/digest"},
+    "campaign_id": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "campaign_revision": {"type": "integer", "minimum": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_revision_id", "work_unit_id", "task_id", "route_model_decision_id"],
+      "properties": {
+        "plan_revision_id": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^plan_[0-9a-f]{64}$"}]},
+        "work_unit_id": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"}]},
+        "task_id": {"type": ["string", "null"], "minLength": 1},
+        "route_model_decision_id": {"oneOf": [{"type": "null"}, {"type": "string", "pattern": "^routemodel_[0-9a-f]{64}$"}]}
+      }
+    },
+    "source_kind": {"enum": ["provider_receipt", "task_receipt", "operator_projection", "unavailable"]},
+    "source_digest": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+    "incurred_usd": {"type": ["number", "null"], "minimum": 0},
+    "incurred_unknown_reason": {"type": ["string", "null"], "minLength": 1},
+    "projected_remaining_usd": {"type": ["number", "null"], "minimum": 0},
+    "remaining_unknown_reason": {"type": ["string", "null"], "minLength": 1},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "dispatch", "invoke_provider", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "cost_observation_only"},
+        "dispatch": {"const": false},
+        "invoke_provider": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  },
+  "allOf": [
+    {"if": {"properties": {"incurred_usd": {"type": "null"}}}, "then": {"properties": {"incurred_unknown_reason": {"type": "string", "minLength": 1}}}, "else": {"properties": {"incurred_unknown_reason": {"type": "null"}}}},
+    {"if": {"properties": {"projected_remaining_usd": {"type": "null"}}}, "then": {"properties": {"remaining_unknown_reason": {"type": "string", "minLength": 1}}}, "else": {"properties": {"remaining_unknown_reason": {"type": "null"}}}}
+  ],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

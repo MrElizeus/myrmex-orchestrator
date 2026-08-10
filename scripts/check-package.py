@@ -55,6 +55,8 @@ REQUIRED_CONTRACTS = {
     "replan-decision-v1.schema.json",
     "scheduling-decision-v1.schema.json",
     "route-model-decision-v1.schema.json",
+    "campaign-observation-v1.schema.json",
+    "cost-observation-v1.schema.json",
     "work-result-v1.schema.json",
     "verification-request-v1.schema.json",
     "verification-result-v1.schema.json",
