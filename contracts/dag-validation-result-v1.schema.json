@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:dag-validation-result:v1",
+  "title": "Myrmex Semantic DAG Validation Result v1",
+  "description": "Deterministic, fail-closed validation receipt for one exact reviewed plan, compiled work-order set, and campaign revision. The receipt validates only and grants no plan activation or repository-effect authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "status", "campaign_id", "campaign_revision", "expected_campaign_revision", "plan_revision_id", "reviewed_plan_record_id", "review_digest", "graph_digest", "topological_order", "critical_path", "ready_work_units", "human_gated_work_units", "uncovered_backlog_item_ids", "defects", "authority", "validation_id", "validation_digest"],
+  "properties": {
+    "schema": {"const": "myrmex.dag-validation-result/v1"},
+    "status": {"enum": ["PASS", "FAIL"]},
+    "campaign_id": {"type": "string"},
+    "campaign_revision": {"type": "integer"},
+    "expected_campaign_revision": {"type": "integer"},
+    "plan_revision_id": {"type": "string"},
+    "reviewed_plan_record_id": {"type": ["string", "null"], "pattern": "^planrec_[0-9a-f]{64}$"},
+    "review_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "graph_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "topological_order": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "critical_path": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "ready_work_units": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "human_gated_work_units": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "uncovered_backlog_item_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "defects": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["code", "category", "severity", "message", "work_unit_ids", "evidence_references"], "properties": {"code": {"type": "string", "pattern": "^DAG-[0-9]{3}$"}, "category": {"type": "string"}, "severity": {"const": "BLOCKING"}, "message": {"type": "string", "minLength": 1}, "work_unit_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}, "evidence_references": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}}}},
+    "authority": {"type": "object", "additionalProperties": false, "required": ["scope", "activate_plan", "repository_write", "commit", "push"], "properties": {"scope": {"const": "validation_only"}, "activate_plan": {"const": false}, "repository_write": {"const": false}, "commit": {"const": false}, "push": {"const": false}}},
+    "validation_id": {"type": "string", "pattern": "^dagval_[0-9a-f]{64}$"},
+    "validation_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

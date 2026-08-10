@@ -49,6 +49,7 @@ REQUIRED_CONTRACTS = {
     "repository-context-v1.schema.json",
     "work-order-v1.schema.json",
     "work-order-v2.schema.json",
+    "dag-validation-result-v1.schema.json",
     "work-result-v1.schema.json",
     "verification-request-v1.schema.json",
     "verification-result-v1.schema.json",

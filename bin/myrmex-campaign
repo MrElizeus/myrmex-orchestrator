@@ -110,6 +110,20 @@ def _work_unit_compiler():
         sys.path.insert(0, str(support))
     return importlib.import_module("myrmex_work_unit_compiler")
 
+
+def _dag_validator():
+    """Load semantic DAG validation only for plan-bound P1 DAG commands."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py", "myrmex_backlog_normalizer.py",
+        "myrmex_plan_store.py", "myrmex_planner.py", "myrmex_work_unit_compiler.py",
+        "myrmex_dag_validate.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_dag_validate")
+
 SCHEMA_V1 = "myrmex.campaign/v1"
 SCHEMA_VERSION = 1
 
@@ -331,7 +345,13 @@ def get_ready_work_units(data: dict[str, Any]) -> list[dict[str, Any]]:
     for wu in data["work_units"]:
         if wu["status"] in {"pending", "ready"}:
             deps = set(wu.get("dependencies", []))
-            if deps.issubset(completed_ids):
+            order = wu.get("work_order")
+            gates = order.get("human_gates", []) if isinstance(order, dict) else []
+            blocks_readiness = any(
+                isinstance(gate, dict) and gate.get("required_before") == "work_unit_ready"
+                for gate in gates
+            )
+            if deps.issubset(completed_ids) and not blocks_readiness:
                 ready.append(wu)
     return ready
 
@@ -607,6 +627,20 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_dag(args: argparse.Namespace) -> int:
+    if (args.plan_revision_id is None) != (args.expect_revision is None):
+        sys.stderr.write("error: --plan-revision-id and --expect-revision are required together for semantic DAG validation\n")
+        return 2
+    if args.plan_revision_id is not None:
+        # Semantic validation must inspect structurally corrupt graphs and emit
+        # typed defects instead of being pre-empted by the P0 reader.
+        validate_campaign_id(args.id)
+        with (campaign_dir(args.id) / "campaign.json").open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        result = _dag_validator().validate_semantic_dag(
+            campaign_dir(args.id), data, args.expect_revision, args.plan_revision_id,
+        )
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "PASS" else 1
     data = read_campaign(args.id)
     try:
         order = compute_dag_order(data["work_units"], data["dag"]["edges"])
@@ -1543,6 +1577,8 @@ def build_parser() -> argparse.ArgumentParser:
     # dag
     p_dag = sub.add_parser("dag", help="Validate and inspect campaign DAG")
     p_dag.add_argument("id", help="Campaign ID")
+    p_dag.add_argument("--plan-revision-id", help="Run fail-closed semantic validation for this reviewed plan")
+    p_dag.add_argument("--expect-revision", type=int, help="Required campaign revision for semantic validation")
     p_dag.set_defaults(func=cmd_dag)
 
     # wu-add
