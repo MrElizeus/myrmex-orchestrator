@@ -718,6 +718,60 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
         self.assertIsNotNone(head.myrmex_task_operation.find_existing_op_for_phase(run, "WU-I", "verifier", 4))
         self.assertTrue(any(call.kwargs.get("corrections_used") == 2 for call in transition_mock.call_args_list))
 
+    def test_J_review_only_semantic_fail_blocks_before_remediation(self) -> None:
+        head = self._production_head(); root = Path(self.tmp_dir) / "ledger-J"
+        writer = root / "camp-J" / "WU-J"; verifier = root / "camp-J" / "WU-J-verifier"
+        writer.mkdir(parents=True); verifier.mkdir(parents=True)
+        candidate, digest, run = "8" * 40, "c" * 64, "run-J"
+        wu = {"id":"WU-J", "campaign_id":"camp-J", "objective":"review only", "phase":"pending",
+              "corrections_used":0, "corrections_budget":2, "no_op_allowed":True, "scope":["x.ts"],
+              "verification_commands":["git status --short"], "base_sha":candidate,
+              "implementing_agent":"writer", "verifying_agent":"verifier", "provider":"opencode",
+              "model":"default", "correction_runs":[], "acceptance_criteria":["accept"],
+              "work_order":{"schema":"myrmex.work-order/v2", "objective":"review only",
+                  "non_goals":["No source or test edits"],
+                  "scope":{"allowed_paths":["x.ts"], "forbidden_paths":[], "preexisting_dirty_paths":[]},
+                  "acceptance_criteria":["accept"],
+                  "verification":{"commands":["git status --short"], "manual_checks":[]},
+                  "git_policy":{"commit":False,"push":False}, "no_op_allowed":True}}
+        payloads = [
+            {"decision":"COMPLETED"},
+            {"decision":"FAIL", "candidate_sha":candidate, "diff_digest":digest,
+             "defects":[{"issue":"candidate needs source edit"}], "checks":[], "residual_risks":[]},
+        ]
+        created = []
+        def create_task(request):
+            created.append(request)
+            return types.SimpleNamespace(task_id=f"task-J-{len(created)}"), object()
+        def get_result(_task_id):
+            payload = payloads[len(created) - 1]
+            return types.SimpleNamespace(status="completed", error_type=None,
+                text_content=json.dumps(payload), json_payload=payload)
+        driver = head.OpenCodeTaskDriver()
+        contexts = self._stable_external_boundaries(head, root, writer, verifier, candidate, digest)
+        contexts += [patch.object(head.opencode_transport, "create_task", side_effect=create_task),
+                     patch.object(head.opencode_transport, "wait_task", return_value=types.SimpleNamespace(status="completed")),
+                     patch.object(head.opencode_transport, "get_result", side_effect=get_result),
+                     patch.object(head.CampaignSupervisor, "ensure_myrmex_state_run", return_value=run),
+                     patch.object(head.CampaignSupervisor, "resolve_execution_driver", return_value=driver),
+                     patch.object(head.CampaignSupervisor, "_transition_wu"),
+                     patch.object(head.CampaignSupervisor, "sync_myrmex_state_phase"),
+                     patch.object(head.CampaignSupervisor, "complete_myrmex_state_run", return_value=True)]
+        with ExitStack() as stack:
+            for context in contexts: stack.enter_context(context)
+            remediation = stack.enter_context(patch.object(driver, "execute_remediation"))
+            ci = stack.enter_context(patch.object(driver, "execute_ci"))
+            blocker = stack.enter_context(patch.object(head.CampaignSupervisor, "_block_wu"))
+            result = head.CampaignSupervisor().run_work_unit(
+                "camp-J", {"repository_root":str(root), "branch":"main", "status":"active"}, wu)
+        self.assertFalse(result)
+        self.assertEqual(len(created), 2)
+        remediation.assert_not_called(); ci.assert_not_called()
+        blocker.assert_called_once()
+        self.assertEqual(blocker.call_args.args[2], "product_change_required")
+        self.assertEqual(wu["corrections_used"], 0)
+        self.assertEqual(wu["correction_runs"], [])
+
     def test_D_no_op_delivery_recovery_uses_durable_writer_or_blocks(self) -> None:
         head = self._production_head(); root = Path(self.tmp_dir) / "noop-D"; root.mkdir()
         candidate, digest, run, cid, wuid = "6" * 40, "d" * 64, "run-D", "camp-D", "WU-D"

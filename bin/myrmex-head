@@ -361,6 +361,13 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         return wu.get("scope", [])
 
     @classmethod
+    def _prohibits_source_remediation(cls, wu: dict[str, Any]) -> bool:
+        if not cls._plan_bound(wu):
+            return False
+        non_goals = wu["work_order"].get("non_goals")
+        return isinstance(non_goals, list) and "No source or test edits" in non_goals
+
+    @classmethod
     def _prompt_context(cls, wu: dict[str, Any]) -> str:
         return json.dumps(cls._work_order_context(wu), sort_keys=True)
 
@@ -2448,6 +2455,15 @@ class CampaignSupervisor:
 
                 if verifier_receipt["status"] == "PASS":
                     break
+
+                if (verifier_receipt["status"] == "FAIL"
+                        and isinstance(driver, OpenCodeTaskDriver)
+                        and driver._prohibits_source_remediation(wu)):
+                    self._block_wu(
+                        cid, wuid, "product_change_required",
+                        "Verifier found a candidate defect, but the authoritative work order prohibits source or test edits; governed replanning is required",
+                    )
+                    return False
 
                 # Failed verification -> Remediation
                 corrections_used += 1
