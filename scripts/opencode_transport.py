@@ -183,6 +183,8 @@ def create_task(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         bufsize=1,
     )
@@ -290,7 +292,14 @@ def get_task(task_id: str, transport_state_dir: Path | None = None) -> TaskSnaps
     opencode_bin = resolve_opencode_bin()
     export_cmd = [opencode_bin, "export", task_id]
     env = dict(os.environ, PAGER="cat")
-    proc_exp = subprocess.run(export_cmd, capture_output=True, text=True, env=env)
+    proc_exp = subprocess.run(
+        export_cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
 
     raw_export: dict[str, Any] | None = None
     if proc_exp.returncode == 0:

@@ -87,6 +87,36 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
         st_mode = meta_path.stat().st_mode
         self.assertEqual(st_mode & 0o777, 0o600)
 
+    def test_03b_transport_replaces_invalid_utf8_without_losing_identity(self) -> None:
+        dummy_bin = Path(self.tmp_dir) / "opencode_invalid_utf8"
+        dummy_bin.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'export':\n"
+            "    sys.stdout.buffer.write(b'{\\\"truncated\\\":\\\"\\xef\\xbf')\n"
+            "else:\n"
+            "    sys.stdout.buffer.write(b'\\xef\\xbf\\n')\n"
+            "    print(json.dumps({'sessionID': 'ses_invalid_utf8'}))\n",
+            encoding="utf-8",
+        )
+        dummy_bin.chmod(0o755)
+
+        with patch.dict(os.environ, {"OPENCODE_BIN": str(dummy_bin)}):
+            identity, proc = opencode_transport.create_task({
+                "prompt": "Test prompt",
+                "agent": "myrmex-worker",
+                "workspace": self.tmp_dir,
+            })
+            self.assertEqual(identity.task_id, "ses_invalid_utf8")
+            proc.wait(timeout=5)
+
+            snapshot = opencode_transport.get_task(
+                identity.task_id,
+                transport_state_dir=self.state_dir / "myrmex/task-operations",
+            )
+            self.assertEqual(snapshot.status, "failed")
+            self.assertIsNone(snapshot.raw_export)
+
     def test_04_verifier_worktree_and_mutation_detection(self) -> None:
         # Setup git repo
         repo_dir = Path(self.tmp_dir) / "repo"
