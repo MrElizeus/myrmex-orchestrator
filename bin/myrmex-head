@@ -314,6 +314,61 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
     verifier_agent: str = "myrmex-verifier"
     remediator_agent: str = "myrmex-worker"
 
+    @staticmethod
+    def _plan_bound(wu: dict[str, Any]) -> bool:
+        order = wu.get("work_order")
+        return isinstance(order, dict) and order.get("schema") == "myrmex.work-order/v2"
+
+    @classmethod
+    def _work_order_context(cls, wu: dict[str, Any]) -> dict[str, Any]:
+        order = wu.get("work_order") if cls._plan_bound(wu) else {}
+        return {
+            "objective": order.get("objective", "") if order else wu.get("objective", ""),
+            "non_goals": order.get("non_goals", []) if order else wu.get("non_goals", []),
+            "scope": order.get("scope", wu.get("scope", [])),
+            "acceptance_criteria": order.get("acceptance_criteria", []) if order else wu.get("acceptance_criteria", []),
+            "verification": order.get("verification", {"commands": wu.get("verification_commands", []), "manual_checks": []}),
+            "git_policy": order.get("git_policy", {"commit": False, "push": False}),
+            "no_op_allowed": order.get("no_op_allowed", False) if order else wu.get("no_op_allowed", False),
+        }
+
+    @classmethod
+    def _execution_context(cls, wu: dict[str, Any]) -> dict[str, Any]:
+        if not cls._plan_bound(wu):
+            return cls._work_order_context(wu)
+        order = wu["work_order"]
+        expected = {
+            "objective": order.get("objective"), "acceptance_criteria": order.get("acceptance_criteria"),
+            "no_op_allowed": order.get("no_op_allowed"),
+        }
+        projections = {key: wu.get(key) for key in expected}
+        projections["scope"] = wu.get("scope")
+        allowed = order.get("scope", {}).get("allowed_paths") if isinstance(order.get("scope"), dict) else None
+        if any(projections[key] != value for key, value in expected.items()) or projections["scope"] != allowed:
+            raise ExecutionDriverError("plan-bound work unit projection diverges from authoritative work order")
+        return cls._work_order_context(wu)
+
+    @classmethod
+    def _allowed_scope(cls, wu: dict[str, Any]) -> list[str]:
+        if cls._plan_bound(wu):
+            scope = wu["work_order"].get("scope")
+            allowed = scope.get("allowed_paths") if isinstance(scope, dict) else None
+            if not isinstance(allowed, list) or not all(isinstance(path, str) for path in allowed):
+                raise ExecutionDriverError("plan-bound work order allowed scope is invalid")
+            return allowed
+        return wu.get("scope", [])
+
+    @classmethod
+    def _prompt_context(cls, wu: dict[str, Any]) -> str:
+        return json.dumps(cls._work_order_context(wu), sort_keys=True)
+
+    @staticmethod
+    def _validate_recovered_identity(existing_op: Any, campaign_id: str, agent_id: str, provider: str, model: str | None, workspace: Path) -> None:
+        if (existing_op.campaign_id != campaign_id or existing_op.agent != agent_id
+                or existing_op.provider != provider or existing_op.model != (model or "default")
+                or Path(existing_op.workspace) != workspace.resolve()):
+            raise ExecutionDriverError("recovered task operation identity does not match dispatch-bound execution")
+
     def execute_writer(
         self,
         wu: dict[str, Any],
@@ -325,7 +380,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         agent_id = wu.get("implementing_agent") or self.writer_agent
         wuid = wu["id"]
         campaign_id = wu.get("campaign_id", "default-campaign")
-        allowed_scope = wu.get("scope", [])
+        context = self._execution_context(wu)
+        allowed_scope = self._allowed_scope(wu)
 
         # 1. Create / retrieve isolated worktree for WU (Writer environment)
         wt_dir, wt_receipt = myrmex_worktree.create_wu_worktree(
@@ -339,6 +395,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 2. Check existing task operation for idempotency / recovery
         existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "writer", 1)
         if existing_op and existing_op.task_id:
+            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
@@ -361,17 +418,29 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                     "worktree": str(wt_dir),
                 }
 
-        # 3. Construct writer prompt
-        prompt = (
-            f"Objective: {wu.get('title')}\n"
-            f"Description: {wu.get('description', '')}\n"
-            f"Acceptance Criteria: {json.dumps(wu.get('acceptance_criteria', []))}\n"
+        # 3. Construct writer prompt. P1 work orders carry the authoritative
+        # context in work_order; legacy WUs continue to use their flat fields.
+        if self._plan_bound(wu):
+            prompt = (
+            f"Objective: {context['objective']}\n"
+            f"Work-order context: {self._prompt_context(wu)}\n"
             f"Allowed Scope: {json.dumps(allowed_scope)}\n"
             f"Base SHA: {base_sha}\n"
             f"Constraints: Do NOT execute git commit, git push, git pr, or git merge. "
             f"Produce your modifications directly in the workspace.\n"
             f"Format response as JSON: {{\"decision\": \"COMPLETED\", \"summary\": \"...\", \"files_touched\": []}}"
-        )
+            )
+        else:
+            prompt = (
+                f"Objective: {wu.get('title')}\n"
+                f"Description: {wu.get('description', '')}\n"
+                f"Acceptance Criteria: {json.dumps(wu.get('acceptance_criteria', []))}\n"
+                f"Allowed Scope: {json.dumps(allowed_scope)}\n"
+                f"Base SHA: {base_sha}\n"
+                f"Constraints: Do NOT execute git commit, git push, git pr, or git merge. "
+                f"Produce your modifications directly in the workspace.\n"
+                f"Format response as JSON: {{\"decision\": \"COMPLETED\", \"summary\": \"...\", \"files_touched\": []}}"
+            )
 
         model = wu.get("model")
         op = myrmex_task_operation.create_task_intent(
@@ -384,6 +453,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             base_sha=base_sha,
             prompt=prompt,
             model=model or "default",
+            provider=wu.get("provider", "opencode"),
             attempt=1,
         )
 
@@ -454,6 +524,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         wuid = wu["id"]
         campaign_id = wu.get("campaign_id", "default-campaign")
         vcmds = wu.get("verification_commands", [])
+        context = self._execution_context(wu)
 
         # Get writer worktree to resolve candidate SHA
         writer_wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
@@ -476,6 +547,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 2. Check existing verifier operation for idempotency / recovery
         existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "verifier", 1)
         if existing_op and existing_op.task_id:
+            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), verifier_wt_dir)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
@@ -504,10 +576,12 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
 
         prompt = (
             f"Verification Task for Work Unit {wuid}\n"
+            f"Candidate identity: campaign={campaign_id}, work_unit={wuid}, candidate_sha={cand_sha}\n"
+            f"Work-order context: {self._prompt_context(wu) if self._plan_bound(wu) else json.dumps(context, sort_keys=True)}\n"
             f"Candidate SHA: {cand_sha}\n"
             f"Diff Digest: {diff_digest}\n"
-            f"Verification Commands: {json.dumps(vcmds)}\n"
-            f"Inspect workspace strictly in read-only mode and respond with valid JSON:\n"
+            f"Verification Commands and Manual Checks: {self._prompt_context(wu)}\n"
+            f"Inspect workspace strictly in read-only mode; do not modify files, commit, push, or create PRs. Respond with valid JSON:\n"
             f"{{\n"
             f'  "decision": "PASS|FAIL|BLOCKED",\n'
             f'  "candidate_sha": "{cand_sha}",\n'
@@ -529,6 +603,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             base_sha=cand_sha,
             prompt=prompt,
             model=model or "default",
+            provider=wu.get("provider", "opencode"),
             attempt=1,
         )
 
@@ -609,7 +684,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         agent_id = wu.get("implementing_agent") or self.remediator_agent
         wuid = wu["id"]
         campaign_id = wu.get("campaign_id", "default-campaign")
-        allowed_scope = wu.get("scope", [])
+        allowed_scope = self._allowed_scope(wu)
+        context = self._execution_context(wu)
 
         wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
         if not wt_dir.exists():
@@ -618,6 +694,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 1. Check existing remediation task operation for recovery
         existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "remediator", attempt)
         if existing_op and existing_op.task_id:
+            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
@@ -635,6 +712,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 2. Construct remediator prompt with exact defect set
         prompt = (
             f"Remediation Task (Attempt {attempt}) for Work Unit {wuid}\n"
+            f"Work-order context: {self._prompt_context(wu) if self._plan_bound(wu) else json.dumps(context, sort_keys=True)}\n"
             f"Defects to correct: {json.dumps(defects)}\n"
             f"Allowed Scope: {json.dumps(allowed_scope)}\n"
             f"Apply bounded corrections to resolve all defects.\n"
@@ -653,6 +731,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             base_sha=wu.get("base_sha", "HEAD"),
             prompt=prompt,
             model=model or "default",
+            provider=wu.get("provider", "opencode"),
             attempt=attempt,
         )
 
@@ -1700,8 +1779,25 @@ class CampaignSupervisor:
             current_head=current_head,
         )
 
+    @staticmethod
+    def _bind_dispatch_context(wu: dict[str, Any], dispatch: dict[str, Any] | None) -> dict[str, Any]:
+        if dispatch is None:
+            return wu
+        selected = dispatch["route_decision"]["selected"]
+        # Keep persisted campaign JSON immutable: bind execution-only fields
+        # to the invocation context passed to every driver phase.
+        return {
+            **wu,
+            "campaign_id": dispatch["intent"]["campaign_id"],
+            "implementing_agent": selected["agent"],
+            "verifying_agent": "myrmex-verifier",
+                "model": selected["model"],
+                "provider": selected["provider"],
+        }
+
     def run_work_unit(self, cid: str, data: dict[str, Any], wu: dict[str, Any], dispatch: dict[str, Any] | None = None) -> bool:
         """Executes the closed-loop autonomous cycle for one work unit with production drivers."""
+        wu = self._bind_dispatch_context(wu, dispatch)
         wuid = wu["id"]
         repo_root = Path(data.get("repository_root") or os.getcwd()).resolve()
         agent_env = sanitized_agent_environment()

@@ -123,6 +123,15 @@ with tempfile.TemporaryDirectory(prefix="myrmex-p1018-") as td:
     assert intent["route_model_decision_digest"] == first["route_decision"]["decision_digest"]
     assert intent["plan_revision_id"] == PLAN_ID and intent["work_unit_id"] == "WU-A"
 
+    # Execution-only binding reaches the production driver without mutating the
+    # persisted compiled work unit or confusing the verifier identity.
+    bound = sup._bind_dispatch_context(first["wu"], first)
+    assert bound["campaign_id"] == cid
+    assert bound["implementing_agent"] == first["route_decision"]["selected"]["agent"]
+    assert bound["model"] == first["route_decision"]["selected"]["model"]
+    assert bound["verifying_agent"] == "myrmex-verifier"
+    assert "model" not in first["wu"] and "campaign_id" not in first["wu"]
+
     # The run binding is a task-intent correlation attached to both decisions;
     # it remains non-authorizing by itself.
     sup._attach_dispatch_run(cid, first, "run-fixture-001")
