@@ -32,11 +32,18 @@ def _sha(value: Any) -> str:
     return hashlib.sha256(_canon(value)).hexdigest()
 
 
-def _path_legal(path: Any) -> bool:
-    if not isinstance(path, str) or not path or "\x00" in path or path.startswith(("/", "~")):
+def _path_legal(path: Any, *, allow_git: bool = False) -> bool:
+    if not isinstance(path, str) or not path or "\x00" in path or path.startswith("~"):
         return False
-    normalized = posixpath.normpath(path.replace("\\", "/"))
-    return normalized not in {".", ".."} and not normalized.startswith("../") and not normalized.startswith(".git/") and normalized != ".git"
+    portable = path.replace("\\", "/")
+    if portable.startswith("/") or any(part == ".." for part in portable.split("/")):
+        return False
+    normalized = posixpath.normpath(portable)
+    if normalized in {".", ".."} or normalized.startswith("../"):
+        return False
+    if not allow_git and (normalized == ".git" or normalized.startswith(".git/")):
+        return False
+    return True
 
 
 def _paths_overlap(left: str, right: str) -> bool:
@@ -294,8 +301,9 @@ def validate_semantic_dag(
             if any(campaign_wu.get(key) != value for key, value in projection.items()):
                 defect("DAG-023", "work_order", "campaign WorkUnit projection diverges from its work order", [wu_id])
         scope = order_contract["scope"]
-        all_paths = scope["allowed_paths"] + scope["forbidden_paths"] + scope["preexisting_dirty_paths"]
-        if any(not _path_legal(path) for path in all_paths):
+        if any(not _path_legal(path) for path in scope["allowed_paths"] + scope["preexisting_dirty_paths"]):
+            defect("DAG-024", "scope", "scope contains an unsafe repository path", [wu_id])
+        if any(not _path_legal(path, allow_git=True) for path in scope["forbidden_paths"]):
             defect("DAG-024", "scope", "scope contains an unsafe repository path", [wu_id])
         if any(_paths_overlap(a, f) for a in scope["allowed_paths"] for f in scope["forbidden_paths"]):
             defect("DAG-025", "scope", "allowed and forbidden scopes overlap", [wu_id])

@@ -117,6 +117,25 @@ with tempfile.TemporaryDirectory(prefix="myrmex-dag-state-") as state_home, temp
         data["work_units"][0]["scope"] = ["../outside"]
     corrupt(unsafe_scope, {"DAG-024"})
 
+    def scope_path(scope_name, path):
+        def mutate(data):
+            order = data["work_units"][0]["work_order"]
+            order["scope"][scope_name] = [path]
+            order["work_order_digest"] = compiler._sha({key: value for key, value in order.items() if key not in {"work_order_id", "work_order_digest"}})
+            order["work_order_id"] = "wo_" + order["work_order_digest"]
+        return mutate
+
+    assert dag_validate._path_legal(".git", allow_git=True)
+    assert dag_validate._path_legal(".git/hooks", allow_git=True)
+    assert not dag_validate._path_legal(".git")
+    assert not dag_validate._path_legal(".git/config")
+    corrupt(scope_path("forbidden_paths", ".git"), set())
+    corrupt(scope_path("forbidden_paths", ".git/hooks"), set())
+    corrupt(scope_path("allowed_paths", ".git"), {"DAG-024"})
+    corrupt(scope_path("preexisting_dirty_paths", ".git/config"), {"DAG-024"})
+    corrupt(scope_path("forbidden_paths", "../outside"), {"DAG-024"})
+    corrupt(scope_path("preexisting_dirty_paths", "../outside"), {"DAG-024"})
+
     def hidden_gate(data):
         order = data["work_units"][0]["work_order"]
         order["human_gates"] = [{"gate_id": "human-1", "decision_type": "approve", "reason": "human authority", "required_before": "work_unit_ready"}]
