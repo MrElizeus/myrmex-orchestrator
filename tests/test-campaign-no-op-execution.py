@@ -9,6 +9,7 @@ import sys
 import tempfile
 import importlib.machinery
 import importlib.util
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,5 +110,40 @@ with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as sta
         pass
     else:
         raise AssertionError("tampered no-op receipt accepted")
+
+    # Production no-op recovery must use the real TaskOperationV1 ledger,
+    # rather than trusting the campaign writer projection.  The ledger file
+    # and all lifecycle transitions below are real; only git/worktree evidence
+    # is isolated for this focused test.
+    writer_op = head_runtime.myrmex_task_operation.create_task_intent(
+        campaign_id=cid, work_unit_id="WU-DURABLE", run_id="run-durable",
+        role="writer", agent="myrmex-worker", workspace=str(repo_path),
+        base_sha=before, prompt="durable writer", provider="opencode",
+        model="default", attempt=1,
+    )
+    head_runtime.myrmex_task_operation.record_task_observed(writer_op, "task-durable")
+    head_runtime.myrmex_task_operation.record_task_terminal(
+        writer_op, "completed", "{}", diff_digest="d" * 64,
+    )
+    head_runtime.myrmex_task_operation.record_receipt_confirmed(writer_op)
+    durable_wu = {
+        "id": "WU-DURABLE", "campaign_id": cid, "base_sha": before,
+        "implementing_agent": "myrmex-worker", "provider": "opencode",
+        "model": "default",
+    }
+    driver = head_runtime.OpenCodeTaskDriver()
+    with patch.object(head_runtime.myrmex_worktree, "_get_worktrees_dir", return_value=state_path / "missing"), \
+         patch.object(head_runtime, "run_argv", side_effect=lambda args, **kw: type("Result", (), {"stdout": "", "returncode": 0, "stderr": ""})()), \
+         patch.object(head_runtime, "compute_candidate_diff_digest", return_value="d" * 64):
+        recovered_writer = driver.recover_writer_receipt(durable_wu, repo_path, "run-durable", {})
+    assert recovered_writer["task_id"] == "task-durable"
+    assert (state_path / "myrmex/task-operations/op-run-durable-WU-DURABLE-writer-att1.json").is_file()
+    missing_wu = dict(durable_wu, id="WU-MISSING")
+    try:
+        driver.recover_writer_receipt(missing_wu, repo_path, "run-durable", {})
+    except head_runtime.ExecutionDriverError:
+        pass
+    else:
+        raise AssertionError("missing durable writer operation was accepted")
 
 print("campaign no-op execution: receipt, unchanged HEAD, no commit, and terminal replay PASS")

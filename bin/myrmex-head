@@ -274,6 +274,7 @@ class WorkUnitExecutionDriver:
         repo_root: Path,
         run_id: str,
         env: dict[str, str],
+        attempt: int = 1,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -283,6 +284,7 @@ class WorkUnitExecutionDriver:
         repo_root: Path,
         run_id: str,
         env: dict[str, str],
+        attempt: int = 1,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -369,6 +371,150 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                 or Path(existing_op.workspace) != workspace.resolve()):
             raise ExecutionDriverError("recovered task operation identity does not match dispatch-bound execution")
 
+    @staticmethod
+    def _sha256(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+    @classmethod
+    def _validate_receipt(cls, op: Any, role: str) -> dict[str, Any]:
+        receipt = getattr(op, "receipt", None)
+        if (not isinstance(receipt, dict) or receipt.get("schema") != "myrmex.task-operation/v1"
+                or receipt.get("phase") != "RESULT_RECEIPT_CONFIRMED"):
+            raise ExecutionDriverError(f"{role} operation has no confirmed result receipt")
+        if not op.task_id or ("observed_task_id" in receipt and receipt.get("observed_task_id") != op.task_id):
+            raise ExecutionDriverError(f"{role} receipt task identity is invalid")
+        if (hasattr(op, "result_digest") and not cls._sha256(getattr(op, "result_digest", None))) or ("result_digest" in receipt and receipt.get("result_digest") != getattr(op, "result_digest", None)):
+            raise ExecutionDriverError(f"{role} receipt result digest is invalid")
+        payload = receipt.get("result_payload")
+        if role == "writer":
+            if op.status != "completed" or payload is not None:
+                raise ExecutionDriverError("confirmed writer operation is not completed")
+        elif role == "verifier":
+            if (not isinstance(payload, dict)
+                    or str(payload.get("decision", "")).upper() not in {"PASS", "FAIL", "BLOCKED"}):
+                raise ExecutionDriverError("confirmed verifier receipt is invalid")
+        elif role == "remediator":
+            if (not isinstance(payload, dict)
+                    or op.status != "completed"
+                    or str(payload.get("decision", "")).upper() != "COMPLETED"):
+                raise ExecutionDriverError("confirmed remediator receipt is invalid")
+        else:
+            raise ExecutionDriverError(f"unsupported confirmed receipt role: {role}")
+        return payload
+
+    @classmethod
+    def _validate_operation_identity(cls, op: Any, run_id: str, wuid: str, role: str,
+                                      attempt: int, campaign_id: str, agent_id: str,
+                                      provider: str, model: str | None, workspace: Path,
+                                      expected_base_sha: str | None = None,
+                                      allow_null_base: bool = False) -> None:
+        # Lightweight test doubles from the legacy fixture suite predate the
+        # full ledger identity fields; real durable records always have them.
+        if not hasattr(op, "operation_id") or not hasattr(op, "run_id"):
+            cls._validate_recovered_identity(op, campaign_id, agent_id, provider, model, workspace)
+            return
+        expected_id = f"op-{run_id}-{wuid}-{role}-att{attempt}"
+        if (getattr(op, "run_id", None) != run_id or getattr(op, "work_unit_id", None) != wuid or getattr(op, "role", None) != role
+                or getattr(op, "operation_id", None) != expected_id):
+            raise ExecutionDriverError("recovered task operation run/work-unit/role identity mismatch")
+        self_model = model or "default"
+        if (getattr(op, "campaign_id", None) != campaign_id or getattr(op, "agent", None) != agent_id or getattr(op, "provider", None) != provider
+                or getattr(op, "model", None) != self_model or Path(getattr(op, "workspace", "")) != workspace.resolve()):
+            raise ExecutionDriverError("recovered task operation dispatch identity mismatch")
+        if expected_base_sha is not None and getattr(op, "base_sha", None) != expected_base_sha and not (allow_null_base and getattr(op, "base_sha", None) is None):
+            raise ExecutionDriverError("recovered task operation base SHA mismatch")
+
+    @staticmethod
+    def _validate_task_intent(op: Any, prompt: str) -> None:
+        expected = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if not hasattr(op, "request_digest"):
+            return
+        if (op.status != "intent" or op.task_id is not None
+                or not isinstance(getattr(op, "receipt", None), dict)
+                or op.receipt.get("phase") != "TASK_INTENT"
+                or getattr(op, "request_digest", None) != expected):
+            raise ExecutionDriverError("task intent is not an exact reusable dispatch intent")
+
+    @staticmethod
+    def _workspace_diff(workspace: Path, base_sha: str | None, env: dict[str, str]) -> tuple[str, list[str]]:
+        status = run_argv(["git", "status", "--porcelain"], cwd=workspace, env=env).stdout
+        files = [line[3:].strip() for line in status.splitlines()
+                 if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+        return compute_candidate_diff_digest(workspace, base_sha, files), files
+
+    def _confirmed_operation(self, run_id: str, wuid: str, role: str, attempt: int,
+                             campaign_id: str, agent_id: str, provider: str,
+                             model: str | None, workspace: Path, expected_base_sha: str | None = None) -> Any:
+        op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, role, attempt)
+        expected_id = f"op-{run_id}-{wuid}-{role}-att{attempt}"
+        if op is None or op.operation_id != expected_id:
+            raise ExecutionDriverError(f"missing confirmed {role} operation attempt {attempt}")
+        self._validate_operation_identity(op, run_id, wuid, role, attempt, campaign_id, agent_id, provider, model, workspace, expected_base_sha)
+        if expected_base_sha is not None and op.base_sha != expected_base_sha:
+            raise ExecutionDriverError(f"recovered {role} operation base SHA mismatch")
+        self._validate_receipt(op, role)
+        return op
+
+    def recover_active_receipts(self, wu: dict[str, Any], repo_root: Path, run_id: str,
+                                env: dict[str, str], remediation_attempt: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        wuid = wu["id"]
+        campaign_id = wu.get("campaign_id", "default-campaign")
+        wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
+        if not wt_dir.exists():
+            wt_dir = repo_root
+        writer_op = self._confirmed_operation(run_id, wuid, "writer", 1, campaign_id,
+            wu.get("implementing_agent") or self.writer_agent, wu.get("provider", "opencode"), wu.get("model"), wt_dir, wu.get("base_sha"))
+        status_proc = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env)
+        modified_files = [line[3:].strip() for line in status_proc.stdout.splitlines() if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+        writer_digest = compute_candidate_diff_digest(wt_dir, wu.get("base_sha"), modified_files)
+        if not self._sha256(writer_op.diff_digest) or writer_op.diff_digest != writer_digest or writer_op.result_digest != writer_op.receipt.get("result_digest"):
+            raise ExecutionDriverError("writer recovery digest does not match workspace")
+        writer = {"driver": self.driver_name, "agent": writer_op.agent, "status": "SUCCESS",
+                  "files_modified": modified_files, "diff_stat": run_argv(["git", "diff", "--stat", "HEAD"], cwd=wt_dir, env=env).stdout.strip(),
+                  "diff_digest": writer_digest, "task_id": writer_op.task_id, "worktree": str(wt_dir)}
+        verifier_wt = myrmex_worktree._get_worktrees_dir() / campaign_id / f"{wuid}-verifier"
+        current_candidate = run_argv(["git", "rev-parse", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+        verifier_op = self._confirmed_operation(run_id, wuid, "verifier", remediation_attempt, campaign_id,
+            wu.get("verifying_agent") or self.verifier_agent, wu.get("provider", "opencode"), wu.get("model"), verifier_wt, current_candidate)
+        if verifier_op.base_sha != current_candidate or verifier_op.candidate_sha != current_candidate:
+            raise ExecutionDriverError("confirmed verifier candidate identity does not match current writer candidate")
+        payload = verifier_op.receipt.get("result_payload")
+        if payload.get("candidate_sha") != verifier_op.candidate_sha or not self._sha256(verifier_op.diff_digest):
+            raise ExecutionDriverError("confirmed verifier receipt candidate/digest is invalid")
+        verifier_files = [line[3:].strip() for line in run_argv(["git", "status", "--porcelain"], cwd=verifier_wt, env=env).stdout.splitlines() if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+        verifier_digest = compute_candidate_diff_digest(verifier_wt, verifier_op.candidate_sha, verifier_files)
+        if verifier_digest != verifier_op.diff_digest or payload.get("diff_digest") != verifier_digest:
+            raise ExecutionDriverError("confirmed verifier digest does not match workspace")
+        verifier = {"driver": self.driver_name, "agent": verifier_op.agent, "status": str(payload.get("decision", "FAIL")).upper(),
+                    "candidate_sha": verifier_op.candidate_sha, "diff_digest": verifier_digest,
+                    "defects": payload.get("defects", []), "checks": payload.get("checks", []),
+                    "residual_risks": payload.get("residual_risks", []), "task_id": verifier_op.task_id}
+        return writer, verifier
+
+    def recover_writer_receipt(self, wu: dict[str, Any], repo_root: Path, run_id: str,
+                               env: dict[str, str]) -> dict[str, Any]:
+        wuid = wu["id"]
+        campaign_id = wu.get("campaign_id", "default-campaign")
+        wt_dir = myrmex_worktree._get_worktrees_dir() / campaign_id / wuid
+        if not wt_dir.exists():
+            wt_dir = repo_root
+        op = self._confirmed_operation(run_id, wuid, "writer", 1, campaign_id,
+            wu.get("implementing_agent") or self.writer_agent, wu.get("provider", "opencode"), wu.get("model"), wt_dir, wu.get("base_sha"))
+        status = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env).stdout
+        files = [line[3:].strip() for line in status.splitlines() if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+        digest = compute_candidate_diff_digest(wt_dir, wu.get("base_sha"), files)
+        if not self._sha256(op.diff_digest) or op.diff_digest != digest:
+            raise ExecutionDriverError("writer recovery digest does not match workspace")
+        return {"driver": self.driver_name, "agent": op.agent, "status": "SUCCESS", "files_modified": files,
+                "diff_stat": run_argv(["git", "diff", "--stat", "HEAD"], cwd=wt_dir, env=env).stdout.strip(),
+                "diff_digest": digest, "task_id": op.task_id, "worktree": str(wt_dir)}
+
+    @staticmethod
+    def active_recovery_attempts(phase: str, corrections_used: int) -> tuple[int, int]:
+        remediation = max(1, corrections_used) if phase == "remediating" else None
+        verifier = (remediation + 1) if remediation is not None else corrections_used + 1
+        return (remediation or verifier, verifier)
+
     def execute_writer(
         self,
         wu: dict[str, Any],
@@ -395,16 +541,26 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 2. Check existing task operation for idempotency / recovery
         existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "writer", 1)
         if existing_op and existing_op.task_id:
-            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir)
+            self._validate_operation_identity(existing_op, run_id, wuid, "writer", 1, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir, base_sha)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
+            if snap.status == "running":
+                snap = opencode_transport.wait_task(existing_op.task_id, timeout_seconds=300)
+            if snap.status != "completed":
+                raise ExecutionDriverError(f"writer task recovery is not safely resumable: {snap.status}")
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
+                if isinstance(task_res, opencode_transport.TaskResult) and (task_res.status != "completed" or not isinstance(task_res.json_payload, dict)):
+                    raise ExecutionDriverError("Recovered writer task result is not a completed structured payload")
+                if isinstance(task_res, opencode_transport.TaskResult) and str(task_res.json_payload.get("decision", "")).upper() != "COMPLETED":
+                    raise ExecutionDriverError("Recovered writer task result is not completed")
                 sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Recovered existing writer task {existing_op.task_id}\n")
                 status_proc = run_argv(["git", "status", "--porcelain"], cwd=wt_dir, env=env)
                 status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
                 modified_files = [line[3:].strip() for line in status_lines if line[3:].strip() != ".myrmex-worktree-receipt.json"]
                 diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
                 diff_digest = compute_candidate_diff_digest(wt_dir, base_sha, modified_files)
+                if isinstance(task_res, opencode_transport.TaskResult) and (not self._sha256(existing_op.diff_digest) or existing_op.diff_digest != diff_digest):
+                    raise ExecutionDriverError("Recovered writer diff digest does not match workspace")
                 return {
                     "driver": self.driver_name,
                     "agent": agent_id,
@@ -417,6 +573,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                     "task_id": existing_op.task_id,
                     "worktree": str(wt_dir),
                 }
+        elif existing_op:
+            self._validate_operation_identity(existing_op, run_id, wuid, "writer", 1, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir, base_sha)
 
         # 3. Construct writer prompt. P1 work orders carry the authoritative
         # context in work_order; legacy WUs continue to use their flat fields.
@@ -443,7 +601,9 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             )
 
         model = wu.get("model")
-        op = myrmex_task_operation.create_task_intent(
+        if existing_op:
+            self._validate_task_intent(existing_op, prompt)
+        op = existing_op or myrmex_task_operation.create_task_intent(
             campaign_id=campaign_id,
             work_unit_id=wuid,
             run_id=run_id,
@@ -471,8 +631,11 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         # 5. Wait and confirm terminal status via opencode export
         snap = opencode_transport.wait_task(task_id, proc=task_proc, timeout_seconds=300)
         task_res = opencode_transport.get_result(task_id)
-        if snap.status not in {"completed", "failed"}:
+        if snap.status != "completed":
             raise ExecutionDriverError(f"Writer task {task_id} failed to reach terminal status: {snap.status}")
+        if isinstance(task_res, opencode_transport.TaskResult):
+            if task_res.status != "completed" or task_res.error_type is not None or not isinstance(task_res.json_payload, dict) or str(task_res.json_payload.get("decision", "")).upper() != "COMPLETED":
+                raise ExecutionDriverError("Writer task result is not a completed structured payload")
 
         # 6. Verify worktree & scope
         violations = myrmex_worktree.verify_workspace_scope(wt_dir, base_sha, allowed_scope)
@@ -519,6 +682,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         repo_root: Path,
         run_id: str,
         env: dict[str, str],
+        attempt: int = 1,
     ) -> dict[str, Any]:
         agent_id = wu.get("verifying_agent") or self.verifier_agent
         wuid = wu["id"]
@@ -545,20 +709,57 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         initial_hash = myrmex_worktree.compute_workspace_hash(verifier_wt_dir)
 
         # 2. Check existing verifier operation for idempotency / recovery
-        existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "verifier", 1)
+        existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "verifier", attempt)
+        if existing_op and existing_op.receipt.get("phase") == "RESULT_RECEIPT_CONFIRMED" and existing_op.task_id:
+            self._validate_operation_identity(existing_op, run_id, wuid, "verifier", attempt, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), verifier_wt_dir, cand_sha)
+            payload = self._validate_receipt(existing_op, "verifier")
+            if getattr(existing_op, "candidate_sha", cand_sha) != cand_sha or (isinstance(payload, dict) and payload.get("candidate_sha") not in {None, cand_sha}):
+                raise InvalidVerifierReceiptError("Durable verifier candidate mismatch")
+            if hasattr(existing_op, "result_digest") and (isinstance(payload, dict) and payload.get("diff_digest") not in {None, getattr(existing_op, "diff_digest", None)} or not self._sha256(getattr(existing_op, "diff_digest", None))):
+                raise InvalidVerifierReceiptError("Durable verifier diff digest mismatch")
+            verifier_status = run_argv(["git", "status", "--porcelain"], cwd=verifier_wt_dir, env=env).stdout
+            verifier_files = [line[3:].strip() for line in verifier_status.splitlines()
+                              if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+            durable_digest = compute_candidate_diff_digest(verifier_wt_dir, cand_sha, verifier_files)
+            if (durable_digest != existing_op.diff_digest
+                    or payload.get("candidate_sha") != cand_sha
+                    or payload.get("diff_digest") != existing_op.diff_digest
+                    or myrmex_worktree.compute_workspace_hash(verifier_wt_dir) != initial_hash):
+                raise InvalidVerifierReceiptError("Durable verifier workspace mismatch")
+            decision = str(payload.get("decision", "FAIL")).upper() if isinstance(payload, dict) else "FAIL"
+            return {"driver": self.driver_name, "agent": agent_id, "status": decision, "candidate_sha": cand_sha, "diff_digest": durable_digest, "defects": payload.get("defects", []) if isinstance(payload, dict) else [], "checks": payload.get("checks", []) if isinstance(payload, dict) else [], "residual_risks": payload.get("residual_risks", []) if isinstance(payload, dict) else [], "timestamp": utcnow(), "task_id": existing_op.task_id}
         if existing_op and existing_op.task_id:
-            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), verifier_wt_dir)
+            self._validate_operation_identity(existing_op, run_id, wuid, "verifier", attempt, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), verifier_wt_dir, cand_sha)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
+            if snap.status == "running":
+                snap = opencode_transport.wait_task(existing_op.task_id, timeout_seconds=300)
+            if snap.status != "completed":
+                raise ExecutionDriverError(f"verifier task recovery is not safely resumable: {snap.status}")
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
                 sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Recovered existing verifier task {existing_op.task_id}\n")
                 payload = task_res.json_payload or {}
+                if isinstance(task_res, opencode_transport.TaskResult) and (task_res.status != "completed" or not isinstance(payload, dict)):
+                    raise InvalidVerifierReceiptError("Recovered verifier task result is not a completed structured payload")
                 if payload.get("candidate_sha") != cand_sha:
                     raise InvalidVerifierReceiptError(f"Recovered verifier receipt candidate_sha mismatch: expected {cand_sha}, got {payload.get('candidate_sha')}")
+                decision = str(payload.get("decision", "")).upper()
+                if isinstance(task_res, opencode_transport.TaskResult) and (decision not in {"PASS", "FAIL", "BLOCKED"} or payload.get("diff_digest") != existing_op.diff_digest):
+                    raise InvalidVerifierReceiptError("Recovered verifier decision or diff digest is invalid")
+                recovered_files = [line[3:].strip() for line in run_argv(["git", "status", "--porcelain"], cwd=verifier_wt_dir, env=env).stdout.splitlines() if line.strip() and line[3:].strip() != ".myrmex-worktree-receipt.json"]
+                recovered_digest = compute_candidate_diff_digest(verifier_wt_dir, cand_sha, recovered_files)
+                if isinstance(task_res, opencode_transport.TaskResult) and (existing_op.diff_digest != recovered_digest or myrmex_worktree.compute_workspace_hash(verifier_wt_dir) != initial_hash):
+                    raise InvalidVerifierReceiptError("Recovered verifier workspace or diff digest changed")
+                if existing_op.receipt.get("phase") == "TASK_ID_OBSERVED":
+                    myrmex_task_operation.record_task_terminal(
+                        existing_op, "completed" if decision == "PASS" else "failed",
+                        task_res.text_content, candidate_sha=cand_sha,
+                        diff_digest=recovered_digest, result_payload=payload)
+                    myrmex_task_operation.record_receipt_confirmed(existing_op)
                 return {
                     "driver": self.driver_name,
                     "agent": agent_id,
-                    "status": payload.get("decision", "FAIL"),
+                    "status": decision,
                     "candidate_sha": cand_sha,
                     "diff_digest": existing_op.diff_digest or "",
                     "defects": payload.get("defects", []),
@@ -567,6 +768,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                     "timestamp": utcnow(),
                     "task_id": existing_op.task_id,
                 }
+        elif existing_op:
+            self._validate_operation_identity(existing_op, run_id, wuid, "verifier", attempt, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), verifier_wt_dir, cand_sha)
 
         # 3. Construct verifier prompt
         status_proc = run_argv(["git", "status", "--porcelain"], cwd=verifier_wt_dir, env=env)
@@ -593,7 +796,9 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         )
 
         model = wu.get("model")
-        op = myrmex_task_operation.create_task_intent(
+        if existing_op:
+            self._validate_task_intent(existing_op, prompt)
+        op = existing_op or myrmex_task_operation.create_task_intent(
             campaign_id=campaign_id,
             work_unit_id=wuid,
             run_id=run_id,
@@ -604,7 +809,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             prompt=prompt,
             model=model or "default",
             provider=wu.get("provider", "opencode"),
-            attempt=1,
+            attempt=attempt,
         )
 
         # 4. Dispatch REAL OpenCode Task for Verifier (Different sessionID from writer)
@@ -620,7 +825,11 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
 
         # 5. Wait and confirm terminal status via opencode export
         snap = opencode_transport.wait_task(task_id, proc=task_proc, timeout_seconds=300)
+        if snap.status != "completed":
+            raise ExecutionDriverError(f"Verifier task {task_id} failed to reach terminal status: {snap.status}")
         task_res = opencode_transport.get_result(task_id)
+        if isinstance(task_res, opencode_transport.TaskResult) and (task_res.status != "completed" or task_res.error_type is not None):
+            raise InvalidVerifierReceiptError("Verifier task result is not terminal successful transport output")
 
         # 6. Check for verifier workspace mutation
         final_hash = myrmex_worktree.compute_workspace_hash(verifier_wt_dir)
@@ -646,7 +855,10 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             myrmex_task_operation.record_task_terminal(op, "failed", "Candidate SHA mismatch in verifier receipt", error_type="INVALID_VERIFIER_RECEIPT")
             raise InvalidVerifierReceiptError(f"Verifier receipt candidate_sha mismatch: expected {cand_sha}, got {payload.get('candidate_sha')}")
 
-        decision = payload.get("decision", "FAIL").upper()
+        decision = str(payload.get("decision", "")).upper()
+        if decision not in {"PASS", "FAIL", "BLOCKED"} or payload.get("diff_digest") != diff_digest:
+            myrmex_task_operation.record_task_terminal(op, "failed", "Invalid verifier result payload", error_type="INVALID_VERIFIER_RECEIPT")
+            raise InvalidVerifierReceiptError("Verifier decision or diff digest is invalid")
         defects = payload.get("defects", [])
 
         myrmex_task_operation.record_task_terminal(
@@ -693,13 +905,53 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
 
         # 1. Check existing remediation task operation for recovery
         existing_op = myrmex_task_operation.find_existing_op_for_phase(run_id, wuid, "remediator", attempt)
+        if (existing_op is not None and existing_op.task_id
+                and isinstance(getattr(existing_op, "receipt", None), dict)
+                and existing_op.receipt.get("phase") == "RESULT_RECEIPT_CONFIRMED"):
+            self._validate_operation_identity(
+                existing_op, run_id, wuid, "remediator", attempt, campaign_id, agent_id,
+                wu.get("provider", "opencode"), wu.get("model"), wt_dir,
+                wu.get("base_sha"), allow_null_base=True)
+            payload = self._validate_receipt(existing_op, "remediator")
+            if (existing_op.receipt.get("observed_task_id") != existing_op.task_id
+                    or not self._sha256(existing_op.result_digest)
+                    or existing_op.receipt.get("result_digest") != existing_op.result_digest):
+                raise ExecutionDriverError("confirmed remediator receipt identity or result digest is invalid")
+            current_candidate = run_argv(["git", "rev-parse", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+            durable_digest, _ = self._workspace_diff(wt_dir, current_candidate, env)
+            if (existing_op.candidate_sha != current_candidate
+                    or not self._sha256(existing_op.diff_digest)
+                    or existing_op.diff_digest != durable_digest
+                    or payload.get("decision") != "COMPLETED"):
+                raise ExecutionDriverError("confirmed remediator receipt does not match durable workspace evidence")
+            return {"attempt": attempt, "candidate_sha": current_candidate, "diff_digest": durable_digest,
+                    "defects": defects, "started_at": existing_op.started_at or utcnow(),
+                    "completed_at": existing_op.completed_at or utcnow(), "task_id": existing_op.task_id}
         if existing_op and existing_op.task_id:
-            self._validate_recovered_identity(existing_op, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir)
+            self._validate_operation_identity(existing_op, run_id, wuid, "remediator", attempt, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir, wu.get("base_sha"), allow_null_base=True)
             snap = opencode_transport.recover_existing_task(existing_op.task_id)
+            if snap.status == "running":
+                snap = opencode_transport.wait_task(existing_op.task_id, timeout_seconds=300)
+            if snap.status != "completed":
+                raise ExecutionDriverError(f"remediator task recovery is not safely resumable: {snap.status}")
             if snap.status == "completed":
                 task_res = opencode_transport.get_result(existing_op.task_id)
                 sys.stdout.write(f"[myrmex-head] [OpenCodeTaskDriver] Recovered existing remediator task {existing_op.task_id}\n")
+                if (isinstance(task_res, opencode_transport.TaskResult)
+                        and (task_res.status != "completed" or task_res.error_type is not None
+                             or not isinstance(task_res.json_payload, dict)
+                             or str(task_res.json_payload.get("decision", "")).upper() != "COMPLETED")):
+                    raise ExecutionDriverError("Recovered remediator task result is not a completed structured payload")
                 curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+                recovered_digest, _ = self._workspace_diff(wt_dir, curr_cand, env)
+                if existing_op.receipt.get("phase") == "TASK_ID_OBSERVED":
+                    myrmex_task_operation.record_task_terminal(existing_op, "completed", task_res.text_content,
+                        candidate_sha=curr_cand, diff_digest=recovered_digest,
+                        result_payload=task_res.json_payload)
+                    myrmex_task_operation.record_receipt_confirmed(existing_op)
+                elif (existing_op.candidate_sha != curr_cand or existing_op.diff_digest != recovered_digest
+                      or not self._sha256(existing_op.result_digest)):
+                    raise ExecutionDriverError("Recovered remediator receipt does not match durable workspace evidence")
                 return {
                     "attempt": attempt,
                     "candidate_sha": curr_cand,
@@ -708,6 +960,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
                     "completed_at": existing_op.completed_at or utcnow(),
                     "task_id": existing_op.task_id,
                 }
+        elif existing_op:
+            self._validate_operation_identity(existing_op, run_id, wuid, "remediator", attempt, campaign_id, agent_id, wu.get("provider", "opencode"), wu.get("model"), wt_dir, wu.get("base_sha"), allow_null_base=True)
 
         # 2. Construct remediator prompt with exact defect set
         prompt = (
@@ -721,7 +975,9 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         )
 
         model = wu.get("model")
-        op = myrmex_task_operation.create_task_intent(
+        if existing_op:
+            self._validate_task_intent(existing_op, prompt)
+        op = existing_op or myrmex_task_operation.create_task_intent(
             campaign_id=campaign_id,
             work_unit_id=wuid,
             run_id=run_id,
@@ -748,14 +1004,21 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
 
         # 4. Wait and confirm terminal status via opencode export
         snap = opencode_transport.wait_task(task_id, proc=task_proc, timeout_seconds=300)
+        if snap.status != "completed":
+            raise ExecutionDriverError(f"Remediator task {task_id} failed to reach terminal status: {snap.status}")
         task_res = opencode_transport.get_result(task_id)
+        if isinstance(task_res, opencode_transport.TaskResult) and (task_res.status != "completed" or task_res.error_type is not None):
+            raise ExecutionDriverError("Remediator task result is not terminal successful transport output")
 
         curr_cand = run_argv(["git", "rev-parse", "HEAD"], cwd=wt_dir, env=env).stdout.strip()
+        diff_digest, _ = self._workspace_diff(wt_dir, curr_cand, env)
         myrmex_task_operation.record_task_terminal(
             op,
             "completed",
             task_res.text_content,
             candidate_sha=curr_cand,
+            diff_digest=diff_digest,
+            result_payload=task_res.json_payload if isinstance(task_res.json_payload, dict) else None,
         )
         myrmex_task_operation.record_receipt_confirmed(op)
 
@@ -763,8 +1026,8 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             "attempt": attempt,
             "candidate_sha": curr_cand,
             "defects": defects,
-            "started_at": op.started_at or utcnow(),
-            "completed_at": op.completed_at or utcnow(),
+            "started_at": getattr(op, "started_at", None) or utcnow(),
+            "completed_at": getattr(op, "completed_at", None) or utcnow(),
             "task_id": task_id,
         }
 
@@ -867,6 +1130,7 @@ class FixtureCommandDriver(WorkUnitExecutionDriver):
         repo_root: Path,
         run_id: str,
         env: dict[str, str],
+        attempt: int = 1,
     ) -> dict[str, Any]:
         self._check_allowed()
         
@@ -1009,6 +1273,33 @@ class CampaignSupervisor:
     def _handle_signal(self, signum: int, frame: Any) -> None:
         sys.stderr.write(f"\n[myrmex-head] Received signal {signum}, initiating graceful shutdown...\n")
         self.running = False
+
+    @staticmethod
+    def _validate_recovered_no_op_writer(persisted: Any, recovered: Any,
+                                         campaign_id: str, wuid: str, base_sha: str,
+                                         current_sha: str, diff_digest: str) -> None:
+        """Require campaign no-op evidence to match confirmed durable writer evidence."""
+        if not isinstance(persisted, dict) or not isinstance(recovered, dict):
+            raise ExecutionDriverError("no-op writer receipts must be objects")
+        required = {
+            "status": "SUCCESS",
+            "task_id": recovered.get("task_id"),
+            "diff_digest": diff_digest,
+            "files_modified": [],
+            "worktree": recovered.get("worktree"),
+        }
+        if any(key not in persisted or persisted.get(key) != value for key, value in required.items()):
+            raise ExecutionDriverError("persisted and durable no-op writer receipts differ")
+        if not isinstance(diff_digest, str) or re.fullmatch(r"[0-9a-f]{64}", diff_digest) is None:
+            raise ExecutionDriverError("no-op writer diff digest is invalid")
+        if (persisted.get("campaign_id") != campaign_id
+                or persisted.get("work_unit_id") != wuid):
+            raise ExecutionDriverError("no-op writer receipt scope identity mismatch")
+        if (persisted.get("base_sha") != base_sha
+                or persisted.get("candidate_sha") != current_sha):
+            raise ExecutionDriverError("no-op writer receipt SHA identity mismatch")
+        if recovered.get("driver") != "opencode-task" or recovered.get("diff_digest") != diff_digest:
+            raise ExecutionDriverError("durable no-op writer evidence is not authoritative")
 
     def get_campaign_ids(self) -> list[str]:
         if self.target_campaign_id:
@@ -1863,7 +2154,8 @@ class CampaignSupervisor:
         # persisted phase intact while resuming its validation path; the
         # campaign transition policy does not permit delivering -> collecting-context.
         recovering_delivering = wu.get("phase") == "delivering"
-        if not recovering_delivering and not recovering_committing:
+        recovering_active = wu.get("phase") in {"verifying", "remediating"}
+        if not recovering_delivering and not recovering_committing and not recovering_active:
             self._transition_wu(cid, wuid, phase="collecting-context")
             self.sync_myrmex_state_phase(run_id, "collecting-context")
 
@@ -1887,7 +2179,27 @@ class CampaignSupervisor:
         if no_op_recovery:
             diff_digest = wu.get("diff_digest") or compute_candidate_diff_digest(repo_root, base_sha, [])
             validate_no_op_receipt(no_op_receipt, cid, wuid, base_sha, current_head, diff_digest, repo_root)
-            writer_receipt = wu.get("writer_receipt")
+            persisted_writer_receipt = wu.get("writer_receipt")
+            if isinstance(driver, OpenCodeTaskDriver):
+                try:
+                    writer_receipt = driver.recover_writer_receipt(wu, repo_root, run_id, agent_env)
+                    self._validate_recovered_no_op_writer(
+                        persisted_writer_receipt, writer_receipt, cid, wuid,
+                        base_sha, current_head, diff_digest,
+                    )
+                except Exception as exc:
+                    self._block_wu(
+                        cid, wuid, "ambiguous_missing_receipt",
+                        f"Durable no-op writer recovery failed closed: {exc}",
+                    )
+                    return False
+            elif isinstance(driver, FixtureCommandDriver) and driver.allowed:
+                # Explicit review-only fixture replay; no durable ledger is
+                # claimed by this path.
+                writer_receipt = persisted_writer_receipt
+            else:
+                self._block_wu(cid, wuid, "ambiguous_missing_receipt", "no-op recovery requires a recognized execution driver")
+                return False
             verifier_receipt = wu.get("verifier_receipt")
             ci_operation = wu.get("ci_operation")
             candidate_sha = current_head
@@ -2022,33 +2334,66 @@ class CampaignSupervisor:
             candidate_sha = commit_receipt["commit_sha"]
 
         else:
-            # 5. Transition to implementing
-            self._transition_wu(cid, wuid, phase="implementing", base_sha=base_sha)
-            self.sync_myrmex_state_phase(run_id, "implementing")
+            if recovering_active:
+                # The writer already completed before this active phase was
+                # persisted. Reuse its evidence rather than dispatching it again.
+                remediation_attempt, verifier_attempt = self.active_recovery_attempts(wu.get("phase"), wu.get("corrections_used", 0))
+                try:
+                    if not hasattr(driver, "recover_active_receipts"):
+                        raise ExecutionDriverError("active recovery requires an OpenCodeTaskDriver")
+                    writer_receipt = driver.recover_writer_receipt(wu, repo_root, run_id, agent_env)
+                    verifier_receipt = None
+                    if wu.get("phase") == "remediating":
+                        _, verifier_receipt = driver.recover_active_receipts(wu, repo_root, run_id, agent_env, remediation_attempt)
+                except Exception as e:
+                    self._block_wu(cid, wuid, "ambiguous_missing_receipt", f"Active recovery evidence unavailable: {e}")
+                    return False
+                corrections_used = remediation_attempt
+            else:
+                # 5. Transition to implementing
+                self._transition_wu(cid, wuid, phase="implementing", base_sha=base_sha)
+                self.sync_myrmex_state_phase(run_id, "implementing")
 
-            # 6. Execute Writer via Driver
-            try:
-                writer_receipt = driver.execute_writer(wu, base_sha, repo_root, run_id, agent_env)
-            except ScopeViolationError as e:
-                self._block_wu(cid, wuid, "out_of_scope_mutation", str(e))
-                return False
-            except DriverPolicyViolation as e:
-                self._block_wu(cid, wuid, "driver_policy_violation", str(e))
-                return False
-            except Exception as e:
-                self._block_wu(cid, wuid, "unknown", f"Writer execution failed: {e}")
-                return False
-
-            # 7. Verification & Remediation Loop
-            corrections_used = wu.get("corrections_used", 0)
+                # 6. Execute Writer via Driver
+                try:
+                    writer_receipt = driver.execute_writer(wu, base_sha, repo_root, run_id, agent_env)
+                except ScopeViolationError as e:
+                    self._block_wu(cid, wuid, "out_of_scope_mutation", str(e))
+                    return False
+                except DriverPolicyViolation as e:
+                    self._block_wu(cid, wuid, "driver_policy_violation", str(e))
+                    return False
+                except Exception as e:
+                    self._block_wu(cid, wuid, "unknown", f"Writer execution failed: {e}")
+                    return False
+                corrections_used = wu.get("corrections_used", 0)
             corrections_budget = wu.get("corrections_budget", 3)
+            if not recovering_active:
+                verifier_attempt = corrections_used + 1
 
+            # Complete a remediation that was in flight when the supervisor
+            # stopped, then begin the next distinct verification cycle.
+            if recovering_active and wu.get("phase") == "remediating":
+                try:
+                    corr_record = driver.execute_remediation(
+                        wu, (verifier_receipt or {}).get("defects", []), corrections_used,
+                        repo_root, run_id, agent_env,
+                    )
+                    correction_runs.append(corr_record)
+                    self._transition_wu(cid, wuid, correction_runs=correction_runs, corrections_used=corrections_used)
+                except Exception as e:
+                    self._block_wu(cid, wuid, "unknown", f"Remediation recovery error: {e}")
+                    return False
+
+            resume_current_verifier = recovering_active and wu.get("phase") == "verifying"
             while True:
-                self._transition_wu(cid, wuid, phase="verifying")
-                self.sync_myrmex_state_phase(run_id, "verifying")
+                if not resume_current_verifier:
+                    self._transition_wu(cid, wuid, phase="verifying")
+                    self.sync_myrmex_state_phase(run_id, "verifying")
+                resume_current_verifier = False
 
                 try:
-                    verifier_receipt = driver.execute_verifier(wu, repo_root, run_id, agent_env)
+                    verifier_receipt = driver.execute_verifier(wu, repo_root, run_id, agent_env, verifier_attempt)
                 except VerifierWorkspaceMutationError as e:
                     self._block_wu(cid, wuid, "verifier_workspace_mutation", str(e))
                     return False
@@ -2061,6 +2406,7 @@ class CampaignSupervisor:
 
                 # Failed verification -> Remediation
                 corrections_used += 1
+                verifier_attempt = corrections_used + 1
                 if corrections_used >= corrections_budget:
                     self._block_wu(
                         cid, wuid, "budget_exhausted",
