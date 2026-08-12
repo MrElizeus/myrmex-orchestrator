@@ -16,6 +16,7 @@ import json
 import hashlib
 import os
 import shutil
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ import importlib.machinery
 import importlib.util
 import types
 import inspect
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from unittest.mock import patch
 from pathlib import Path
 
@@ -101,7 +102,11 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
         )
         dummy_bin.chmod(0o755)
 
-        with patch.dict(os.environ, {"OPENCODE_BIN": str(dummy_bin)}):
+        data_home = Path(self.tmp_dir) / "data-empty"
+        with patch.dict(os.environ, {
+            "OPENCODE_BIN": str(dummy_bin),
+            "XDG_DATA_HOME": str(data_home),
+        }):
             identity, proc = opencode_transport.create_task({
                 "prompt": "Test prompt",
                 "agent": "myrmex-worker",
@@ -116,6 +121,77 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
             )
             self.assertEqual(snapshot.status, "failed")
             self.assertIsNone(snapshot.raw_export)
+
+    def test_03c_truncated_export_recovers_exact_local_session(self) -> None:
+        dummy_bin = Path(self.tmp_dir) / "opencode_truncated_export"
+        dummy_bin.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.buffer.write(b'{' + b'x' * 65535)\n",
+            encoding="utf-8",
+        )
+        dummy_bin.chmod(0o755)
+
+        data_home = Path(self.tmp_dir) / "data"
+        db_path = data_home / "opencode/opencode.db"
+        db_path.parent.mkdir(parents=True)
+        session_id = "ses_large_exact"
+        with closing(sqlite3.connect(db_path)) as connection:
+            connection.executescript("""
+                CREATE TABLE session (
+                    id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT,
+                    title TEXT, version TEXT, permission TEXT, time_created INTEGER,
+                    time_updated INTEGER, path TEXT, agent TEXT, model TEXT, cost REAL,
+                    tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+                    tokens_cache_read INTEGER, tokens_cache_write INTEGER
+                );
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+                );
+                CREATE TABLE part (
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                    time_created INTEGER, data TEXT
+                );
+            """)
+            connection.execute(
+                "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (session_id, "project", "slug", self.tmp_dir, "title", "1", "[]",
+                 1, 4, self.tmp_dir, "myrmex-worker", json.dumps({"id": "model"}),
+                 0.0, 1, 2, 3, 4, 5),
+            )
+            connection.executemany(
+                "INSERT INTO message VALUES (?,?,?,?)",
+                [
+                    ("msg_user", session_id, 1, json.dumps({"role": "user", "time": {"created": 1}})),
+                    ("msg_final", session_id, 3, json.dumps({
+                        "role": "assistant", "finish": "stop", "time": {"created": 3, "completed": 4}
+                    })),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO part VALUES (?,?,?,?,?)",
+                [
+                    ("part_large", "msg_user", session_id, 2,
+                     json.dumps({"type": "text", "text": "x" * 70000})),
+                    ("part_final", "msg_final", session_id, 4,
+                     json.dumps({"type": "text", "text": json.dumps({
+                         "decision": "COMPLETED", "summary": "no changes"
+                     })})),
+                ],
+            )
+            connection.commit()
+
+        with patch.dict(os.environ, {
+            "OPENCODE_BIN": str(dummy_bin),
+            "XDG_DATA_HOME": str(data_home),
+        }):
+            snapshot = opencode_transport.get_task(session_id, transport_state_dir=self.state_dir)
+            self.assertEqual(snapshot.status, "completed")
+            self.assertEqual(snapshot.raw_export["info"]["id"], session_id)
+            self.assertEqual(len(snapshot.raw_export["messages"][0]["parts"][0]["text"]), 70000)
+            result = opencode_transport.get_result(session_id, transport_state_dir=self.state_dir)
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.json_payload["decision"], "COMPLETED")
 
     def test_04_verifier_worktree_and_mutation_detection(self) -> None:
         # Setup git repo

@@ -13,10 +13,13 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import asdict, dataclass
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +138,141 @@ def _write_secure_json(path: Path, data: dict[str, Any]) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(str(temp_path), str(path))
+
+
+def _opencode_db_path() -> Path:
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share"))
+    return data_home / "opencode/opencode.db"
+
+
+def _load_local_session_export(task_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+    """Reconstruct one exact session when the CLI export stream is truncated.
+
+    OpenCode stores session/message/part payloads in its local SQLite database.
+    This fallback is read-only and returns nothing on any schema, identity, or
+    JSON ambiguity; callers must never treat a partial reconstruction as a
+    result receipt.
+    """
+    path = (db_path or _opencode_db_path()).expanduser()
+    if path.is_symlink() or not path.is_file():
+        return None
+
+    required = {
+        "session": {"id", "project_id", "slug", "directory", "title", "version", "time_created", "time_updated"},
+        "message": {"id", "session_id", "time_created", "data"},
+        "part": {"id", "message_id", "session_id", "time_created", "data"},
+    }
+    uri = f"file:{urllib.parse.quote(str(path.resolve()))}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            columns: dict[str, list[str]] = {}
+            for table, names in required.items():
+                table_columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+                if not names.issubset(table_columns):
+                    return None
+                columns[table] = table_columns
+
+            session_rows = connection.execute(
+                "SELECT * FROM session WHERE id = ?", (task_id,)
+            ).fetchall()
+            if len(session_rows) != 1:
+                return None
+            session = dict(zip(columns["session"], session_rows[0]))
+            if session.get("id") != task_id:
+                return None
+
+            message_rows = connection.execute(
+                "SELECT id, session_id, time_created, data FROM message "
+                "WHERE session_id = ? ORDER BY time_created, id",
+                (task_id,),
+            ).fetchall()
+            part_rows = connection.execute(
+                "SELECT id, message_id, session_id, time_created, data FROM part "
+                "WHERE session_id = ? ORDER BY time_created, id",
+                (task_id,),
+            ).fetchall()
+
+            messages: list[dict[str, Any]] = []
+            by_message: dict[str, dict[str, Any]] = {}
+            for message_id, session_id, _created, raw_data in message_rows:
+                if (not isinstance(message_id, str) or not message_id
+                        or session_id != task_id or message_id in by_message):
+                    return None
+                info = json.loads(raw_data)
+                if not isinstance(info, dict) or not isinstance(info.get("role"), str):
+                    return None
+                info = {**info, "id": message_id, "sessionID": task_id}
+                message = {"info": info, "parts": []}
+                by_message[message_id] = message
+                messages.append(message)
+
+            seen_parts: set[str] = set()
+            for part_id, message_id, session_id, _created, raw_data in part_rows:
+                if (not isinstance(part_id, str) or not part_id
+                        or session_id != task_id or part_id in seen_parts
+                        or message_id not in by_message):
+                    return None
+                part = json.loads(raw_data)
+                if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+                    return None
+                seen_parts.add(part_id)
+                by_message[message_id]["parts"].append({
+                    **part,
+                    "id": part_id,
+                    "sessionID": task_id,
+                    "messageID": message_id,
+                })
+
+            def parsed(name: str) -> Any:
+                value = session.get(name)
+                return json.loads(value) if isinstance(value, str) else value
+
+            info: dict[str, Any] = {
+                "id": task_id,
+                "slug": session["slug"],
+                "projectID": session["project_id"],
+                "directory": session["directory"],
+                "title": session["title"],
+                "version": session["version"],
+                "time": {
+                    "created": session["time_created"],
+                    "updated": session["time_updated"],
+                },
+            }
+            optional_scalars = {
+                "parent_id": "parentID", "share_url": "shareURL", "workspace_id": "workspaceID",
+                "path": "path", "agent": "agent", "cost": "cost",
+            }
+            for column, export_name in optional_scalars.items():
+                if session.get(column) is not None:
+                    info[export_name] = session[column]
+            for column in ("model", "permission", "revert", "metadata"):
+                if session.get(column) is not None:
+                    info[column] = parsed(column)
+            if all(session.get(name) is not None for name in ("summary_additions", "summary_deletions", "summary_files")):
+                info["summary"] = {
+                    "additions": session["summary_additions"],
+                    "deletions": session["summary_deletions"],
+                    "files": session["summary_files"],
+                }
+                if session.get("summary_diffs") is not None:
+                    info["summary"]["diffs"] = parsed("summary_diffs")
+            if all(session.get(name) is not None for name in (
+                    "tokens_input", "tokens_output", "tokens_reasoning",
+                    "tokens_cache_read", "tokens_cache_write")):
+                info["tokens"] = {
+                    "input": session["tokens_input"],
+                    "output": session["tokens_output"],
+                    "reasoning": session["tokens_reasoning"],
+                    "cache": {
+                        "read": session["tokens_cache_read"],
+                        "write": session["tokens_cache_write"],
+                    },
+                }
+            return {"info": info, "messages": messages}
+    except (json.JSONDecodeError, OSError, sqlite3.Error, TypeError, ValueError):
+        return None
 
 
 def create_task(
@@ -310,6 +448,8 @@ def get_task(task_id: str, transport_state_dir: Path | None = None) -> TaskSnaps
                 raw_export = json.loads(stdout_txt[json_start:])
             except Exception:
                 pass
+        if raw_export is None:
+            raw_export = _load_local_session_export(task_id)
 
     if raw_export is not None:
         messages = raw_export.get("messages", [])
