@@ -147,8 +147,8 @@
           "risk_class",
           "required_route",
           "human_gates",
-          "required_evidence",
-          "terminal_gate"
+            "required_evidence",
+            "terminal_gate"
         ],
         "properties": {
           "id": {
@@ -258,6 +258,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "no_op_allowed": {
+            "type": "boolean",
+            "default": false
           },
           "terminal_gate": {
             "type": "string",

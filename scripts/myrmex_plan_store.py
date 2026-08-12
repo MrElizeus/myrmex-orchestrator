@@ -113,7 +113,7 @@ RECORD_DIGEST_EXCLUDED = {"record_id", "record_digest"}
 WU_FIELDS = (
     "id", "objective", "non_goals", "dependencies", "scope", "acceptance_criteria",
     "verification", "risk_class", "required_route", "human_gates",
-    "required_evidence", "terminal_gate",
+    "required_evidence", "terminal_gate", "no_op_allowed",
 )
 WU_SCOPE_FIELDS = ("allowed_paths", "forbidden_paths")
 WU_VERIFICATION_FIELDS = ("commands", "manual_checks", "discover_when_missing")
@@ -257,7 +257,9 @@ def _validate_work_units(value: Any) -> None:
         raise PlanRecordInvalid("work_units must be a non-empty list")
     ids: list[str] = []
     for wu in value:
-        _obj_fields(wu, WU_FIELDS, "work_unit")
+        normalized = {**wu, "no_op_allowed": wu.get("no_op_allowed", False)}
+        _obj_fields(normalized, WU_FIELDS, "work_unit")
+        wu = normalized
         wu_id = _require_str(wu["id"], "work_unit.id")
         if not WU_ID_RE.fullmatch(wu_id):
             raise PlanRecordInvalid("work_unit.id must match ^WU-[A-Z0-9][A-Z0-9-]{0,30}$")
@@ -289,6 +291,8 @@ def _validate_work_units(value: Any) -> None:
             if gate["required_before"] not in ("plan_activation", "work_unit_ready", "repository_effect", "delivery"):
                 raise PlanRecordInvalid("human_gate.required_before must be plan_activation|work_unit_ready|repository_effect|delivery")
         _require_str_list(wu["required_evidence"], "work_unit.required_evidence")
+        if not isinstance(wu["no_op_allowed"], bool):
+            raise PlanRecordInvalid("work_unit.no_op_allowed must be a boolean")
         _require_str(wu["terminal_gate"], "work_unit.terminal_gate")
     if len(ids) != len(set(ids)):
         raise PlanRecordInvalid("work_unit IDs must be unique")

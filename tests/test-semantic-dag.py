@@ -66,6 +66,15 @@ with tempfile.TemporaryDirectory(prefix="myrmex-dag-state-") as state_home, temp
     assert first["validation_id"] == "dagval_" + first["validation_digest"]
     assert first["topological_order"] == ["WU-P1-009"] and first["critical_path"] == ["WU-P1-009"]
     assert first["defects"] == [] and first["authority"]["activate_plan"] is False
+    tampered_policy = copy.deepcopy(pristine)
+    tampered_policy["work_units"][0]["work_order"]["no_op_allowed"] = not tampered_policy["work_units"][0]["work_order"].get("no_op_allowed", False)
+    tampered_order = tampered_policy["work_units"][0]["work_order"]
+    tampered_order["work_order_digest"] = compiler._sha({key: value for key, value in tampered_order.items() if key not in {"work_order_id", "work_order_digest"}})
+    tampered_order["work_order_id"] = "wo_" + tampered_order["work_order_digest"]
+    campaign_file.write_text(json.dumps(tampered_policy, indent=2) + "\n", encoding="utf-8")
+    policy_result = json.loads(run_campaign(args, state_home, ok=False).stdout)
+    assert policy_result["status"] == "FAIL" and "DAG-022" in {item["code"] for item in policy_result["defects"]}
+    campaign_file.write_bytes(before_campaign)
     dag_validate.validate_result(first)
     tampered_receipt = copy.deepcopy(first); tampered_receipt["graph_digest"] = "0" * 64
     try:

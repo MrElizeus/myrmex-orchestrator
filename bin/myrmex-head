@@ -100,6 +100,24 @@ def compute_candidate_diff_digest(repo_root: Path, base_sha: str, modified_files
     return hashlib.sha256((output + "".join(untracked)).encode("utf-8")).hexdigest()
 
 
+def deterministic_no_op_receipt(campaign_id: str, wuid: str, base_sha: str, current_sha: str, diff_digest: str) -> dict[str, Any]:
+    """Typed receipt for an explicitly reviewed, unchanged repository candidate."""
+    body = {
+        "schema": "myrmex.no-op-receipt/v1", "status": "CONFIRMED",
+        "campaign_id": campaign_id, "work_unit_id": wuid, "base_sha": base_sha,
+        "current_sha": current_sha, "candidate_sha": current_sha,
+        "diff_digest": diff_digest, "modified_paths": [], "commit_sha": None,
+    }
+    return {**body, "receipt_digest": canonical_sha(body)}
+
+
+def validate_no_op_receipt(receipt: Any, campaign_id: str, wuid: str, base_sha: str, current_sha: str, diff_digest: str, repo_root: Path) -> None:
+    if not isinstance(receipt, dict) or receipt != deterministic_no_op_receipt(campaign_id, wuid, base_sha, current_sha, diff_digest):
+        raise RuntimeError("no-op receipt identity or digest mismatch")
+    if compute_candidate_diff_digest(repo_root, base_sha, []) != diff_digest:
+        raise RuntimeError("no-op receipt empty diff digest mismatch")
+
+
 # ============================================================================
 # Environment Sanitization & Security Boundaries
 # ============================================================================
@@ -751,7 +769,6 @@ class FixtureCommandDriver(WorkUnitExecutionDriver):
 
             diff_stat = run_argv(["git", "diff", "--stat", "HEAD"], cwd=repo_root, env=env).stdout.strip()
             diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
-
             return {
                 "driver": self.driver_name,
                 "agent": self.writer_agent,
@@ -1742,7 +1759,8 @@ class CampaignSupervisor:
             or (wu.get("commit_sha") and wu.get("commit_sha") == current_head)
             or (wu.get("candidate_sha") and wu.get("candidate_sha") == current_head)
         )
-        recovering_pre_commit = recovering_committing and not expected_commit_present
+        no_op_recovery = bool(wu.get("no_op_allowed", False)) and wu.get("phase") in {"committing", "delivering"} and isinstance(wu.get("no_op_receipt"), dict)
+        recovering_pre_commit = recovering_committing and not expected_commit_present and not no_op_recovery
 
         # A crash can leave the campaign ledger at delivering after the
         # commit effect, but before evidence recording/completion.  Keep that
@@ -1753,14 +1771,14 @@ class CampaignSupervisor:
             self._transition_wu(cid, wuid, phase="collecting-context")
             self.sync_myrmex_state_phase(run_id, "collecting-context")
 
-        already_committed = recovering_delivering or (recovering_committing and expected_commit_present) or (
+        already_committed = not no_op_recovery and (recovering_delivering or (recovering_committing and expected_commit_present) or (
             last_commit_msg.lower().startswith(f"feat({wuid.lower()}):") or
             (wu.get("commit_sha") and wu.get("commit_sha") == current_head) or
             (wu.get("candidate_sha") and wu.get("candidate_sha") == current_head)
-        )
+        ))
 
         vcmds = wu.get("verification_commands", [])
-        no_op_allowed = wu.get("no_op_allowed", False)
+        no_op_allowed = bool(wu.get("no_op_allowed", False))
         writer_receipt: dict[str, Any] | None = wu.get("writer_receipt") if recovering_pre_commit else None
         verifier_receipt: dict[str, Any] | None = wu.get("verifier_receipt") if recovering_pre_commit else None
         ci_operation: dict[str, Any] | None = wu.get("ci_operation") if recovering_pre_commit else None
@@ -1768,14 +1786,22 @@ class CampaignSupervisor:
         correction_runs: list[dict[str, Any]] = list(wu.get("correction_runs", []))
         candidate_sha: str = current_head
         diff_digest: str = (wu.get("diff_digest") or "") if recovering_pre_commit else ""
+        no_op_receipt = wu.get("no_op_receipt") if (no_op_recovery or recovering_pre_commit or recovering_delivering) else None
 
-        if recovering_pre_commit:
+        if no_op_recovery:
+            diff_digest = wu.get("diff_digest") or compute_candidate_diff_digest(repo_root, base_sha, [])
+            validate_no_op_receipt(no_op_receipt, cid, wuid, base_sha, current_head, diff_digest, repo_root)
+            writer_receipt = wu.get("writer_receipt")
+            verifier_receipt = wu.get("verifier_receipt")
+            ci_operation = wu.get("ci_operation")
+            candidate_sha = current_head
+        elif recovering_pre_commit:
             modified_files = writer_receipt.get("files_modified", []) if isinstance(writer_receipt, dict) else []
             complete_pre_commit_receipts = (
                 isinstance(writer_receipt, dict) and writer_receipt.get("status") == "SUCCESS"
                 and isinstance(verifier_receipt, dict) and verifier_receipt.get("status") == "PASS"
                 and isinstance(ci_operation, dict) and ci_operation.get("status") == "pass"
-                and isinstance(modified_files, list) and bool(modified_files)
+                and isinstance(modified_files, list)
                 and re.fullmatch(r"[0-9a-f]{64}", diff_digest) is not None
             )
             if complete_pre_commit_receipts:
@@ -1809,7 +1835,9 @@ class CampaignSupervisor:
                 correction_runs = list(wu.get("correction_runs", []))
                 diff_digest = ""
 
-        if already_committed:
+        if no_op_recovery:
+            pass
+        elif already_committed:
             sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} already committed at {current_head[:8]}; resuming recovery verification.\n")
             tree_sha = run_argv(["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root, env=agent_env).stdout.strip()
             writer_receipt = wu.get("writer_receipt")
@@ -1887,14 +1915,10 @@ class CampaignSupervisor:
         elif recovering_pre_commit:
             try:
                 commit_receipt = self.produce_governed_commit(
-                    run_id=run_id,
-                    repo_root=repo_root,
-                    wuid=wuid,
-                    objective=wu["objective"],
-                    base_sha=base_sha,
+                    run_id=run_id, repo_root=repo_root, wuid=wuid,
+                    objective=wu["objective"], base_sha=base_sha,
                     modified_files=writer_receipt.get("files_modified", []),
-                    diff_digest=diff_digest,
-                    cid=cid,
+                    diff_digest=diff_digest, cid=cid,
                 )
             except Exception as e:
                 self._block_wu(cid, wuid, "unknown", f"Governed git commit recovery failed: {e}")
@@ -1984,6 +2008,8 @@ class CampaignSupervisor:
                 self._block_wu(cid, wuid, "unknown", "Diff against base SHA is empty and no-op is not allowed")
                 return False
             diff_digest = compute_candidate_diff_digest(repo_root, base_sha, modified_files)
+            if no_op_allowed and not modified_files:
+                no_op_receipt = deterministic_no_op_receipt(cid, wuid, base_sha, current_head, diff_digest)
 
             # 9. Persist every pre-commit receipt before entering the effect
             # boundary.  Recovery can then resume or validate the governed
@@ -1996,13 +2022,18 @@ class CampaignSupervisor:
                 writer_receipt=writer_receipt,
                 verifier_receipt=verifier_receipt,
                 ci_op=ci_operation,
+                no_op_receipt=no_op_receipt,
                 correction_runs=correction_runs,
                 corrections_used=len(correction_runs),
             )
             self.sync_myrmex_state_phase(run_id, "committing")
 
             try:
-                commit_receipt = self.produce_governed_commit(
+                if no_op_allowed and not modified_files:
+                    commit_receipt = None
+                    candidate_sha = current_head
+                else:
+                    commit_receipt = self.produce_governed_commit(
                     run_id=run_id,
                     repo_root=repo_root,
                     wuid=wuid,
@@ -2011,12 +2042,13 @@ class CampaignSupervisor:
                     modified_files=modified_files,
                     diff_digest=diff_digest,
                     cid=cid,
-                )
+                    )
             except Exception as e:
                 self._block_wu(cid, wuid, "unknown", f"Governed git commit failed: {e}")
                 return False
 
-            candidate_sha = commit_receipt["commit_sha"]
+            if commit_receipt is not None:
+                candidate_sha = commit_receipt["commit_sha"]
 
         # 10. Delivering Phase.  Recovery is already persisted at this phase;
         # repeating the transition is rejected by the campaign state machine.
@@ -2024,7 +2056,7 @@ class CampaignSupervisor:
             self._transition_wu(
                 cid, wuid,
                 phase="delivering",
-                commit_sha=candidate_sha,
+                commit_sha=None if no_op_receipt else candidate_sha,
                 base_sha=base_sha,
                 candidate_sha=candidate_sha,
                 diff_digest=diff_digest,
@@ -2066,13 +2098,14 @@ class CampaignSupervisor:
             "correction_runs": correction_runs,
             "ci_operation": ci_operation,
             "commit_receipt": commit_receipt,
+            "no_op_receipt": no_op_receipt,
             "implementing_agent": writer_receipt.get("agent", "myrmex-worker"),
             "verifying_agent": verifier_receipt.get("agent", "myrmex-verifier"),
             "verification_commands_run": verifier_receipt.get("commands_run", []),
             "verification_results": verifier_receipt.get("results", []),
             "ci_result": ci_operation.get("status", "pass"),
             "ci_summary": f"CI command executed: {ci_operation.get('command')}",
-            "commit_sha": candidate_sha,
+            "commit_sha": None if no_op_receipt else candidate_sha,
             "pr_number": wu.get("pr_number"),
             "pr_url": wu.get("pr_url"),
             "external_receipts": [],
@@ -2087,7 +2120,8 @@ class CampaignSupervisor:
                 "base_sha": base_sha,
                 "candidate_sha": candidate_sha,
                 "diff_digest": diff_digest,
-                "commit_sha": candidate_sha,
+                "commit_sha": None if no_op_receipt else candidate_sha,
+                "no_op_receipt": no_op_receipt,
             }
             mismatched_identity = [
                 key for key, value in required_identity.items()
@@ -2127,7 +2161,8 @@ class CampaignSupervisor:
             )
             return False
         self._transition_wu(cid, wuid, phase="completed", status="completed")
-        sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} COMPLETED successfully with commit {candidate_sha[:8]}.\n")
+        outcome = "unchanged candidate/no-op" if no_op_receipt else f"commit {candidate_sha[:8]}"
+        sys.stdout.write(f"[myrmex-head] [{cid}] Work unit {wuid} COMPLETED successfully with {outcome}.\n")
         return True
 
     def _transition_wu(
@@ -2140,6 +2175,7 @@ class CampaignSupervisor:
         base_sha: str | None = None,
         candidate_sha: str | None = None,
         diff_digest: str | None = None,
+        no_op_receipt: dict[str, Any] | None = None,
         run_id: str | None = None,
         writer_receipt: dict[str, Any] | None = None,
         verifier_receipt: dict[str, Any] | None = None,
@@ -2175,6 +2211,8 @@ class CampaignSupervisor:
             cmd.extend(["--ci-op", json.dumps(ci_op)])
         if commit_receipt is not None:
             cmd.extend(["--commit-receipt", json.dumps(commit_receipt)])
+        if no_op_receipt is not None:
+            cmd.extend(["--no-op-receipt", json.dumps(no_op_receipt)])
         if correction_runs is not None:
             cmd.extend(["--correction-runs", json.dumps(correction_runs)])
         if corrections_used is not None:

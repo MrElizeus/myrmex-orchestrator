@@ -277,7 +277,9 @@ def validate_semantic_dag(
                 ("human_gates", "human_gates"), ("expected_evidence", "required_evidence"),
                 ("terminal_gate", "terminal_gate"),
             )
-            if any(order_contract[left] != expected[right] for left, right in pairs) or order_contract["scope"] != {
+            semantics_match = not any(order_contract[left] != expected[right] for left, right in pairs)
+            semantics_match = semantics_match and order_contract["no_op_allowed"] == expected.get("no_op_allowed", False)
+            if not semantics_match or order_contract["scope"] != {
                 "allowed_paths": expected["scope"]["allowed_paths"],
                 "forbidden_paths": expected["scope"]["forbidden_paths"],
                 "preexisting_dirty_paths": order_contract["scope"]["preexisting_dirty_paths"],

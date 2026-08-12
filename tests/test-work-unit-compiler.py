@@ -17,6 +17,7 @@ BIN = ROOT / "bin/myrmex-campaign"
 sys.path.insert(0, str(ROOT / "scripts"))
 import myrmex_plan_critic as critic  # noqa: E402
 import myrmex_work_unit_compiler as compiler  # noqa: E402
+import myrmex_plan_store as plan_store  # noqa: E402
 
 
 def run_campaign(args, state_home, ok=True):
@@ -36,6 +37,15 @@ critic_fixtures = runpy.run_path(str(ROOT / "tests/test-plan-critic.py"))
 fixture = critic_fixtures["fixture"]
 make_review = critic_fixtures["make_review"]
 source_root, campaign_id, planning_request_id, planner_task_id, proposed = fixture("compiler")
+
+# Omitted policy is legacy-compatible and does not alter the original digest;
+# explicitly enabling review-only execution is identity-bearing.
+legacy_wu = copy.deepcopy(proposed["work_units"][0])
+legacy_digest = plan_store.compute_plan_digest(proposed)
+assert "no_op_allowed" not in legacy_wu
+enabled = copy.deepcopy(proposed)
+enabled["work_units"][0]["no_op_allowed"] = True
+assert plan_store.compute_plan_digest(enabled) != legacy_digest
 
 campaign = {
     "id": campaign_id, "revision": 1, "repository_root": "/repo",
@@ -85,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix="myrmex-compiler-state-") as state_dir, 
     assert after_tree == before_tree, "preview must be byte-for-byte read-only"
     assert len(preview_data["work_orders"]) == 1
     order = preview_data["work_orders"][0]
+    assert order["no_op_allowed"] is False
     assert order["plan_provenance"]["plan_revision_id"] == proposed["plan_revision_id"]
     assert order["plan_provenance"]["review_digest"] == review["review_digest"]
     assert order["backlog_provenance"] and order["scope"]["preexisting_dirty_paths"] == ["protected.txt"]
@@ -92,6 +103,34 @@ with tempfile.TemporaryDirectory(prefix="myrmex-compiler-state-") as state_dir, 
     assert order["verification"]["commands"] and order["risk_class"] == "bounded"
     assert order["required_route"] == "direct-only" and order["expected_evidence"] and order["terminal_gate"]
     compiler.validate_work_order(order)
+
+    # An explicitly reviewed no-op policy is identity-bearing and must reach
+    # both compiler projections, not merely the source plan digest.
+    reviewed = compiler._reviewed_head_read_only(source_root, campaign_id, proposed["plan_revision_id"])
+    review_receipt = compiler._review_receipt(source_root, campaign_id, reviewed)
+    request, result = compiler._planning_result(source_root, campaign_id, reviewed)
+    snapshot, items = compiler._backlog_items(source_root, campaign_id, request)
+    explicit_plan_wu = copy.deepcopy(proposed["work_units"][0])
+    explicit_plan_wu["no_op_allowed"] = True
+    explicit_order = compiler.compile_work_order(
+        campaign, reviewed, review_receipt, snapshot, items,
+        result["coverage_matrix"], explicit_plan_wu, [],
+    )
+    explicit_campaign_wu = {
+        "id": explicit_order["work_unit_id"],
+        "objective": explicit_order["objective"],
+        "dependencies": explicit_order["dependencies"],
+        "scope": explicit_order["scope"]["allowed_paths"],
+        "acceptance_criteria": explicit_order["acceptance_criteria"],
+        "verification_commands": explicit_order["verification"]["commands"],
+        "risk_class": explicit_order["risk_class"],
+        "required_route": explicit_order["required_route"],
+        "no_op_allowed": explicit_order["no_op_allowed"],
+        "work_order": explicit_order,
+    }
+    assert explicit_order["no_op_allowed"] is True
+    assert explicit_campaign_wu["no_op_allowed"] is True
+    compiler.validate_work_order(explicit_campaign_wu["work_order"])
 
     stale = run_campaign([
         "plan-compile-apply", campaign_id, "--plan-revision-id", proposed["plan_revision_id"],

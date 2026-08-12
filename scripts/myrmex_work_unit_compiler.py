@@ -141,7 +141,7 @@ def validate_work_order(order: Any) -> None:
         "schema", "work_order_id", "work_order_digest", "campaign_id", "work_unit_id",
         "plan_provenance", "backlog_provenance", "objective", "non_goals", "dependencies",
         "repository_root", "base_sha", "scope", "acceptance_criteria", "verification",
-        "risk_class", "required_route", "human_gates", "expected_evidence", "terminal_gate", "git_policy",
+        "risk_class", "required_route", "human_gates", "expected_evidence", "terminal_gate", "git_policy", "no_op_allowed",
     }
     if not isinstance(order, dict) or set(order) != required or order.get("schema") != WORK_ORDER_SCHEMA:
         raise WorkUnitCompileInputInvalid("work order fields/schema invalid")
@@ -189,6 +189,7 @@ def compile_work_order(campaign, reviewed, review_receipt, snapshot, items, cove
         "risk_class": plan_wu["risk_class"], "required_route": plan_wu["required_route"],
         "human_gates": plan_wu["human_gates"], "expected_evidence": plan_wu["required_evidence"],
         "terminal_gate": plan_wu["terminal_gate"], "git_policy": {"commit": False, "push": False},
+        "no_op_allowed": plan_wu.get("no_op_allowed", False),
     }
     order["work_order_digest"] = _sha({key: value for key, value in order.items() if key not in {"work_order_id", "work_order_digest"}})
     order["work_order_id"] = "wo_" + order["work_order_digest"]
@@ -214,8 +215,9 @@ def compile_reviewed_plan(campaign_dir, campaign, expected_campaign_revision, pl
         "dependencies": order["dependencies"], "scope": order["scope"]["allowed_paths"],
         "acceptance_criteria": order["acceptance_criteria"],
         "verification_commands": order["verification"]["commands"],
-        "risk_class": order["risk_class"], "required_route": order["required_route"],
-        "work_order": order,
+         "risk_class": order["risk_class"], "required_route": order["required_route"],
+         "no_op_allowed": order["no_op_allowed"],
+         "work_order": order,
     } for order in orders]
     traceability = [{
         "backlog_item_id": item_id,

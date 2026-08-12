@@ -550,7 +550,8 @@ def add_wu_to_data(data: dict[str, Any], wu_spec: dict[str, Any]) -> None:
         "implementation_command": wu_spec.get("implementation_command"),
         "remediation_command": wu_spec.get("remediation_command"),
         "ci_command": wu_spec.get("ci_command"),
-        "no_op_allowed": wu_spec.get("no_op_allowed", False),
+         "no_op_allowed": wu_spec.get("no_op_allowed", False),
+         "no_op_receipt": None,
         "defects_found": [],
         "corrections_applied": [],
         "implementing_agent": None,
@@ -887,6 +888,8 @@ def cmd_wu_transition(args: argparse.Namespace) -> int:
 
     if args.commit_receipt:
         wu["commit_receipt"] = _parse_receipt(args.commit_receipt)
+    if args.no_op_receipt:
+        wu["no_op_receipt"] = _parse_receipt(args.no_op_receipt)
 
     correction_runs_arg = None
     if args.correction_runs:
@@ -1938,6 +1941,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_wut.add_argument("--verifier-receipt", help="JSON string or file path for verifier receipt")
     p_wut.add_argument("--ci-op", help="JSON string or file path for CI operation")
     p_wut.add_argument("--commit-receipt", help="JSON string or file path for commit receipt")
+    p_wut.add_argument("--no-op-receipt", help="JSON string or file path for deterministic no-op receipt")
     p_wut.add_argument("--correction-runs", help="JSON array of durable correction receipts")
     p_wut.add_argument("--corrections-used", type=int, help="Monotonic correction-attempt count")
     p_wut.add_argument("--pr-number", type=int, help="Pull request number")

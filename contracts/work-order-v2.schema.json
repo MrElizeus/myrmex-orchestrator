@@ -10,7 +10,7 @@
     "plan_provenance", "backlog_provenance", "objective", "non_goals", "dependencies",
     "repository_root", "base_sha", "scope", "acceptance_criteria", "verification",
     "risk_class", "required_route", "human_gates", "expected_evidence", "terminal_gate",
-    "git_policy"
+    "git_policy", "no_op_allowed"
   ],
   "properties": {
     "schema": {"const": "myrmex.work-order/v2"},
@@ -72,6 +72,7 @@
     "human_gates": {"type": "array", "items": {"type": "object"}},
     "expected_evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
     "terminal_gate": {"type": "string", "minLength": 1},
+    "no_op_allowed": {"type": "boolean", "default": false},
     "git_policy": {
       "type": "object", "additionalProperties": false, "required": ["commit", "push"],
       "properties": {"commit": {"const": false}, "push": {"const": false}}

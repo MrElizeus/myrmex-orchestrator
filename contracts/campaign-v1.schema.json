@@ -263,6 +263,7 @@
         },
         "ci_operation": {"type": ["object", "null"]},
         "commit_receipt": {"type": ["object", "null"]},
+        "no_op_receipt": {"type": ["object", "null"]},
         "implementation_command": {
           "type": ["string", "array", "null"],
           "items": {"type": "string"}
