@@ -2392,7 +2392,7 @@ class CampaignSupervisor:
                 except Exception as e:
                     self._block_wu(cid, wuid, "ambiguous_missing_receipt", f"Active recovery evidence unavailable: {e}")
                     return False
-                corrections_used = remediation_attempt
+                corrections_used = wu.get("corrections_used", 0)
             else:
                 # 5. Transition to implementing
                 self._transition_wu(cid, wuid, phase="implementing", base_sha=base_sha)
@@ -2420,10 +2420,11 @@ class CampaignSupervisor:
             if recovering_active and wu.get("phase") == "remediating":
                 try:
                     corr_record = driver.execute_remediation(
-                        wu, (verifier_receipt or {}).get("defects", []), corrections_used,
+                        wu, (verifier_receipt or {}).get("defects", []), remediation_attempt,
                         repo_root, run_id, agent_env,
                     )
                     correction_runs.append(corr_record)
+                    corrections_used = max(corrections_used, remediation_attempt)
                     self._transition_wu(cid, wuid, correction_runs=correction_runs, corrections_used=corrections_used)
                 except Exception as e:
                     self._block_wu(cid, wuid, "unknown", f"Remediation recovery error: {e}")
@@ -2450,8 +2451,8 @@ class CampaignSupervisor:
 
                 # Failed verification -> Remediation
                 corrections_used += 1
-                verifier_attempt = corrections_used + 1
-                if corrections_used >= corrections_budget:
+                verifier_attempt += 1
+                if corrections_used > corrections_budget:
                     self._block_wu(
                         cid, wuid, "budget_exhausted",
                         f"corrections budget exhausted ({corrections_used}/{corrections_budget})"
