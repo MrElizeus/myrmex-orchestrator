@@ -399,7 +399,6 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
 
     def test_E_production_remediating_recovery_effects_are_bound(self) -> None:
         head = self._production_head(); root = Path(self.tmp_dir) / "ledger-E"
-        head.CampaignSupervisor.active_recovery_attempts = staticmethod(head.OpenCodeTaskDriver.active_recovery_attempts)
         writer = root / "camp-E" / "WU-E"; verifier = root / "camp-E" / "WU-E-verifier"
         writer.mkdir(parents=True); verifier.mkdir(parents=True)
         candidate, digest = "4" * 40, "e" * 64

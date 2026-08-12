@@ -2337,7 +2337,9 @@ class CampaignSupervisor:
             if recovering_active:
                 # The writer already completed before this active phase was
                 # persisted. Reuse its evidence rather than dispatching it again.
-                remediation_attempt, verifier_attempt = self.active_recovery_attempts(wu.get("phase"), wu.get("corrections_used", 0))
+                remediation_attempt, verifier_attempt = OpenCodeTaskDriver.active_recovery_attempts(
+                    wu.get("phase"), wu.get("corrections_used", 0)
+                )
                 try:
                     if not hasattr(driver, "recover_active_receipts"):
                         raise ExecutionDriverError("active recovery requires an OpenCodeTaskDriver")
