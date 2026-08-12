@@ -515,6 +515,43 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
         verifier = (remediation + 1) if remediation is not None else corrections_used + 1
         return (remediation or verifier, verifier)
 
+    @staticmethod
+    def verifier_attempt_after_infrastructure_failure(
+        run_id: str,
+        wuid: str,
+        attempt: int,
+        max_successor_attempts: int = 1,
+    ) -> int:
+        """Skip one durable verifier-only infrastructure failure.
+
+        A verifier workspace mutation is not a candidate defect and must not
+        consume a writer correction. Preserve the failed operation and allow
+        one fresh verifier identity; repeated mutation fails closed.
+        """
+        current = attempt
+        successors = 0
+        while True:
+            op = myrmex_task_operation.find_existing_op_for_phase(
+                run_id, wuid, "verifier", current
+            )
+            retryable = (
+                op is not None
+                and op.status == "failed"
+                and op.error_type == "VERIFIER_MUTATION"
+                and bool(op.task_id)
+                and isinstance(op.receipt, dict)
+                and op.receipt.get("phase") == "TASK_TERMINAL"
+                and op.receipt.get("observed_task_id") == op.task_id
+            )
+            if not retryable:
+                return current
+            successors += 1
+            if successors > max_successor_attempts:
+                raise ExecutionDriverError(
+                    "verifier infrastructure retry budget exhausted after workspace mutation"
+                )
+            current += 1
+
     def execute_writer(
         self,
         wu: dict[str, Any],
@@ -785,6 +822,7 @@ class OpenCodeTaskDriver(WorkUnitExecutionDriver):
             f"Diff Digest: {diff_digest}\n"
             f"Verification Commands and Manual Checks: {self._prompt_context(wu)}\n"
             f"Inspect workspace strictly in read-only mode; do not modify files, commit, push, or create PRs. Respond with valid JSON:\n"
+            f"Run only the listed verification commands and read-only inspections. Do not install dependencies or run commands that create or update caches, lockfiles, node_modules, build output, or generated files.\n"
             f"{{\n"
             f'  "decision": "PASS|FAIL|BLOCKED",\n'
             f'  "candidate_sha": "{cand_sha}",\n'
@@ -2340,6 +2378,10 @@ class CampaignSupervisor:
                 remediation_attempt, verifier_attempt = OpenCodeTaskDriver.active_recovery_attempts(
                     wu.get("phase"), wu.get("corrections_used", 0)
                 )
+                if isinstance(driver, OpenCodeTaskDriver):
+                    verifier_attempt = driver.verifier_attempt_after_infrastructure_failure(
+                        run_id, wuid, verifier_attempt
+                    )
                 try:
                     if not hasattr(driver, "recover_active_receipts"):
                         raise ExecutionDriverError("active recovery requires an OpenCodeTaskDriver")

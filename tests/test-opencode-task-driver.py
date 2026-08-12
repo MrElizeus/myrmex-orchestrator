@@ -587,6 +587,76 @@ class TestOpenCodeTaskDriverP012(unittest.TestCase):
                 self.assertEqual(op.status, status); self.assertEqual(op.receipt["phase"], "RESULT_RECEIPT_CONFIRMED"); task_ids.append(op.task_id)
         self.assertEqual(len(task_ids), len(set(task_ids)))
 
+    def test_G_verifier_mutation_uses_one_successor_without_writer_correction(self) -> None:
+        head = self._production_head(); root = Path(self.tmp_dir) / "ledger-G"
+        writer = root / "camp-G" / "WU-G"; verifier = root / "camp-G" / "WU-G-verifier"
+        writer.mkdir(parents=True); verifier.mkdir(parents=True)
+        candidate, digest, run = "6" * 40, "a" * 64, "run-G"
+        wu = {"id":"WU-G", "campaign_id":"camp-G", "objective":"retry verifier only", "phase":"verifying",
+              "corrections_used":1, "corrections_budget":3, "no_op_allowed":True, "scope":[],
+              "verification_commands":["git status --short"], "base_sha":candidate,
+              "implementing_agent":"writer", "verifying_agent":"verifier", "provider":"opencode",
+              "model":"default", "correction_runs":[{"attempt":1}]}
+        self._seed_real_op(head, campaign="camp-G", wuid="WU-G", run=run, role="writer", attempt=1,
+            agent="writer", workspace=writer, base_sha=candidate, task_id="task-G-writer",
+            status="completed", diff_digest=digest)
+        failed = head.myrmex_task_operation.create_task_intent(
+            campaign_id="camp-G", work_unit_id="WU-G", run_id=run, role="verifier", agent="verifier",
+            workspace=str(verifier), base_sha=candidate, prompt="old verifier", provider="opencode",
+            model="default", attempt=2)
+        head.myrmex_task_operation.record_task_observed(failed, "task-G-verifier-2")
+        head.myrmex_task_operation.record_task_terminal(
+            failed, "failed", "Verifier mutated workspace", error_type="VERIFIER_MUTATION")
+
+        created = []
+        def create_task(request):
+            created.append(request)
+            return types.SimpleNamespace(task_id="task-G-verifier-3"), object()
+        payload = {"decision":"PASS", "candidate_sha":candidate, "diff_digest":digest,
+                   "defects":[], "checks":[], "residual_risks":[]}
+        driver = head.OpenCodeTaskDriver()
+        contexts = self._stable_external_boundaries(head, root, writer, verifier, candidate, digest)
+        contexts += [patch.object(head.opencode_transport, "create_task", side_effect=create_task),
+                     patch.object(head.opencode_transport, "wait_task", return_value=types.SimpleNamespace(status="completed")),
+                     patch.object(head.opencode_transport, "get_result", return_value=types.SimpleNamespace(
+                         status="completed", error_type=None, text_content=json.dumps(payload), json_payload=payload)),
+                     patch.object(head.CampaignSupervisor, "ensure_myrmex_state_run", return_value=run),
+                     patch.object(head.CampaignSupervisor, "resolve_execution_driver", return_value=driver),
+                     patch.object(head.CampaignSupervisor, "_transition_wu"),
+                     patch.object(head.CampaignSupervisor, "sync_myrmex_state_phase"),
+                     patch.object(head.CampaignSupervisor, "produce_governed_commit"),
+                     patch.object(head.CampaignSupervisor, "_block_wu"),
+                     patch.object(head.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout="", stderr="")),
+                     patch.object(head.CampaignSupervisor, "complete_myrmex_state_run", return_value=True)]
+        with ExitStack() as stack:
+            for context in contexts: stack.enter_context(context)
+            result = head.CampaignSupervisor().run_work_unit(
+                "camp-G", {"repository_root":str(root), "branch":"main", "status":"active"}, wu)
+        self.assertTrue(result)
+        self.assertEqual(len(created), 1)
+        self.assertIn("Do not install dependencies", created[0]["prompt"])
+        self.assertEqual(failed.receipt["phase"], "TASK_TERMINAL")
+        successor = head.myrmex_task_operation.find_existing_op_for_phase(run, "WU-G", "verifier", 3)
+        self.assertIsNotNone(successor)
+        self.assertEqual(successor.receipt["phase"], "RESULT_RECEIPT_CONFIRMED")
+        self.assertEqual(wu["corrections_used"], 1)
+
+    def test_H_repeated_verifier_mutation_exhausts_successor_budget(self) -> None:
+        head = self._production_head()
+        operations = {}
+        for attempt in (2, 3):
+            operations[attempt] = types.SimpleNamespace(
+                status="failed", error_type="VERIFIER_MUTATION", task_id=f"task-{attempt}",
+                receipt={"phase":"TASK_TERMINAL", "observed_task_id":f"task-{attempt}"})
+        with patch.object(
+            head.myrmex_task_operation, "find_existing_op_for_phase",
+            side_effect=lambda _run, _wuid, _role, attempt: operations.get(attempt),
+        ):
+            with self.assertRaises(head.ExecutionDriverError):
+                head.OpenCodeTaskDriver.verifier_attempt_after_infrastructure_failure(
+                    "run-H", "WU-H", 2
+                )
+
     def test_D_no_op_delivery_recovery_uses_durable_writer_or_blocks(self) -> None:
         head = self._production_head(); root = Path(self.tmp_dir) / "noop-D"; root.mkdir()
         candidate, digest, run, cid, wuid = "6" * 40, "d" * 64, "run-D", "camp-D", "WU-D"
