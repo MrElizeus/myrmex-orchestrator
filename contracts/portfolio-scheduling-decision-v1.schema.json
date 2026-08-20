@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:myrmex:schema:portfolio-scheduling-decision:v1",
+  "title": "Myrmex Portfolio Scheduling Decision v1",
+  "description": "A read-only, digest-addressed candidate coordination preview across campaigns. It grants no dispatch or execution authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "decision_id",
+    "decision_digest",
+    "portfolio_state_digest",
+    "max_concurrent_wu",
+    "active_work_unit_count",
+    "policy",
+    "campaigns",
+    "considered_candidates",
+    "eligible_candidate_ids",
+    "selected_candidate_ids",
+    "selection_reason",
+    "authority"
+  ],
+  "properties": {
+    "schema": {"const": "myrmex.portfolio-scheduling-decision/v1"},
+    "decision_id": {"type": "string", "pattern": "^portfolio_schedule_[0-9a-f]{64}$"},
+    "decision_digest": {"$ref": "#/$defs/digest"},
+    "portfolio_state_digest": {"$ref": "#/$defs/digest"},
+    "max_concurrent_wu": {"type": "integer", "minimum": 1},
+    "active_work_unit_count": {"type": "integer", "minimum": 0},
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "hard_constraints", "weights", "tie_breakers", "policy_digest"],
+      "properties": {
+        "schema": {"const": "myrmex.priority-policy/v1"},
+        "version": {"const": "1.0.0"},
+        "hard_constraints": {"type": "array", "const": ["campaign_active", "schedulable_status", "dependencies_completed", "human_gates_cleared", "work_unit_unblocked", "work_unit_budget_available", "campaign_budget_available", "route_budget_available", "cost_budget_available", "failure_limit_available", "concurrency_available"]},
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical_path_length", "downstream_unlock_count", "age_minutes"],
+          "properties": {
+            "critical_path_length": {"const": 1000},
+            "downstream_unlock_count": {"const": 100},
+            "age_minutes": {"const": 1}
+          }
+        },
+        "tie_breakers": {"type": "array", "const": ["score_desc", "work_unit_id_asc"]},
+        "policy_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "campaigns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/campaign"}
+    },
+    "considered_candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "eligible_candidate_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/candidateId"}
+    },
+    "selected_candidate_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/candidateId"}
+    },
+    "selection_reason": {
+      "enum": ["highest_score_then_stable_id", "no_available_candidate", "portfolio_concurrency_exhausted"]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "dispatch", "start_run", "repository_write", "commit", "push"],
+      "properties": {
+        "scope": {"const": "portfolio_schedule_preview_only"},
+        "dispatch": {"const": false},
+        "start_run": {"const": false},
+        "repository_write": {"const": false},
+        "commit": {"const": false},
+        "push": {"const": false}
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "campaignId": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}$"},
+    "workUnitId": {"type": "string", "pattern": "^WU-[A-Z0-9][A-Z0-9-]{0,30}$"},
+    "candidateId": {"type": "string", "pattern": "^camp-[a-z0-9][a-z0-9-]{4,60}/WU-[A-Z0-9][A-Z0-9-]{0,30}$"},
+    "campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "campaign_revision", "campaign_state_digest", "observed_campaign_updated_at", "local_decision_digest", "campaign_max_concurrent_wu", "active_work_unit_count"],
+      "properties": {
+        "campaign_id": {"$ref": "#/$defs/campaignId"},
+        "campaign_revision": {"type": "integer", "minimum": 1},
+        "campaign_state_digest": {"$ref": "#/$defs/digest"},
+        "observed_campaign_updated_at": {"type": "string", "format": "date-time"},
+        "local_decision_digest": {"$ref": "#/$defs/digest"},
+        "campaign_max_concurrent_wu": {"type": "integer", "minimum": 1},
+        "active_work_unit_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["age_minutes", "critical_path_length", "downstream_unlock_count", "dependency_count", "completed_dependency_count"],
+      "properties": {
+        "age_minutes": {"type": "integer", "minimum": 0},
+        "critical_path_length": {"type": "integer", "minimum": 1},
+        "downstream_unlock_count": {"type": "integer", "minimum": 0},
+        "dependency_count": {"type": "integer", "minimum": 0},
+        "completed_dependency_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "campaign_id", "campaign_revision", "campaign_state_digest", "work_unit_id", "status", "source_index", "eligible", "exclusion_reasons", "features", "score", "local_rank", "portfolio_rank"],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/candidateId"},
+        "campaign_id": {"$ref": "#/$defs/campaignId"},
+        "campaign_revision": {"type": "integer", "minimum": 1},
+        "campaign_state_digest": {"$ref": "#/$defs/digest"},
+        "work_unit_id": {"$ref": "#/$defs/workUnitId"},
+        "status": {"enum": ["pending", "ready", "active", "verifying", "remediating", "ci", "delivering", "completed", "blocked", "failed", "cancelled", "superseded"]},
+        "source_index": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "boolean"},
+        "exclusion_reasons": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "features": {"$ref": "#/$defs/features"},
+        "score": {"type": ["integer", "null"]},
+        "local_rank": {"type": ["integer", "null"], "minimum": 1},
+        "portfolio_rank": {"type": ["integer", "null"], "minimum": 1}
+      }
+    }
+  }
+}

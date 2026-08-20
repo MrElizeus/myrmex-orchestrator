@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added the read-only P2 portfolio scheduler: deterministic multi-campaign
+  candidate coordination with an explicit global concurrency ceiling,
+  digest-addressed decisions, and no dispatch or repository authority.
 - Added explicit execution-policy resolution for new runs: clear prompts persist
   their route, while ambiguous prompts reconcile to `REQUEST_EXECUTION_POLICY`
   before any effect.

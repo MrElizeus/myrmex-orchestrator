@@ -480,6 +480,28 @@ through a revision-less generic patch. It writes `PR_CREATED_LABEL_PENDING`
 immediately after creation and can use the issue-label REST fallback when
 `gh pr edit --add-label` lacks Projects scope, without creating a duplicate PR.
 
+## P2 portfolio candidate preview
+
+The per-campaign priority policy remains the authoritative source for local
+eligibility and scoring. To coordinate candidates across several campaigns,
+run the read-only P2 preview with an explicit global concurrency ceiling:
+
+```bash
+myrmex-campaign portfolio-schedule-preview --max-concurrent-wu 2
+myrmex-campaign portfolio-schedule-preview --max-concurrent-wu 2 \
+  --campaign-id camp-alpha --campaign-id camp-beta
+```
+
+The command reads each selected `campaign.json` once, fails closed on an
+unreadable or invalid snapshot, and returns
+`myrmex.portfolio-scheduling-decision/v1`. Candidates are ordered by the
+existing deterministic score and then the stable `campaign_id/WU-id` identity.
+Already-active work units consume the global capacity before new candidates are
+selected. The decision is a preview only: it does not dispatch a Task, change a
+campaign revision, acquire a lease, write a sidecar artifact, or authorize
+repository effects. A supervisor must revalidate the exact campaign revisions
+and use its existing state-first dispatch gates before execution.
+
 ## Updating
 
 Re-run `install.sh` from a newer package. Existing Myrmex files and the state binary are timestamped into backups before replacement. Unrelated files remain untouched.

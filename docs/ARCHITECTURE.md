@@ -33,9 +33,18 @@ P1-011 semantic DAG validation binds those work orders back to the reviewed plan
 
 P1-013 adds an immutable replan-trigger ledger above the active-plan receipt. Typed source, repository, blocker, failure, defect, budget, provider, memory-refutation, and human-decision signals carry exact evidence artifact identities and stable digests. Recording a signal is idempotent and explicitly lacks authority to mutate the active plan, create a revision or WU, or perform repository effects.
 
+P2 adds a read-only portfolio coordinator over the per-campaign priority
+previews. It reads one immutable campaign snapshot per selected campaign,
+coordinates candidate identities with a stable score/ID order, and applies an
+explicit global `max_concurrent_wu` ceiling. The resulting
+`myrmex.portfolio-scheduling-decision/v1` is digest-addressed and carries no
+dispatch, run-start, repository, commit, or push authority. It does not mutate
+campaign state or launch parallel work; execution remains behind the existing
+state-first P1 supervisor gates.
+
 `myrmex-memory` is a separate dependency-free local JSONL/index backend for evidence-backed claims: private **project** architecture invariants, decisions, conventions, and known failure modes, plus sanitized **installation**-local operational lessons. It records candidate, verified, revoked, superseded, and confirmed lifecycle snapshots without turning semantic memory into a transaction database. Installation retrieval is filtered/ranked by tool/model applicability and freshness (TTL/decay); project scope ranks first. The primary is the sole native-memory writer/promoter/revoker/confirmer; browser/scout/worker/verifier return evidence or `memory_candidates` only.
 
-Installation promotion is an explicit privacy boundary: raw project-private claims and proof metadata are never copied. The backend validates a newly supplied local proof, then stores only a digest-derived sanitized handle with an opaque source-memory reference. Normalized work-unit metrics live in a separate installation-local JSONL stream, so they cannot alter semantic confidence, policy, or exact run state. There is no cross-installation sharing, model training, automatic policy change, daemon, or scheduler.
+Installation promotion is an explicit privacy boundary: raw project-private claims and proof metadata are never copied. The backend validates a newly supplied local proof, then stores only a digest-derived sanitized handle with an opaque source-memory reference. Normalized work-unit metrics live in a separate installation-local JSONL stream, so they cannot alter semantic confidence, policy, or exact run state. There is no cross-installation sharing, model training, automatic policy change, or autonomous portfolio dispatch daemon. The P2 scheduler is an explicit read-only preview boundary.
 
 Engram remains an optional semantic adapter for compact continuity across sessions. Exact run state and receipts stay in `myrmex-state`; native memory and Engram can degrade safely rather than inventing a receipt. This split keeps recovery durable without a database service, vector store, or daemon.
 
@@ -45,4 +54,4 @@ The frontier model is a planning/validation authority for one stated objective. 
 
 ## Deliberate v0.1 boundaries
 
-Myrmex does not introduce a daemon, custom OpenCode plugin, parallel worktree scheduler, review framework, or deployment engine. OpenCode supplies agents/tasks; the state CLI supplies exact recovery. Add heavier infrastructure only after a demonstrated operational need.
+Myrmex does not introduce a daemon, custom OpenCode plugin, parallel worktree scheduler, review framework, or deployment engine. OpenCode supplies agents/tasks; the state CLI supplies exact recovery. The P2 portfolio preview coordinates candidates without acquiring execution authority. Add heavier infrastructure only after a demonstrated operational need.

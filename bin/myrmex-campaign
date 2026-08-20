@@ -166,6 +166,20 @@ def _priority_policy_runtime():
     return importlib.import_module("myrmex_priority_policy")
 
 
+def _portfolio_scheduler_runtime():
+    """Load the read-only P2 portfolio candidate coordinator."""
+    import importlib
+
+    support = _bundled_scripts_dir((
+        "myrmex_campaign_intelligence.py",
+        "myrmex_priority_policy.py",
+        "myrmex_portfolio_scheduler.py",
+    ))
+    if str(support) not in sys.path:
+        sys.path.insert(0, str(support))
+    return importlib.import_module("myrmex_portfolio_scheduler")
+
+
 def _observability_runtime():
     """Load reconstructible, non-authoritative P1 campaign observability."""
     import importlib
@@ -239,6 +253,14 @@ def campaign_state_home() -> Path:
         base = Path.home() / ".local" / "state" / "myrmex" / "campaigns"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def campaign_state_home_path() -> Path:
+    """Return the campaign root without creating it (for read-only previews)."""
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "myrmex" / "campaigns"
+    return Path.home() / ".local" / "state" / "myrmex" / "campaigns"
 
 
 def campaign_dir(campaign_id: str) -> Path:
@@ -1786,6 +1808,18 @@ def cmd_schedule_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_portfolio_schedule_preview(args: argparse.Namespace) -> int:
+    try:
+        result = _portfolio_scheduler_runtime().preview_portfolio(
+            campaign_state_home_path(), args.campaign_id, args.max_concurrent_wu,
+        )
+    except Exception as exc:
+        _intel_emit_error("portfolio_schedule_preview_failed", str(exc))
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Durable Campaign Store and Orchestrator for Myrmex")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1923,6 +1957,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_schedule.add_argument("id", help="Campaign ID")
     p_schedule.add_argument("--expect-revision", required=True, type=int)
     p_schedule.set_defaults(func=cmd_schedule_preview)
+
+    p_portfolio_schedule = sub.add_parser(
+        "portfolio-schedule-preview",
+        help="Coordinate eligible WUs across campaigns without dispatch or mutation",
+    )
+    p_portfolio_schedule.add_argument(
+        "--max-concurrent-wu", required=True, type=int,
+        help="Global positive WorkUnit concurrency ceiling",
+    )
+    p_portfolio_schedule.add_argument(
+        "--campaign-id", action="append", default=None,
+        help="Limit the preview to one or more campaign IDs (repeatable); default discovers all campaigns",
+    )
+    p_portfolio_schedule.set_defaults(func=cmd_portfolio_schedule_preview)
 
     # wu-transition
     p_wut = sub.add_parser("wu-transition", help="Transition work unit phase/status")

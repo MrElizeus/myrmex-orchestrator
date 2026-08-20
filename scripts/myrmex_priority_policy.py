@@ -297,8 +297,15 @@ def validate_decision(decision: Any) -> None:
         raise PriorityPolicyInputInvalid("scheduling selection reason/authority invalid")
 
 
-def preview_schedule(campaign_dir: pathlib.Path, campaign_id: str, expected_revision: int, policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    campaign = _load_campaign(pathlib.Path(campaign_dir), campaign_id, expected_revision)
+def preview_schedule_payload(campaign: dict[str, Any], campaign_id: str, expected_revision: int, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build a deterministic preview from one already-read campaign payload.
+
+    The portfolio coordinator uses this entry point so a read-only multi-
+    campaign preview does not read a campaign twice and accidentally combine
+    two different revisions around a concurrent writer.
+    """
+    if not isinstance(campaign, dict) or campaign.get("id") != campaign_id or campaign.get("revision") != expected_revision:
+        raise PriorityPolicyStale("campaign identity or revision is stale")
     by_id, dependencies, successors = _validate_campaign(campaign)
     selected_policy = default_policy() if policy is None else json.loads(json.dumps(policy))
     validate_policy(selected_policy)
@@ -345,3 +352,8 @@ def preview_schedule(campaign_dir: pathlib.Path, campaign_id: str, expected_revi
     decision = {**body, "decision_id": "schedule_" + digest, "decision_digest": digest}
     validate_decision(decision)
     return decision
+
+
+def preview_schedule(campaign_dir: pathlib.Path, campaign_id: str, expected_revision: int, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    campaign = _load_campaign(pathlib.Path(campaign_dir), campaign_id, expected_revision)
+    return preview_schedule_payload(campaign, campaign_id, expected_revision, policy)
